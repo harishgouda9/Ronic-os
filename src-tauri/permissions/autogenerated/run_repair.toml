@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-run-repair"
+description = "Enables the run_repair command without any pre-configured scope."
+commands.allow = ["run_repair"]
+
+[[permission]]
+identifier = "deny-run-repair"
+description = "Denies the run_repair command without any pre-configured scope."
+commands.deny = ["run_repair"]

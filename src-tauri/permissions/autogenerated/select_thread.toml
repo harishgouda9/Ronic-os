@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-select-thread"
+description = "Enables the select_thread command without any pre-configured scope."
+commands.allow = ["select_thread"]
+
+[[permission]]
+identifier = "deny-select-thread"
+description = "Denies the select_thread command without any pre-configured scope."
+commands.deny = ["select_thread"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-stop-fleet-daemon"
+description = "Enables the stop_fleet_daemon command without any pre-configured scope."
+commands.allow = ["stop_fleet_daemon"]
+
+[[permission]]
+identifier = "deny-stop-fleet-daemon"
+description = "Denies the stop_fleet_daemon command without any pre-configured scope."
+commands.deny = ["stop_fleet_daemon"]

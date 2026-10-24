@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-harness2-promote"
+description = "Enables the harness2_promote command without any pre-configured scope."
+commands.allow = ["harness2_promote"]
+
+[[permission]]
+identifier = "deny-harness2-promote"
+description = "Denies the harness2_promote command without any pre-configured scope."
+commands.deny = ["harness2_promote"]

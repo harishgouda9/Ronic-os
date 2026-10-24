@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-set-ide-agent"
+description = "Enables the set_ide_agent command without any pre-configured scope."
+commands.allow = ["set_ide_agent"]
+
+[[permission]]
+identifier = "deny-set-ide-agent"
+description = "Denies the set_ide_agent command without any pre-configured scope."
+commands.deny = ["set_ide_agent"]

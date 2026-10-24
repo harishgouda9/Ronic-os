@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-mesh-relay"
+description = "Enables the mesh_relay command without any pre-configured scope."
+commands.allow = ["mesh_relay"]
+
+[[permission]]
+identifier = "deny-mesh-relay"
+description = "Denies the mesh_relay command without any pre-configured scope."
+commands.deny = ["mesh_relay"]

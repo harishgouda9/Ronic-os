@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-launch-local-app"
+description = "Enables the launch_local_app command without any pre-configured scope."
+commands.allow = ["launch_local_app"]
+
+[[permission]]
+identifier = "deny-launch-local-app"
+description = "Denies the launch_local_app command without any pre-configured scope."
+commands.deny = ["launch_local_app"]

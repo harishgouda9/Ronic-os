@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-harness2-revert"
+description = "Enables the harness2_revert command without any pre-configured scope."
+commands.allow = ["harness2_revert"]
+
+[[permission]]
+identifier = "deny-harness2-revert"
+description = "Denies the harness2_revert command without any pre-configured scope."
+commands.deny = ["harness2_revert"]

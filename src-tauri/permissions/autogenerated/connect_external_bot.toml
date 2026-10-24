@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-connect-external-bot"
+description = "Enables the connect_external_bot command without any pre-configured scope."
+commands.allow = ["connect_external_bot"]
+
+[[permission]]
+identifier = "deny-connect-external-bot"
+description = "Denies the connect_external_bot command without any pre-configured scope."
+commands.deny = ["connect_external_bot"]

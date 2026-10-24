@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-omni-search-capabilities"
+description = "Enables the omni_search_capabilities command without any pre-configured scope."
+commands.allow = ["omni_search_capabilities"]
+
+[[permission]]
+identifier = "deny-omni-search-capabilities"
+description = "Denies the omni_search_capabilities command without any pre-configured scope."
+commands.deny = ["omni_search_capabilities"]

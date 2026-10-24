@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-omni-ask-peer-app"
+description = "Enables the omni_ask_peer_app command without any pre-configured scope."
+commands.allow = ["omni_ask_peer_app"]
+
+[[permission]]
+identifier = "deny-omni-ask-peer-app"
+description = "Denies the omni_ask_peer_app command without any pre-configured scope."
+commands.deny = ["omni_ask_peer_app"]

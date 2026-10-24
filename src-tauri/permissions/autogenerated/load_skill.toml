@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-load-skill"
+description = "Enables the load_skill command without any pre-configured scope."
+commands.allow = ["load_skill"]
+
+[[permission]]
+identifier = "deny-load-skill"
+description = "Denies the load_skill command without any pre-configured scope."
+commands.deny = ["load_skill"]

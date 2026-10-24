@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-close-position"
+description = "Enables the close_position command without any pre-configured scope."
+commands.allow = ["close_position"]
+
+[[permission]]
+identifier = "deny-close-position"
+description = "Denies the close_position command without any pre-configured scope."
+commands.deny = ["close_position"]

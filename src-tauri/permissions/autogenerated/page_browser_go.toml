@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-page-browser-go"
+description = "Enables the page_browser_go command without any pre-configured scope."
+commands.allow = ["page_browser_go"]
+
+[[permission]]
+identifier = "deny-page-browser-go"
+description = "Denies the page_browser_go command without any pre-configured scope."
+commands.deny = ["page_browser_go"]

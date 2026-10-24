@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-reveal-bot-screen"
+description = "Enables the reveal_bot_screen command without any pre-configured scope."
+commands.allow = ["reveal_bot_screen"]
+
+[[permission]]
+identifier = "deny-reveal-bot-screen"
+description = "Denies the reveal_bot_screen command without any pre-configured scope."
+commands.deny = ["reveal_bot_screen"]

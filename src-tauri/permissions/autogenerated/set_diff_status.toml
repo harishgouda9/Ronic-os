@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-set-diff-status"
+description = "Enables the set_diff_status command without any pre-configured scope."
+commands.allow = ["set_diff_status"]
+
+[[permission]]
+identifier = "deny-set-diff-status"
+description = "Denies the set_diff_status command without any pre-configured scope."
+commands.deny = ["set_diff_status"]

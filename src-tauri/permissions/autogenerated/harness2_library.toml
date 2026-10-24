@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-harness2-library"
+description = "Enables the harness2_library command without any pre-configured scope."
+commands.allow = ["harness2_library"]
+
+[[permission]]
+identifier = "deny-harness2-library"
+description = "Denies the harness2_library command without any pre-configured scope."
+commands.deny = ["harness2_library"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-hide-bot-screens"
+description = "Enables the hide_bot_screens command without any pre-configured scope."
+commands.allow = ["hide_bot_screens"]
+
+[[permission]]
+identifier = "deny-hide-bot-screens"
+description = "Denies the hide_bot_screens command without any pre-configured scope."
+commands.deny = ["hide_bot_screens"]

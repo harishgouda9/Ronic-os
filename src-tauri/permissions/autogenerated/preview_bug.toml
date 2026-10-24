@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-preview-bug"
+description = "Enables the preview_bug command without any pre-configured scope."
+commands.allow = ["preview_bug"]
+
+[[permission]]
+identifier = "deny-preview-bug"
+description = "Denies the preview_bug command without any pre-configured scope."
+commands.deny = ["preview_bug"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-start-fleet-daemon"
+description = "Enables the start_fleet_daemon command without any pre-configured scope."
+commands.allow = ["start_fleet_daemon"]
+
+[[permission]]
+identifier = "deny-start-fleet-daemon"
+description = "Denies the start_fleet_daemon command without any pre-configured scope."
+commands.deny = ["start_fleet_daemon"]

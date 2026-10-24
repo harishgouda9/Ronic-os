@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-install-market"
+description = "Enables the install_market command without any pre-configured scope."
+commands.allow = ["install_market"]
+
+[[permission]]
+identifier = "deny-install-market"
+description = "Denies the install_market command without any pre-configured scope."
+commands.deny = ["install_market"]

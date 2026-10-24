@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-hide-workspace-webapps"
+description = "Enables the hide_workspace_webapps command without any pre-configured scope."
+commands.allow = ["hide_workspace_webapps"]
+
+[[permission]]
+identifier = "deny-hide-workspace-webapps"
+description = "Denies the hide_workspace_webapps command without any pre-configured scope."
+commands.deny = ["hide_workspace_webapps"]

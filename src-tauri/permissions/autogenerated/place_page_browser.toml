@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-place-page-browser"
+description = "Enables the place_page_browser command without any pre-configured scope."
+commands.allow = ["place_page_browser"]
+
+[[permission]]
+identifier = "deny-place-page-browser"
+description = "Denies the place_page_browser command without any pre-configured scope."
+commands.deny = ["place_page_browser"]

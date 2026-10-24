@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-mount-memory-companion"
+description = "Enables the mount_memory_companion command without any pre-configured scope."
+commands.allow = ["mount_memory_companion"]
+
+[[permission]]
+identifier = "deny-mount-memory-companion"
+description = "Denies the mount_memory_companion command without any pre-configured scope."
+commands.deny = ["mount_memory_companion"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-workspace-bridge-status"
+description = "Enables the workspace_bridge_status command without any pre-configured scope."
+commands.allow = ["workspace_bridge_status"]
+
+[[permission]]
+identifier = "deny-workspace-bridge-status"
+description = "Denies the workspace_bridge_status command without any pre-configured scope."
+commands.deny = ["workspace_bridge_status"]

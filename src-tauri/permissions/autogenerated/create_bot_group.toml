@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-create-bot-group"
+description = "Enables the create_bot_group command without any pre-configured scope."
+commands.allow = ["create_bot_group"]
+
+[[permission]]
+identifier = "deny-create-bot-group"
+description = "Denies the create_bot_group command without any pre-configured scope."
+commands.deny = ["create_bot_group"]

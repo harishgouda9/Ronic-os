@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-harness2-install"
+description = "Enables the harness2_install command without any pre-configured scope."
+commands.allow = ["harness2_install"]
+
+[[permission]]
+identifier = "deny-harness2-install"
+description = "Denies the harness2_install command without any pre-configured scope."
+commands.deny = ["harness2_install"]

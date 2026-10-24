@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-execute-code-mode-script"
+description = "Enables the execute_code_mode_script command without any pre-configured scope."
+commands.allow = ["execute_code_mode_script"]
+
+[[permission]]
+identifier = "deny-execute-code-mode-script"
+description = "Denies the execute_code_mode_script command without any pre-configured scope."
+commands.deny = ["execute_code_mode_script"]

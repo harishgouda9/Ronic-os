@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-place-bot-screen"
+description = "Enables the place_bot_screen command without any pre-configured scope."
+commands.allow = ["place_bot_screen"]
+
+[[permission]]
+identifier = "deny-place-bot-screen"
+description = "Denies the place_bot_screen command without any pre-configured scope."
+commands.deny = ["place_bot_screen"]

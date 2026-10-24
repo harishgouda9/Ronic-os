@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-hide-page-browser"
+description = "Enables the hide_page_browser command without any pre-configured scope."
+commands.allow = ["hide_page_browser"]
+
+[[permission]]
+identifier = "deny-hide-page-browser"
+description = "Denies the hide_page_browser command without any pre-configured scope."
+commands.deny = ["hide_page_browser"]

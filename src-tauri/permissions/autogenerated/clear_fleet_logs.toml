@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-clear-fleet-logs"
+description = "Enables the clear_fleet_logs command without any pre-configured scope."
+commands.allow = ["clear_fleet_logs"]
+
+[[permission]]
+identifier = "deny-clear-fleet-logs"
+description = "Denies the clear_fleet_logs command without any pre-configured scope."
+commands.deny = ["clear_fleet_logs"]

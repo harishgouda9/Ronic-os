@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-spawn-terminal"
+description = "Enables the spawn_terminal command without any pre-configured scope."
+commands.allow = ["spawn_terminal"]
+
+[[permission]]
+identifier = "deny-spawn-terminal"
+description = "Denies the spawn_terminal command without any pre-configured scope."
+commands.deny = ["spawn_terminal"]

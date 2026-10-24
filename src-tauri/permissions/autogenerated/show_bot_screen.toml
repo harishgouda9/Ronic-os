@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-show-bot-screen"
+description = "Enables the show_bot_screen command without any pre-configured scope."
+commands.allow = ["show_bot_screen"]
+
+[[permission]]
+identifier = "deny-show-bot-screen"
+description = "Denies the show_bot_screen command without any pre-configured scope."
+commands.deny = ["show_bot_screen"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-compile-mcp-acp-to-typescript-dts"
+description = "Enables the compile_mcp_acp_to_typescript_dts command without any pre-configured scope."
+commands.allow = ["compile_mcp_acp_to_typescript_dts"]
+
+[[permission]]
+identifier = "deny-compile-mcp-acp-to-typescript-dts"
+description = "Denies the compile_mcp_acp_to_typescript_dts command without any pre-configured scope."
+commands.deny = ["compile_mcp_acp_to_typescript_dts"]

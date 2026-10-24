@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-mesh-connect-all"
+description = "Enables the mesh_connect_all command without any pre-configured scope."
+commands.allow = ["mesh_connect_all"]
+
+[[permission]]
+identifier = "deny-mesh-connect-all"
+description = "Denies the mesh_connect_all command without any pre-configured scope."
+commands.deny = ["mesh_connect_all"]

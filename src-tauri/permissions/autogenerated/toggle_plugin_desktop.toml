@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-toggle-plugin-desktop"
+description = "Enables the toggle_plugin_desktop command without any pre-configured scope."
+commands.allow = ["toggle_plugin_desktop"]
+
+[[permission]]
+identifier = "deny-toggle-plugin-desktop"
+description = "Denies the toggle_plugin_desktop command without any pre-configured scope."
+commands.deny = ["toggle_plugin_desktop"]

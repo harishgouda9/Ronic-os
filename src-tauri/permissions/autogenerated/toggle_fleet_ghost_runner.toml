@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-toggle-fleet-ghost-runner"
+description = "Enables the toggle_fleet_ghost_runner command without any pre-configured scope."
+commands.allow = ["toggle_fleet_ghost_runner"]
+
+[[permission]]
+identifier = "deny-toggle-fleet-ghost-runner"
+description = "Denies the toggle_fleet_ghost_runner command without any pre-configured scope."
+commands.deny = ["toggle_fleet_ghost_runner"]

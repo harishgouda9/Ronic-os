@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-sync-memories-to-engine"
+description = "Enables the sync_memories_to_engine command without any pre-configured scope."
+commands.allow = ["sync_memories_to_engine"]
+
+[[permission]]
+identifier = "deny-sync-memories-to-engine"
+description = "Denies the sync_memories_to_engine command without any pre-configured scope."
+commands.deny = ["sync_memories_to_engine"]

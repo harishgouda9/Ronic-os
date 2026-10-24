@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-save-extension"
+description = "Enables the save_extension command without any pre-configured scope."
+commands.allow = ["save_extension"]
+
+[[permission]]
+identifier = "deny-save-extension"
+description = "Denies the save_extension command without any pre-configured scope."
+commands.deny = ["save_extension"]

@@ -1,0 +1,38 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Ronic OS",
+  "version": "2.1.4",
+  "identifier": "os.omniworkspace.desktop",
+  "build": {
+    "beforeDevCommand": "node ./node_modules/vite/bin/vite.js",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "node ./node_modules/vite/bin/vite.js build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "Ronic OS",
+        "decorations": false,
+        "shadow": true,
+        "width": 1440,
+        "height": 920,
+        "minWidth": 1100,
+        "minHeight": 700,
+        "resizable": true,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob: https: asset: http://asset.localhost https://asset.localhost; connect-src 'self' ipc: http://ipc.localhost https://ipc.localhost ws://ipc.localhost wss://ipc.localhost http://127.0.0.1:1420 ws://127.0.0.1:1420 http://localhost:1420 ws://localhost:1420 http://127.0.0.1:* http://localhost:* ws://127.0.0.1:* ws://localhost:* http://127.0.0.1:4141 http://127.0.0.1:4142 http://127.0.0.1:11434 http://127.0.0.1:47331 https: wss:; media-src 'self' blob:; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; frame-src 'self' https: http://127.0.0.1:* http://localhost:*",
+      "devCsp": "default-src 'self'; script-src 'self' 'unsafe-eval'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob: https: asset: http://asset.localhost; connect-src 'self' ipc: http://ipc.localhost https://ipc.localhost ws://ipc.localhost http://127.0.0.1:1420 ws://127.0.0.1:1420 http://localhost:1420 ws://localhost:1420 http://127.0.0.1:* http://localhost:* ws://127.0.0.1:* ws://localhost:* http://127.0.0.1:4141 http://127.0.0.1:4142 http://127.0.0.1:11434 http://127.0.0.1:47331 https: wss:; media-src 'self' blob:; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; frame-src 'self' https: http://127.0.0.1:* http://localhost:*"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/icon.ico"]
+  }
+}

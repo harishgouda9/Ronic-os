@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-resolve-skill-proposal"
+description = "Enables the resolve_skill_proposal command without any pre-configured scope."
+commands.allow = ["resolve_skill_proposal"]
+
+[[permission]]
+identifier = "deny-resolve-skill-proposal"
+description = "Denies the resolve_skill_proposal command without any pre-configured scope."
+commands.deny = ["resolve_skill_proposal"]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-link-apps"
+description = "Enables the link_apps command without any pre-configured scope."
+commands.allow = ["link_apps"]
+
+[[permission]]
+identifier = "deny-link-apps"
+description = "Denies the link_apps command without any pre-configured scope."
+commands.deny = ["link_apps"]

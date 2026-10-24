@@ -1,0 +1,18 @@
+node_modules
+dist
+src-tauri/target
+src-tauri/gen
+.DS_Store
+*.log
+.omniworkspace
+
+# Build artifacts synced to the repo root by scripts/desktop.mjs
+*.exe
+*.dll
+
+# Local editor/tooling state
+.kilo
+.vite
+
+.env
+.env.local

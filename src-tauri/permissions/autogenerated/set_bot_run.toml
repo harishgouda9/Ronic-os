@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-set-bot-run"
+description = "Enables the set_bot_run command without any pre-configured scope."
+commands.allow = ["set_bot_run"]
+
+[[permission]]
+identifier = "deny-set-bot-run"
+description = "Denies the set_bot_run command without any pre-configured scope."
+commands.deny = ["set_bot_run"]

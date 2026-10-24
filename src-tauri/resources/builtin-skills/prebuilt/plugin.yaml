@@ -1,0 +1,9 @@
+id: prebuilt-skills
+name: Prebuilt skills
+version: 1.0.0
+has_agent_part: true
+has_desktop_part: false
+tools:
+hooks: []
+skills: [find-skills, grill-me, agent-browser, improve-codebase-architecture, computer-use, code-review, vercel-react-best-practices, remotion-to-hyperframes, hyperframes-cli, composio]
+desktop:

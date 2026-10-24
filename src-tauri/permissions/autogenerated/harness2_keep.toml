@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-harness2-keep"
+description = "Enables the harness2_keep command without any pre-configured scope."
+commands.allow = ["harness2_keep"]
+
+[[permission]]
+identifier = "deny-harness2-keep"
+description = "Denies the harness2_keep command without any pre-configured scope."
+commands.deny = ["harness2_keep"]

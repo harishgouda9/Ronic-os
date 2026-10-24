@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-place-workspace-webapp"
+description = "Enables the place_workspace_webapp command without any pre-configured scope."
+commands.allow = ["place_workspace_webapp"]
+
+[[permission]]
+identifier = "deny-place-workspace-webapp"
+description = "Denies the place_workspace_webapp command without any pre-configured scope."
+commands.deny = ["place_workspace_webapp"]

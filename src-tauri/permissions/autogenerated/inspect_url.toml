@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-inspect-url"
+description = "Enables the inspect_url command without any pre-configured scope."
+commands.allow = ["inspect_url"]
+
+[[permission]]
+identifier = "deny-inspect-url"
+description = "Denies the inspect_url command without any pre-configured scope."
+commands.deny = ["inspect_url"]
