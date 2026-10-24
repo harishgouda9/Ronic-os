@@ -141,6 +141,13 @@ fn main() {
         "harness2_keep",
         "harness2_promote",
         "harness2_revert",
+        "license_status",
+        "refresh_license",
+        "device_fingerprint",
+        "cloud_keychain_store",
+        "cloud_keychain_restore",
+        "cloud_keychain_clear",
+        "open_system_url",
     ];
 
     tauri_build::try_build(

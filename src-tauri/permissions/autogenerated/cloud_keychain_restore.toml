@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-cloud-keychain-restore"
+description = "Enables the cloud_keychain_restore command without any pre-configured scope."
+commands.allow = ["cloud_keychain_restore"]
+
+[[permission]]
+identifier = "deny-cloud-keychain-restore"
+description = "Denies the cloud_keychain_restore command without any pre-configured scope."
+commands.deny = ["cloud_keychain_restore"]

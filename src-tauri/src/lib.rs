@@ -28,6 +28,7 @@ mod yaml_flow;
 mod terminal_pty;
 pub mod bot_fleet;
 mod code_mode;
+pub mod licensing;
 mod harness2_engine;
 mod mcp_acp_automesh;
 pub mod tunnel;
@@ -39,7 +40,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 pub struct AppState {
     pub conn: Mutex<Connection>,
@@ -87,6 +88,7 @@ pub fn run() {
         app_handle: Arc::new(Mutex::new(None)),
     };
     tauri::Builder::default()
+        .plugin(tauri_plugin_deep_link::init())
         .manage(state)
         .manage(terminal_pty::TerminalManager::new())
         .invoke_handler(tauri::generate_handler![
@@ -221,6 +223,13 @@ pub fn run() {
             code_mode::compile_mcp_acp_to_typescript_dts,
             code_mode::execute_code_mode_script,
             code_mode::omni_search_capabilities,
+            licensing::license_status,
+            licensing::refresh_license,
+            licensing::device_fingerprint,
+            licensing::cloud_keychain_store,
+            licensing::cloud_keychain_restore,
+            licensing::cloud_keychain_clear,
+            licensing::open_system_url,
             harness2_engine::harness2_status,
             harness2_engine::harness2_set_flags,
             harness2_engine::harness2_install,
@@ -236,6 +245,27 @@ pub fn run() {
             let handle = app.handle().clone();
             if let Ok(mut h) = app.state::<AppState>().app_handle.lock() {
                 *h = Some(handle.clone());
+            }
+            // ronic://auth/callback?code=... — the last hop of the PKCE
+            // sign-in (system browser -> Vercel bounce -> this deep link).
+            // The raw query is re-emitted; the webview completes the token
+            // exchange, so no tokens ever pass through this process.
+            #[cfg(desktop)]
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                let emitter = handle.clone();
+                let _ = app.deep_link().register_all();
+                app.deep_link().on_open_url(move |event| {
+                    for url in event.urls() {
+                        if url.host_str() == Some("auth") && url.path() == "/callback" {
+                            let query = url.query().unwrap_or_default();
+                            if let Some(state) = emitter.try_state::<AppState>() {
+                                ipc_push(&state.ipc, &format!("auth/deep_link {query}"));
+                            }
+                            let _ = emitter.emit("omni://auth-code", query);
+                        }
+                    }
+                });
             }
             crate::workspace_bridge::start(handle.clone());
             crate::mcp_acp_automesh::start(handle.clone());

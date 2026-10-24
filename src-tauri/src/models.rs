@@ -595,6 +595,7 @@ pub struct Snapshot {
     pub dom_latency_ms: i64,
     pub sandbox_output: String,
     pub bug_preview: String,
+    pub license: crate::licensing::LicenseSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize)]

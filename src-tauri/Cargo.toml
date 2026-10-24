@@ -28,6 +28,9 @@ base64 = "0.22"
 url = "2"
 include_dir = "0.7"
 portable-pty = "0.8"
+ed25519-dalek = "2"
+keyring = { version = "3", features = ["windows-native", "sync-secret-service"] }
+tauri-plugin-deep-link = "2"
 
 [target.'cfg(windows)'.dependencies]
 webview2-com = "0.39"

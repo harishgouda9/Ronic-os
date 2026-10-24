@@ -93,6 +93,7 @@ pub fn load(conn: &Connection, meta: &Meta) -> Result<Snapshot> {
         dom_latency_ms,
         sandbox_output: db::kv_get(conn, "sandbox_output")?.unwrap_or_default(),
         bug_preview: db::kv_get(conn, "bug_preview")?.unwrap_or_default(),
+        license: crate::licensing::load_snapshot(conn),
     })
 }
 
