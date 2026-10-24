@@ -141,51 +141,10 @@ pub fn ipc_push(ipc: &Mutex<VecDeque<String>>, line: &str) {
 }
 
 pub fn run_capture(program: &str, args: &[&str], cwd: Option<&Path>, timeout: Duration) -> Result<(i32, String)> {
-    let mut cmd = Command::new(program);
-    cmd.args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if let Some(dir) = cwd {
-        cmd.current_dir(dir);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    let mut child = cmd.spawn().map_err(|e| err(format!("could not start {program}: {e}")))?;
-    let started = Instant::now();
-    loop {
-        if let Some(status) = child.try_wait().map_err(|e| err(e.to_string()))? {
-            let mut out = String::new();
-            if let Some(mut stdout) = child.stdout.take() {
-                stdout.read_to_string(&mut out).ok();
-            }
-            if let Some(mut stderr) = child.stderr.take() {
-                let mut err_buf = String::new();
-                stderr.read_to_string(&mut err_buf).ok();
-                if !err_buf.is_empty() {
-                    if !out.is_empty() {
-                        out.push('\n');
-                    }
-                    out.push_str(&err_buf);
-                }
-            }
-            if out.len() > 16_000 {
-                truncate_utf8(&mut out, 16_000);
-                out.push_str("\n…truncated");
-            }
-            return Ok((status.code().unwrap_or(-1), out));
-        }
-        if started.elapsed() > timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(err(format!("{program} exceeded {}s", timeout.as_secs())));
-        }
-        std::thread::sleep(Duration::from_millis(30));
-    }
+    // Pipes must be drained while the child runs: a child that writes more
+    // than the OS pipe buffer (~64 KB) blocks on a full pipe and never exits.
+    // run_capture_stream keeps reader threads alive for the child's lifetime.
+    run_capture_stream(program, args, cwd, timeout, |_| {})
 }
 
 pub fn split_args(cmd: &str) -> Vec<String> {

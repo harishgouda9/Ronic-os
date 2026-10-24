@@ -75,12 +75,8 @@ pub struct BotScreenStatus {
     pub url: String,
 }
 
-#[allow(dead_code)]
 pub struct ScreenHit {
-    pub showing: bool,
-    pub refused: bool,
     pub url: String,
-    pub title: String,
     pub text: String,
     pub nodes: Vec<DomNode>,
     pub ms: i64,
@@ -89,10 +85,7 @@ pub struct ScreenHit {
 impl ScreenHit {
     pub fn empty(url: &str) -> Self {
         Self {
-            showing: true,
-            refused: false,
             url: url.to_string(),
-            title: String::new(),
             text: String::new(),
             nodes: Vec::new(),
             ms: 0,
@@ -104,8 +97,6 @@ impl ScreenHit {
 struct RawRead {
     #[serde(default)]
     url: String,
-    #[serde(default)]
-    title: String,
     #[serde(default)]
     text: String,
     #[serde(default)]
@@ -273,10 +264,7 @@ pub fn type_bot(app: &AppHandle, id: &str, node: i64, text: &str) -> Result<Scre
 fn finish_hit(page: RawRead, expected: &str, started: Instant) -> Result<ScreenHit> {
     let url = if page_url(&page.url).is_ok() { page.url } else { expected.to_string() };
     Ok(ScreenHit {
-        showing: true,
-        refused: false,
         url,
-        title: page.title,
         text: prefix_utf8(&page.text, 1200).to_string(),
         nodes: nodes_of(&page.nodes),
         ms: started.elapsed().as_millis() as i64,

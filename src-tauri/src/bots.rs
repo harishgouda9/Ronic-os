@@ -8,7 +8,6 @@ use serde_json::{json, Value};
 use std::fs;
 use std::path::Path;
 
-#[allow(dead_code)]
 pub struct BotFlags {
     pub id: String,
     pub handle: String,

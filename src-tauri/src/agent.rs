@@ -371,7 +371,10 @@ fn answer_bot(state: &AppState, thread_id: &str, turn_id: &str, bot_id: &str, se
                     Ok(())
                 })?;
                 provider_id = next;
-                let text = match run_turn(state, thread_id, turn_id, bot_id, &provider_id, &system, secrets, model, effort, &tools, true, true, true, true) {
+                // The retry keeps the bot's own tool permissions. Overriding
+                // them here would let a fenced tool call run on failover even
+                // when the bot was configured with every tool disabled.
+                let text = match run_turn(state, thread_id, turn_id, bot_id, &provider_id, &system, secrets, model, effort, &tools, speaker.allow_code, speaker.allow_computer, speaker.allow_browser, speaker.allow_file) {
                     Err(error) if reply_was_cleared(&error) => {
                         let _ = with_db(state, |conn| finish(conn, thread_id));
                         return Ok(BotTurn::Paused(error));

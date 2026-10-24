@@ -751,11 +751,12 @@ pub fn insert_step(conn: &Connection, thread_id: &str, role: &str, model: &str, 
 }
 
 pub fn insert_step_in(conn: &Connection, thread_id: &str, turn_id: &str, role: &str, model: &str, content: &str, action: &str, payload: &Value, latency: i64) -> Result<()> {
+    let now = now_ms();
     conn.execute(
         "INSERT INTO execution_steps (id, thread_id, turn_id, role, model_used, content_markdown, action_type, action_payload_json, execution_latency_ms, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-        params![nid("step"), thread_id, turn_id, role, model, content, action, payload.to_string(), latency, now_ms()],
+        params![nid("step"), thread_id, turn_id, role, model, content, action, payload.to_string(), latency, now],
     )?;
-    conn.execute("UPDATE chat_threads SET updated_at = ?1 WHERE id = ?2", params![now_ms(), thread_id])?;
+    conn.execute("UPDATE chat_threads SET updated_at = ?1 WHERE id = ?2", params![now, thread_id])?;
     Ok(())
 }
 

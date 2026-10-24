@@ -948,7 +948,6 @@ pub struct WalletRequest {
     pub native_amount: String,
     pub counterparty: String,
     pub purpose: String,
-    #[allow(dead_code)]
     pub actor: String,
     pub kind: String,
     pub effect: String,
@@ -963,7 +962,8 @@ pub async fn wallet_tx(state: State<'_, AppState>, request: WalletRequest) -> Re
         if settings.live_rails {
             return Err(err("Live rails are switched on, and this build will not send a real charge. Turn live rails off to use the sandbox ledger."));
         }
-        crate::wallet::settle(&conn, &request.bot_profile_id, &request.rail, request.amount_usd, &request.native_amount, &request.counterparty, &request.purpose, "user", &request.kind, request.slippage_bps, &request.effect)?
+        let actor = if request.actor.trim().is_empty() { "user" } else { request.actor.trim() };
+        crate::wallet::settle(&conn, &request.bot_profile_id, &request.rail, request.amount_usd, &request.native_amount, &request.counterparty, &request.purpose, actor, &request.kind, request.slippage_bps, &request.effect)?
     };
     finish(&state, Some(toast))
 }
@@ -1073,7 +1073,7 @@ pub async fn set_vault_passphrase(state: State<'_, AppState>, password: String) 
         *state.vault_key.lock().unwrap_or_else(|e| e.into_inner()) = Some(key);
         state.unlocked.store(true, Ordering::Relaxed);
     }
-    finish(&state, Some("Vault locked with Argon2id and AES-256-GCM. The passphrase is not stored.".into()))
+    finish(&state, Some("Vault passphrase set with Argon2id; keys are sealed with AES-256-GCM. The passphrase is not stored.".into()))
 }
 
 #[tauri::command]
@@ -1158,7 +1158,16 @@ fn open_external_window(app: &AppHandle, provider_id: &str, url: &str) -> Result
     let safe: String = provider_id.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).take(48).collect();
     let window_label = format!("harness_{safe}");
     if let Some(existing) = app.get_webview_window(&window_label) {
-        let _ = existing.close();
+        // Reuse the live window. close() is asynchronous in Tauri 2, so
+        // closing and immediately rebuilding under the same label can fail
+        // with "label already exists". Navigating keeps the sign-in session
+        // on the profile directory this window already owns.
+        existing.navigate(parsed).map_err(|e| err(e.to_string()))?;
+        let _ = existing.set_focus();
+        if let Some(view) = app.get_webview(existing.label()) {
+            crate::site_window::prepare_sign_in(&view, false);
+        }
+        return Ok(format!("Opened a native window at {safe_url}."));
     }
     let dir = crate::site_window::ensure_profile(&crate::util::product_home(), &window_label)?;
     // A second WebView2 with its own user agent stays blank unless the profile directory is unique.
@@ -1933,8 +1942,13 @@ fn resolve_bot_profile(conn: &Connection, reference: &str) -> Option<String> {
     .ok()
 }
 
+// One workflow run at a time: runs rewrite the global active_profile KV and
+// node statuses, so two interleaved runs corrupt each other's state.
+static WORKFLOW_RUN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn execute_workflow(state: &AppState, id: &str, approve_paused_gate: bool) -> Result<String> {
     use tauri::Emitter;
+    let _run_guard = WORKFLOW_RUN.try_lock().map_err(|_| err("another workflow run is already in progress; wait for it to finish or pause it first"))?;
     let (name, triggers, mut nodes, paused_at, mut checkpoint): (String, Vec<String>, Vec<WfNode>, Option<String>, serde_json::Map<String, Value>) = {
         let conn = guard(state);
         let row = conn

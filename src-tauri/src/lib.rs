@@ -336,10 +336,6 @@ fn find_project_root() -> Option<PathBuf> {
             }
         }
     }
-    let standard = PathBuf::from(r"C:\Users\haris\OneDrive\Desktop\Omni Workspace OS");
-    if standard.join("package.json").exists() {
-        return Some(standard);
-    }
     None
 }
 

@@ -898,9 +898,6 @@ pub(crate) fn chat_page_host(host: &str) -> bool {
 
 fn deliver(app: &AppHandle, label: &str, raw: &str) {
     let items = parse_box(raw);
-    if items.is_empty() && !raw.trim().is_empty() && raw.trim() != "[]" && raw.trim() != "null" {
-        return;
-    }
     if items.is_empty() {
         return;
     }
@@ -1092,28 +1089,12 @@ fn random_token() -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-#[cfg(windows)]
 fn fill_random(buf: &mut [u8]) {
-    #[link(name = "advapi32")]
-    extern "system" {
-        #[link_name = "SystemFunction036"]
-        fn rtl_gen_random(buffer: *mut u8, length: u32) -> u8;
-    }
-    let ok = unsafe { rtl_gen_random(buf.as_mut_ptr(), buf.len() as u32) };
-    if ok == 0 {
+    // getrandom is the same CSPRNG the vault uses. The old time+pid LCG
+    // fallback produced predictable tokens for the bridge and tunnel.
+    if getrandom::getrandom(buf).is_err() {
         fallback_random(buf);
     }
-}
-
-#[cfg(not(windows))]
-fn fill_random(buf: &mut [u8]) {
-    use std::io::Read;
-    if let Ok(mut file) = fs::File::open("/dev/urandom") {
-        if file.read_exact(buf).is_ok() {
-            return;
-        }
-    }
-    fallback_random(buf);
 }
 
 fn fallback_random(buf: &mut [u8]) {
