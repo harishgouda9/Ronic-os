@@ -25,15 +25,18 @@ import {
   Terminal as TerminalIcon,
   type LucideIcon,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, Suspense, lazy, type ReactNode } from "react";
 import { RAIL, type ScreenId } from "../types";
 import { useOmni } from "../store";
 import { Pill } from "./bits";
 import { isTauri } from "../api";
-import TerminalPanel from "../components/TerminalPanel";
 import { SuperchargeControl } from "../components/Harness2Studio";
 import { JobClock } from "./JobClock";
 import { useDesktopChrome, WindowControls } from "./WindowChrome";
+
+// xterm and the PTY glue are the heaviest leaf in the shell; load the panel
+// only when the terminal drawer is first opened.
+const TerminalPanel = lazy(() => import("../components/TerminalPanel"));
 
 const RAIL_KEY = "omni.railWidth";
 
@@ -81,30 +84,6 @@ const ICONS: Record<string, LucideIcon> = {
   vault: Settings,
 };
 
-const NAMES: Record<ScreenId, string> = {
-  onboarding: "First run",
-  chat: "Bots & groups",
-  bots: "External bots",
-  profiles: "Bot profiles",
-  providers: "Apps & providers",
-  memory: "Memory",
-  skills: "Skills & Capabilities",
-  mesh: "MCP & ACP mesh",
-  harness2: "Harness²",
-  capabilities: "Skills & Capabilities",
-  fleet: "Bot fleet",
-  ide: "Coding agents",
-  computer: "Computer & browser",
-  workflows: "Workflows",
-  market: "Marketplace",
-  wallet: "Wallet & trading",
-  extensions: "Self-modify",
-  repair: "Self-repair",
-  billing: "Plan & act",
-  settings: "Settings",
-  vault: "Secret vault",
-};
-
 export function Shell({ children }: { children: ReactNode }) {
   const snap = useOmni((s) => s.snap)!;
   const screen = useOmni((s) => s.screen);
@@ -121,6 +100,12 @@ export function Shell({ children }: { children: ReactNode }) {
   const recovering = useOmni((s) => s.recovering);
   const terminal = useOmni((s) => s.terminal);
   const setTerminal = useOmni((s) => s.setTerminal);
+  // The panel stays mounted after its first open (the PTY session survives
+  // drawer close); before that nothing xterm-shaped is loaded at all.
+  const [terminalMounted, setTerminalMounted] = useState(false);
+  useEffect(() => {
+    if (terminal) setTerminalMounted(true);
+  }, [terminal]);
   const [agentTerminalActive, setAgentTerminalActive] = useState(false);
 
   useEffect(() => {
@@ -370,11 +355,15 @@ export function Shell({ children }: { children: ReactNode }) {
           title="Drag to resize terminal"
           onPointerDown={beginTerminalResize}
         />
-        <TerminalPanel
-          sessionId="omni_global"
-          onClose={() => setTerminal(false)}
-          title="Ronic Shell"
-        />
+        {terminalMounted ? (
+          <Suspense fallback={null}>
+            <TerminalPanel
+              sessionId="omni_global"
+              onClose={() => setTerminal(false)}
+              title="Ronic Shell"
+            />
+          </Suspense>
+        ) : null}
       </div>
       {toast ? (
         <button className="toast" onClick={() => setToast(null)}>

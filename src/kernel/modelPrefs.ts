@@ -5,8 +5,6 @@ const EDITS = "omni.modelEdits.v1";
 const STARS = "omni.modelStars.v1";
 const EFFORTS = "omni.modelEffort.v1";
 const LIVE = "omni.liveModels.v1";
-const BOT_MODELS = "omni.botModel.v1";
-const LEGACY_MODEL = "omni.selectedModel.v1";
 
 export type ModelEdit = { label?: string; upstreamModel?: string; hidden?: boolean };
 
@@ -72,31 +70,6 @@ export function groupsFor(models: ChatModel[], query: string) {
   }
   const titles = [...GROUP_ORDER.filter((title) => buckets.has(title)), ...[...buckets.keys()].filter((title) => !GROUP_ORDER.includes(title))];
   return titles.map((title) => ({ title, models: buckets.get(title) ?? [] }));
-}
-
-export function botModelId(botId: string, adoptLegacy = false) {
-  if (!botId) return "";
-  const map = read<Record<string, string>>(BOT_MODELS, {});
-  if (Object.prototype.hasOwnProperty.call(map, botId)) return map[botId] || "";
-  if (!adoptLegacy || Object.keys(map).length > 0) return "";
-  let legacy = "";
-  try {
-    legacy = localStorage.getItem(LEGACY_MODEL) ?? "";
-    localStorage.removeItem(LEGACY_MODEL);
-  } catch {
-    legacy = "";
-  }
-  if (!legacy) return "";
-  map[botId] = legacy;
-  write(BOT_MODELS, map);
-  return legacy;
-}
-
-export function saveBotModel(botId: string, modelId: string) {
-  if (!botId) return;
-  const map = read<Record<string, string>>(BOT_MODELS, {});
-  map[botId] = modelId;
-  write(BOT_MODELS, map);
 }
 
 export function starIds() {

@@ -248,6 +248,8 @@ export function CoworkerSidebar({ onInspect, onEditProfile }: { onInspect: (id: 
     <section className="pane roster" data-seen={seenTick}>
       <div className="roster-lanes" role="tablist" aria-label="Roster">
         <button type="button" role="tab" aria-selected={lane === "bots"} className={lane === "bots" ? "on" : ""} onClick={() => setLane("bots")}>Bots</button>
+        <button type="button" role="tab" aria-selected={lane === "sessions"} className={lane === "sessions" ? "on" : ""} onClick={() => setLane("sessions")}>Sessions</button>
+        <button type="button" role="tab" aria-selected={lane === "harness"} className={lane === "harness" ? "on" : ""} onClick={() => setLane("harness")}>Harness</button>
       </div>
       <div className="roster-bar">
         <input className="roster-search" value={query} placeholder={placeholder} onChange={(event) => setQuery(event.target.value)} />
@@ -1009,10 +1011,9 @@ export function GatewayCard({ step, model }: { step: Step; model: ChatModel | nu
 }
 
 export function HandoffLine({ step }: { step: Step }) {
-  const to = String(step.actionPayload.to ?? "");
   return (
     <article className="step capsule">
-      <p className="mono">{step.contentMarkdown}{to ? "" : ""}</p>
+      <p className="mono">{step.contentMarkdown}</p>
     </article>
   );
 }

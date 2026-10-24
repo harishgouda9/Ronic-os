@@ -1,5 +1,16 @@
 import React, { useState, useMemo } from "react";
-import { ArrowLeft, Check, Download, ExternalLink, Key, Lock, Plus, RefreshCw, Search, ShieldCheck, Sparkles, Trash2, X } from "lucide-react";
+import {
+  ArrowLeft,
+  Check,
+  Key,
+  Lock,
+  Plus,
+  Search,
+  ShieldCheck,
+  Sparkles,
+  Trash2,
+  X,
+} from "lucide-react";
 import { useOmni } from "../store";
 import {
   MARKETPLACE_CATALOG,

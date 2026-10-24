@@ -1,5 +1,4 @@
 import type { CommandResult } from "./types";
-import { browserCall } from "./kernel/browser";
 
 export function isTauri(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -16,5 +15,8 @@ export async function call(cmd: string, args: Record<string, unknown> = {}): Pro
     const { invoke } = await import("@tauri-apps/api/core");
     return invoke<CommandResult>(cmd, args);
   }
+  // The whole browser-preview kernel loads only in the web preview; the
+  // desktop bundle never pays for it.
+  const { browserCall } = await import("./kernel/browser");
   return browserCall(cmd, args);
 }

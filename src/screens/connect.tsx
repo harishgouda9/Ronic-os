@@ -1,29 +1,20 @@
 import { useEffect, useState } from "react";
 import {
   AppWindow,
-  Bot,
-  Boxes,
   Check,
   ChevronDown,
   Copy,
-  Cpu,
   ExternalLink,
   Eye,
   EyeOff,
   FolderOpen,
-  Globe,
-  HardDrive,
-  KeyRound,
   Layers,
-  Monitor,
   Play,
   Plus,
-  RefreshCw,
   Search,
   Sparkles,
   Square,
   Terminal,
-  Zap,
 } from "lucide-react";
 import { isTauri, pickPaths } from "../api";
 import type { LinkedApp, MemoryEngine, MemoryItem, Provider, ProviderType } from "../types";
@@ -65,44 +56,6 @@ export function isProviderConnected(provider: Provider): boolean {
 
 export function isAppInstalled(app: LinkedApp): boolean {
   return Boolean(app.executablePath && app.executablePath.trim().length > 0);
-}
-
-function getBrand(id: string, name: string, category?: string) {
-  const key = `${id} ${name}`.toLowerCase();
-  if (key.includes("claude")) {
-    return { icon: Terminal, color: "#d97706", bg: "rgba(217, 119, 6, 0.12)", label: "Claude" };
-  }
-  if (key.includes("chatgpt") || key.includes("openai")) {
-    return { icon: Bot, color: "#10b981", bg: "rgba(16, 185, 129, 0.12)", label: "OpenAI" };
-  }
-  if (key.includes("openrouter")) {
-    return { icon: Globe, color: "#8b5cf6", bg: "rgba(139, 92, 246, 0.12)", label: "OpenRouter" };
-  }
-  if (key.includes("deepseek")) {
-    return { icon: Sparkles, color: "#2563eb", bg: "rgba(37, 99, 235, 0.12)", label: "DeepSeek" };
-  }
-  if (key.includes("qwen") || key.includes("dashscope")) {
-    return { icon: Cpu, color: "#6366f1", bg: "rgba(99, 102, 241, 0.12)", label: "Qwen" };
-  }
-  if (key.includes("gemini")) {
-    return { icon: Sparkles, color: "#06b6d4", bg: "rgba(6, 182, 212, 0.12)", label: "Gemini" };
-  }
-  if (key.includes("grok")) {
-    return { icon: Zap, color: "#e11d48", bg: "rgba(225, 29, 72, 0.12)", label: "xAI" };
-  }
-  if (key.includes("ollama")) {
-    return { icon: HardDrive, color: "#64748b", bg: "rgba(100, 116, 139, 0.12)", label: "Ollama" };
-  }
-  if (key.includes("cursor") || key.includes("code") || key.includes("vs") || category === "editor") {
-    return { icon: AppWindow, color: "#059669", bg: "rgba(5, 150, 105, 0.12)", label: "Code Editor" };
-  }
-  if (key.includes("aider") || key.includes("codex") || key.includes("cli") || key.includes("terminal")) {
-    return { icon: Terminal, color: "#0284c7", bg: "rgba(2, 132, 199, 0.12)", label: "CLI Tool" };
-  }
-  if (category === "browser" || key.includes("web") || key.includes("chrome") || key.includes("firefox")) {
-    return { icon: Globe, color: "#f59e0b", bg: "rgba(245, 158, 11, 0.12)", label: "Web App" };
-  }
-  return { icon: Layers, color: "#8b5cf6", bg: "rgba(139, 92, 246, 0.12)", label: "Application" };
 }
 
 function getProviderTypeLabel(type: ProviderType): string {
@@ -467,8 +420,6 @@ function ConnectedProviderCard({ provider, options }: { provider: Provider; opti
     setEndpoint(provider.binaryOrEndpoint);
   }, [provider.binaryOrEndpoint]);
 
-  const brand = getBrand(provider.id, provider.name);
-  const BrandIcon = brand.icon;
   const isWeb = provider.providerType === "isolated_webview" || provider.providerType === "official_oauth";
 
   function copyPath() {
@@ -670,8 +621,6 @@ function ConnectedProviderCard({ provider, options }: { provider: Provider; opti
 function ConnectedAppCard({ app, onBrowse }: { app: LinkedApp; onBrowse: () => void }) {
   const run = useOmni((s) => s.run);
   const busy = useOmni((s) => s.busy);
-  const brand = getBrand(app.id, app.appName, app.category);
-  const BrandIcon = brand.icon;
   const isRunning = Boolean(app.activePid);
 
   return (
@@ -739,8 +688,6 @@ function WaitingProviderCard({ provider, options }: { provider: Provider; option
   const [showSecret, setShowSecret] = useState(false);
   const [endpoint, setEndpoint] = useState(provider.binaryOrEndpoint);
 
-  const brand = getBrand(provider.id, provider.name);
-  const BrandIcon = brand.icon;
   const isWeb = provider.providerType === "official_oauth" || provider.providerType === "isolated_webview";
   const isOllama = provider.providerType === "local_ollama";
   const isCli = provider.providerType === "cli_subprocess";
@@ -903,8 +850,6 @@ function WaitingProviderCard({ provider, options }: { provider: Provider; option
 // Component: Missing App Card (Catalog Style)
 // -------------------------------------------------------------
 function MissingAppCard({ app, onBrowse }: { app: LinkedApp; onBrowse: () => void }) {
-  const brand = getBrand(app.id, app.appName, app.category);
-  const BrandIcon = brand.icon;
   const installUrl = INSTALLS[app.id];
 
   return (
@@ -1257,5 +1202,4 @@ const ENGINE_ORDER = ["mem0_builtin", "zep_graphiti", "cognee", "letta", "obsidi
 
 import BotFleetMissionControl from "../components/BotFleetMissionControl";
 
-export { Memory } from "./memory";
 export { BotFleetMissionControl as Fleet };
