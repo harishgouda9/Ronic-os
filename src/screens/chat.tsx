@@ -368,8 +368,18 @@ export function Chat() {
     }
   }
 
+  // The [keyedKey] effect below loads the model list on mount with the full
+  // selection precedence (focus harness, saved, thread, profile). Skip this
+  // effect's first run so the two don't race two invoke() calls and two
+  // conflicting setModelId updaters; it only needs to react to mid-session
+  // recoveries, which bump the store generation.
+  const skippedFirstGenerationRun = useRef(false);
   useEffect(() => {
     if (generation === 0) return;
+    if (!skippedFirstGenerationRun.current) {
+      skippedFirstGenerationRun.current = true;
+      return;
+    }
     sending.current = false;
     setOptimisticSteps([]);
     setChatError(null);
@@ -386,6 +396,9 @@ export function Chat() {
       requestAnimationFrame(() => {
         scrollToBottom(false);
       });
+    }).catch((error) => {
+      setModelsReady(true);
+      setMenuStatus(errorText(error));
     });
   }, [generation]);
 
@@ -681,10 +694,6 @@ export function Chat() {
         setInstallAsk(null);
         setDeskNote(res.toast ?? `Opened ${app.name}.`);
       }
-    } catch (error) {
-      const message = errorText(error);
-      setDeskNote(message);
-      useOmni.setState({ toast: message });
     } finally {
       setDeskBusy(null);
     }
@@ -846,16 +855,11 @@ export function Chat() {
 
     // 2. Identify active background activity from user intent
     const lower = text.toLowerCase();
-    let activity = "thinking...";
-    if (/install|download|npm|pip|cargo|plugin|package|setup/i.test(lower)) {
-      activity = "installing...";
-    } else if (/edit|modify|change|write|fix|refactor|update|create|code/i.test(lower)) {
-      activity = "working...";
-    } else if (/search|find|research|lookup|browse|crawl|google|read|scan/i.test(lower)) {
-      activity = "researching...";
-    } else {
-      activity = "working...";
-    }
+    const activity = /install|download|npm|pip|cargo|plugin|package|setup/i.test(lower)
+      ? "installing..."
+      : /search|find|research|lookup|browse|crawl|google|read|scan/i.test(lower)
+        ? "researching..."
+        : "working...";
     setLiveActivity(activity);
     setOptimisticSteps((prev) => [...prev, optimisticStep]);
 
@@ -1266,6 +1270,8 @@ export function Chat() {
                   setModels(next);
                   setModelId((current) => next.some((item) => item.id === current) ? current : (next[0]?.id ?? ""));
                   setMenuStatus(result.notes.join(" "));
+                }).catch((error) => {
+                  setMenuStatus(errorText(error));
                 }).finally(() => setRefreshing(false));
               }}
               onMode={setMenuMode}

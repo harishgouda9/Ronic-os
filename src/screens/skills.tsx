@@ -1,29 +1,18 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   AlertCircle,
-  ArrowUpRight,
   Check,
-  CheckCheck,
-  Code2,
-  Copy,
   Edit3,
-  ExternalLink,
   Eye,
   FileText,
   Filter,
-  FolderPlus,
-  Layers,
-  Play,
   Plus,
   Puzzle,
   RefreshCw,
   Search,
   Server,
   ShieldCheck,
-  Sliders,
   Sparkles,
-  Tag,
-  Terminal,
   Trash2,
   X,
 } from "lucide-react";
@@ -59,7 +48,6 @@ export function Skills() {
   // Editing Skill State
   const [editingSkill, setEditingSkill] = useState<Skill | null>(null);
   const [editBody, setEditBody] = useState<string>("");
-  const [editFiles, setEditFiles] = useState<{ path: string; content: string }[]>([]);
 
   // Plugins Tab State
   const [pluginSubTab, setPluginSubTab] = useState<"installed" | "project">("installed");
@@ -155,7 +143,7 @@ export function Skills() {
       newSkillBody.trim() ||
       `---\nname: ${slug}\ndescription: ${desc}\nslash_command: /${slug}\nrequires_tools: [${tools.join(", ")}]\nplatforms: [windows, macos, linux]\n---\n\n# ${title}\n\n1. Follow prompt instructions carefully.\n`;
 
-    await run("save_skill", {
+    const res = await run("save_skill", {
       draft: {
         id: "",
         profileId: profile?.id || "",
@@ -170,6 +158,10 @@ export function Skills() {
       },
     });
 
+    if (!res) {
+      setAuthorNotice("Could not register the skill. The toast has the reason.");
+      return;
+    }
     setAuthorNotice(`✓ Successfully authored and registered /${slug}`);
     setNewSkillSlug("");
     setNewSkillTitle("");
@@ -501,7 +493,6 @@ export function Skills() {
                         onClick={() => {
                           setEditingSkill(skill);
                           setEditBody(skill.body);
-                          setEditFiles(skill.files ?? []);
                         }}
                         className="p-1 text-slate-400 hover:text-slate-700 rounded transition"
                         title="Edit playbook"
@@ -982,7 +973,7 @@ export function Skills() {
                 type="button"
                 disabled={busy || !mcpName.trim()}
                 onClick={async () => {
-                  await run("save_mcp", {
+                  const res = await run("save_mcp", {
                     draft: {
                       id: "",
                       name: mcpName.trim(),
@@ -993,6 +984,10 @@ export function Skills() {
                       tools: mcpTool.trim() ? [{ name: mcpTool.trim(), description: mcpTool.trim() }] : [],
                     },
                   });
+                  if (!res) {
+                    setAuthorNotice("Could not register the MCP server. The toast has the reason.");
+                    return;
+                  }
                   setAuthorNotice(`✓ Registered MCP server "${mcpName}"`);
                   setMcpName("");
                   setMcpCommand("");
@@ -1088,7 +1083,7 @@ export function Skills() {
                 type="button"
                 disabled={busy || !plugSlug.trim()}
                 onClick={async () => {
-                  await run("save_plugin", {
+                  const res = await run("save_plugin", {
                     draft: {
                       id: "",
                       version: "1.0.0",
@@ -1102,6 +1097,10 @@ export function Skills() {
                       desktop: plugHasDesktop && plugLabel.trim() ? [{ kind: "status", label: plugLabel.trim(), target: "" }] : [],
                     },
                   });
+                  if (!res) {
+                    setAuthorNotice("Could not save the plugin manifest. The toast has the reason.");
+                    return;
+                  }
                   setAuthorNotice(`✓ Created plugin manifest for "${plugSlug}"`);
                   setPlugSlug("");
                   setPlugName("");
@@ -1275,7 +1274,6 @@ export function Skills() {
                   onClick={() => {
                     setEditingSkill(viewingSkill);
                     setEditBody(viewingSkill.body);
-                    setEditFiles(viewingSkill.files ?? []);
                     setViewingSkill(null);
                   }}
                   className="px-3.5 py-1.5 text-xs font-semibold text-slate-700 bg-white border border-slate-300 hover:bg-slate-100 rounded-[6px] transition flex items-center gap-1.5"

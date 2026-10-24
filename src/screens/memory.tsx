@@ -134,7 +134,6 @@ export function Memory() {
   // Functional 1-Click Installer State
   const [installingEngine, setInstallingEngine] = useState<string | null>(null);
   const [installerEndpoint, setInstallerEndpoint] = useState<string>("http://127.0.0.1:8000");
-  const [installerApiKey, setInstallerApiKey] = useState<string>("");
   const [installerProbeStatus, setInstallerProbeStatus] = useState<"idle" | "probing" | "online" | "offline">("idle");
   const [installerProbeDetail, setInstallerProbeDetail] = useState<string>("");
   const [installerCopied, setInstallerCopied] = useState<boolean>(false);
@@ -165,7 +164,6 @@ export function Memory() {
       setInstallingEngine(engId);
       setInstallerCopied(false);
       setInstallerEndpoint(defaultUrl);
-      setInstallerApiKey("");
       setInstallerProbeStatus("probing");
       setInstallerProbeDetail(`Probing 127.0.0.1:${port}...`);
 
@@ -258,6 +256,24 @@ export function Memory() {
   const [editAppliesTo, setEditAppliesTo] = useState<string>(selectedMemory?.appliesTo || "Workspace default");
   const [editFileUri, setEditFileUri] = useState<string>(selectedMemory?.fileOrUri || "");
   const [editTags, setEditTags] = useState<string>(selectedMemory?.tags?.join(", ") || "");
+
+  // Memories load asynchronously and the visible selection can change without
+  // a click (first snapshot arrival, deletion of the selected note). Sync the
+  // editor to the resolved selection; typing on an unchanged note is untouched.
+  const resolvedMemoryId = selectedMemory?.id ?? "";
+  useEffect(() => {
+    if (isCreatingNew) return;
+    const mem = selectedMemory;
+    if (!mem) return;
+    setEditTitle(mem.title);
+    setEditFact(mem.fact);
+    setEditCategory(mem.category);
+    setEditSource(mem.source);
+    setEditAppliesTo(mem.appliesTo);
+    setEditFileUri(mem.fileOrUri);
+    setEditTags(mem.tags.join(", "));
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- rerun only when the selection identity changes
+  }, [resolvedMemoryId]);
 
   // Tab 2: Graph Explorer State
   const [selectedGraphNode, setSelectedGraphNode] = useState<string | null>(null);
@@ -611,8 +627,9 @@ export function Memory() {
           <button
             disabled={busy}
             onClick={() => {
-              void run("refresh_memory_vault", { engineId: activeEngine });
-              setStatusBanner(`✓ Refreshed state.db: ${atomicMemories.length} atomic memories & ${graphEdges.length} graph edges.`);
+              void run("refresh_memory_vault", { engineId: activeEngine }).then((res) => {
+                setStatusBanner(res ? (res.toast || `Refreshed state.db: ${atomicMemories.length} atomic memories & ${graphEdges.length} graph edges.`) : "Could not refresh the vault.");
+              });
             }}
             className="px-3 py-1.5 text-xs font-semibold bg-white border border-[#E5E5E5] rounded-[6px] hover:border-slate-400 transition"
           >
@@ -621,8 +638,9 @@ export function Memory() {
           <button
             disabled={busy}
             onClick={() => {
-              void run("sync_memories_to_engine", { targetEngineId: "obsidian_khoj" });
-              setStatusBanner(`✓ Exported ${atomicMemories.length} Mem0 facts and [[Wikilinks]] graph edges to Obsidian vault.`);
+              void run("sync_memories_to_engine", { targetEngineId: "obsidian_khoj" }).then((res) => {
+                setStatusBanner(res ? (res.toast || `Exported ${atomicMemories.length} Mem0 facts and [[Wikilinks]] graph edges to Obsidian vault.`) : "Could not export to Obsidian.");
+              });
             }}
             className="px-3 py-1.5 text-xs font-semibold bg-white border border-[#E5E5E5] rounded-[6px] hover:border-slate-400 transition"
           >
@@ -1515,27 +1533,18 @@ export function Memory() {
                   </div>
 
                   {/* Config Inputs */}
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                    <div className="space-y-1">
-                      <label className="text-xs font-semibold text-slate-700">Server Endpoint</label>
-                      <input
-                        type="text"
-                        value={installerEndpoint}
-                        onChange={(e) => setInstallerEndpoint(e.target.value)}
-                        placeholder="http://127.0.0.1:8000"
-                        className="w-full px-3 py-1.5 text-xs font-mono bg-white border border-[#E5E5E5] rounded-[6px] outline-none focus:border-slate-400"
-                      />
-                    </div>
-                    <div className="space-y-1">
-                      <label className="text-xs font-semibold text-slate-700">API Key (Optional)</label>
-                      <input
-                        type="password"
-                        value={installerApiKey}
-                        onChange={(e) => setInstallerApiKey(e.target.value)}
-                        placeholder="None (local) or zep_..."
-                        className="w-full px-3 py-1.5 text-xs font-mono bg-white border border-[#E5E5E5] rounded-[6px] outline-none focus:border-slate-400"
-                      />
-                    </div>
+                  <div className="space-y-1">
+                    <label className="text-xs font-semibold text-slate-700">Server Endpoint</label>
+                    <input
+                      type="text"
+                      value={installerEndpoint}
+                      onChange={(e) => setInstallerEndpoint(e.target.value)}
+                      placeholder="http://127.0.0.1:8000"
+                      className="w-full px-3 py-1.5 text-xs font-mono bg-white border border-[#E5E5E5] rounded-[6px] outline-none focus:border-slate-400"
+                    />
+                    <p className="text-[10px] text-slate-400">
+                      Chat still reads the built-in vault. Endpoint is saved for the day a recall driver ships for this engine.
+                    </p>
                   </div>
 
                   {/* Footer Actions */}
@@ -1574,7 +1583,7 @@ export function Memory() {
                         style={{ color: "#ffffff" }}
                       >
                         <Check size={13} className="text-white" stroke="#ffffff" />
-                        <span className="text-white" style={{ color: "#ffffff" }}>Test & Connect</span>
+                        <span className="text-white" style={{ color: "#ffffff" }}>Save & Test</span>
                       </button>
                     </div>
                   </div>

@@ -235,7 +235,7 @@ export default function BotFleetMissionControl() {
     const trimmed = quickSignalInput.trim();
     if (!trimmed) return;
     const activeBot = daemons.find((d) => d.category === "bot_daemon" && (d.pid || d.status === "running"));
-    const targetId = activeBot ? activeBot.name : "Fleet";
+    const targetId = activeBot ? activeBot.id : "";
     setQuickSignalInput("");
     await run("send_fleet_daemon_input", { id: targetId, input: trimmed });
   };
@@ -650,7 +650,8 @@ export default function BotFleetMissionControl() {
             </div>
           </div>
 
-          {/* Quick Daemon Command Dispatch Input */}
+          {/* Quick operator note — daemons run in their own console, so this
+              lands in the shared fleet log rather than a process stdin. */}
           <div className="pt-2 border-t border-[#E5E5E5] flex gap-1.5">
             <input
               value={quickSignalInput}
@@ -660,16 +661,17 @@ export default function BotFleetMissionControl() {
                   void handleSendSignal();
                 }
               }}
-              placeholder="Send stdin signal or ping to active daemon..."
+              placeholder="Post an operator note to the fleet log..."
               className="flex-1 px-2.5 py-1.5 text-xs font-mono border border-[#E5E5E5] rounded-[6px] outline-none focus:border-[#111111] bg-white text-[#0F172A]"
             />
             <button
               type="button"
               onClick={() => void handleSendSignal()}
+              title="Saves the note to the fleet log (daemon stdin is not reachable)"
               className="px-3 py-1.5 text-xs font-semibold bg-[#111111] text-white rounded-[6px] hover:opacity-90 cursor-pointer flex items-center gap-1"
             >
               <Send size={12} />
-              <span>Send</span>
+              <span>Post</span>
             </button>
           </div>
         </div>

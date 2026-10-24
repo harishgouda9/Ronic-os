@@ -1,6 +1,17 @@
 import { create } from "zustand";
 import { call, isTauri } from "./api";
+import { RAIL } from "./types";
 import type { CommandResult, ScreenId, Snapshot } from "./types";
+
+// sessionStorage can hold a screen id from an older build; anything unknown
+// falls back to chat instead of flowing into typed lookups.
+const KNOWN_SCREENS: readonly ScreenId[] = [
+  ...RAIL.map((item) => item.id),
+  "onboarding",
+  "vault",
+  "profiles",
+  "capabilities",
+];
 
 type State = {
   snap: Snapshot | null;
@@ -53,7 +64,9 @@ export const useOmni = create<State>((set, get) => ({
         const res = await call("bootstrap");
         if (ticket !== generation) return false;
         const saved = sessionStorage.getItem("omni.screen") as ScreenId | null;
-        const screen = res.snapshot.onboardingComplete ? saved || "chat" : "onboarding";
+        const known = new Set<string>(KNOWN_SCREENS);
+        const stored = saved && known.has(saved) ? saved : null;
+        const screen = res.snapshot.onboardingComplete ? stored || "chat" : "onboarding";
         if (!res.snapshot.vaultUnlocked) {
           set({ snap: res.snapshot, loading: false, error: null, screen: "vault" });
           return false;

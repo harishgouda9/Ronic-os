@@ -80,6 +80,9 @@ export function AccountPanel() {
           void saveDisplayName(name).then((message) => {
             setNote(message || "Profile saved.");
             setBusy(false);
+          }).catch((error) => {
+            setNote(error instanceof Error ? error.message : String(error));
+            setBusy(false);
           });
         }}
       >Save profile</button>

@@ -15,6 +15,12 @@ export function Wallet() {
   const [slippage, setSlippage] = useState(String(policy.maxSlippageBps));
   const pending = snap.transactions.filter((tx) => tx.policyDecision === "pending_approval");
 
+  // The policy can change on other screens (or from a bot's wallet review);
+  // keep the field in view so a submit never sends a stale bps.
+  useEffect(() => {
+    setSlippage(String(policy.maxSlippageBps));
+  }, [policy.maxSlippageBps]);
+
   function savePolicy(next: Partial<typeof policy>) {
     const merged = { ...policy, ...next };
     void run("set_policy", {
