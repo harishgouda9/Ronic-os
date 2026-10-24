@@ -372,6 +372,16 @@ export type Extension = {
   code: string;
 };
 
+export type LicenseInfo = {
+  planTier: "free" | "pro" | "founder_lifetime" | "team" | string;
+  status: "active" | "expired" | "invalid" | "unsigned_dev" | "none" | string;
+  founderBadge: number | null;
+  maxDevices: number;
+  walletMicroUsd: number;
+  leaseExpUnix: number;
+  hardwareHash: string;
+};
+
 export type MarketItem = {
   slug: string;
   title: string;
@@ -471,6 +481,7 @@ export type Snapshot = {
   domLatencyMs: number;
   sandboxOutput: string;
   bugPreview: string;
+  license: LicenseInfo;
 };
 
 export type CommandResult = { snapshot: Snapshot; toast: string | null; installChoice?: string | null; payload?: unknown };

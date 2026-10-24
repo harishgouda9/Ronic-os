@@ -64,7 +64,17 @@ npm run test:rust      # Rust unit tests (embeds the comctl6 manifest on Windows
 
 ```
 src/            React app (screens, components, kernel glue, browser preview)
-src-tauri/      Rust backend (commands, agent loop, bridge, fleet, vault)
+src-tauri/      Rust backend (commands, agent loop, bridge, fleet, vault, licensing)
+backend/        Vercel control plane (billing webhooks, burst proxy, PKCE bounce)
+supabase/       schema.sql + license-lease Edge Function (Ed25519 signer)
 scripts/        desktop dev/build orchestration + test runners
-supabase/       optional cloud account/store schema (anon key only)
 ```
+
+## Cloud licensing (summary)
+
+The desktop verifies Ed25519-signed 7-day leases offline — see
+[`backend/README.md`](backend/README.md) for the deploy/secrets checklist and
+`supabase/schema.sql` for the tables. Release builds compile in
+`RONIC_ED25519_PUBLIC_KEY`; without it the app runs in unsigned dev mode
+(license shown, never enforced) and every local feature keeps working.
+

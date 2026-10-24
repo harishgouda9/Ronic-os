@@ -10,7 +10,7 @@
 //
 // Usage: node scripts/rust-tests.mjs [--lib]
 
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -28,6 +28,56 @@ const cargoEnv = {
 
 function run(command, cmdArgs, options = {}) {
   execFileSync(command, cmdArgs, { stdio: "inherit", ...options });
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// The GNU-built test exe imports api-ms-win-* DLLs by name; under a shell
+// with a POSIX-style PATH (Git Bash / MSYS) the Windows loader cannot resolve
+// them and the process dies with STATUS_ENTRYPOINT_NOT_FOUND before main.
+// Run it with a clean Windows PATH so the result never depends on the shell
+// that launched the script.
+function windowsLoaderPath() {
+  const root = process.env.SystemRoot || "C:\\Windows";
+  const cargoBin = process.env.USERPROFILE ? join(process.env.USERPROFILE, ".cargo", "bin") : "";
+  return [
+    join(root, "System32"),
+    root,
+    join(root, "System32", "Wbem"),
+    join(root, "System32", "WindowsPowerShell", "v1.0"),
+    cargoBin,
+  ].filter(Boolean).join(";");
+}
+
+// Console-test binaries built by the GNU toolchain can die at CRT startup
+// (0xC0000139) when they inherit MSYS pipe handles from a Git Bash parent,
+// before main() ever runs. Capturing and forwarding their output instead of
+// inheriting handles works from every shell. A long AV-scan hold right after
+// mt.exe rewrites the exe is covered by the backoff retries.
+async function runTestExe(testExe, args, options) {
+  const cleanEnv = { ...process.env, PATH: windowsLoaderPath() };
+  const delays = [0, 3000, 8000, 15000, 25000];
+  let lastError;
+  for (const delay of delays) {
+    if (delay) {
+      console.log(`Test binary failed to load (scanner hold); retrying in ${delay / 1000}s…`);
+      await sleep(delay);
+    }
+    try {
+      const res = spawnSync(testExe, args, { ...options, env: cleanEnv, stdio: "pipe", encoding: "utf8", maxBuffer: 32 * 1024 * 1024 });
+      if (res.stdout) process.stdout.write(res.stdout);
+      if (res.stderr) process.stderr.write(res.stderr);
+      if (res.status === 0) return;
+      if (res.status !== null && res.status !== 3221225781 && res.status !== 193) {
+        process.exitCode = res.status ?? 1;
+        return;
+      }
+      lastError = new Error(`test binary exited with ${res.status}`);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError;
 }
 
 function findMt() {
@@ -89,5 +139,7 @@ if (process.platform !== "win32") {
   const manifestFile = join(targetDir, "comctl6.manifest");
   writeFileSync(manifestFile, manifest, "utf8");
   run(mt, ["-manifest", manifestFile, `-outputresource:${testExe};#1`]);
-  run(testExe, args.filter((item) => item !== "--lib"), { cwd: tauriDir });
+  // No cwd: the repo path contains spaces and the MinGW loader fails to
+  // resolve its api-set imports when the working directory has spaces.
+  await runTestExe(testExe, args.filter((item) => item !== "--lib"), {});
 }

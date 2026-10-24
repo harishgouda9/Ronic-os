@@ -1741,6 +1741,15 @@ function seed(): Snapshot {
     domLatencyMs: 0,
     sandboxOutput: "",
     bugPreview: "",
+    license: {
+      planTier: "free",
+      status: "unsigned_dev",
+      founderBadge: null,
+      maxDevices: 1,
+      walletMicroUsd: 0,
+      leaseExpUnix: 0,
+      hardwareHash: "",
+    },
   };
 }
 

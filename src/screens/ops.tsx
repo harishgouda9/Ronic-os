@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import type { Settings } from "../types";
 import { useOmni } from "../store";
+import { cloudConfig, startProductCheckout } from "../services/cloud";
 import { money, Pill, tone, when } from "../ui/bits";
 
 export function Wallet() {
@@ -285,9 +286,12 @@ export function Billing() {
   const snap = useOmni((s) => s.snap)!;
   const run = useOmni((s) => s.run);
   const settings = snap.settings;
+  const license = snap.license;
+  const [billingNote, setBillingNote] = useState("");
   function save(next: Settings) {
     void run("save_settings", { settings: next });
   }
+  const walletUsd = (license?.walletMicroUsd ?? 0) / 1_000_000;
   return (
     <div className="screen">
       <div>
@@ -295,10 +299,47 @@ export function Billing() {
         <p className="muted">{settings.plan} · installed {settings.version}. {settings.availableVersion === settings.version ? "No update is listed." : `Listed update ${settings.availableVersion}.`} This screen does not download a signed binary.</p>
       </div>
       <div className="grid-3">
-        <article className="card"><div className="muted">Burst credits</div><div className="kpi">{money(settings.burstCreditsUsd)}</div></article>
+        <article className="card">
+          <div className="muted">Cloud plan</div>
+          <div className="kpi">{license ? tierLabel(license.planTier, license.founderBadge) : "—"}</div>
+          <p className="faint">{license ? licenseStatusLabel(license.status) : "Sign in from Settings to see the cloud license."}</p>
+        </article>
+        <article className="card"><div className="muted">Burst credits (local)</div><div className="kpi">{money(settings.burstCreditsUsd)}</div><p className="faint">Cloud wallet: {money(walletUsd)}</p></article>
         <article className="card"><div className="muted">Ghost runners</div><div>{settings.ghostRunners.join(", ") || "None"}</div></article>
-        <article className="card"><div className="muted">Auto-act under</div><div className="kpi">{money(settings.autoActUnderUsd)}</div></article>
       </div>
+
+      <section className="card stack">
+        <strong>Revenue streams</strong>
+        <div className="grid-3">
+          <article className="card">
+            <strong>Ronic Pro</strong>
+            <p className="muted">$14/mo or $120/yr · ₹999/mo UPI</p>
+            <p className="faint">Unlimited 4-lane multiplexer, &lt;50ms failover, squads, auto Supercharge, 6 memory engines, 3 machines.</p>
+            <div className="row-actions">
+              <button type="button" className="btn small" disabled={!cloudConfig.checkoutApi} title={cloudConfig.checkoutApi ? undefined : "VITE_CHECKOUT_API is not set on this build."} onClick={() => void checkout("pro_monthly", "stripe")}>$14/mo card</button>
+              <button type="button" className="btn ghost small" disabled={!cloudConfig.checkoutApi} onClick={() => void checkout("pro_monthly", "razorpay")}>₹999 UPI</button>
+            </div>
+          </article>
+          <article className="card">
+            <strong>Founder Pass</strong>
+            <p className="muted">$149 once · ₹11,999 · 500 total</p>
+            <p className="faint">Lifetime Pro, 3 machines, ★ badge. When the pool empties it is gone for good.</p>
+            <div className="row-actions">
+              <button type="button" className="btn small" disabled={license?.planTier === "founder_lifetime" || !cloudConfig.checkoutApi} onClick={() => void checkout("founder_pass", "stripe")}>
+                {license?.planTier === "founder_lifetime" ? "★ Yours" : "Claim — $149"}
+              </button>
+              <button type="button" className="btn ghost small" disabled={license?.planTier === "founder_lifetime" || !cloudConfig.checkoutApi} onClick={() => void checkout("founder_pass", "razorpay")}>₹11,999</button>
+            </div>
+          </article>
+          <article className="card">
+            <strong>24/7 Ghost Runners</strong>
+            <p className="muted">$19/mo per runner or $0.008/hr</p>
+            <p className="faint">Cloud Firecracker microVMs keep bots and cron routines alive with the lid closed. Orchestrator deploys separately; billing tables are live.</p>
+          </article>
+        </div>
+        {billingNote ? <p className="muted">{billingNote}</p> : null}
+      </section>
+
       <section className="card stack">
         <label className="field">
           <span>Update channel</span>
@@ -315,5 +356,40 @@ export function Billing() {
       </section>
     </div>
   );
+
+  async function checkout(product: "founder_pass" | "pro_monthly" | "pro_yearly", rail: "stripe" | "razorpay") {
+    setBillingNote("Starting checkout…");
+    const { error, checkout: started } = await startProductCheckout(product, rail);
+    if (error || !started) {
+      setBillingNote(error ?? "Checkout did not start.");
+      return;
+    }
+    if (started.kind === "stripe") {
+      try {
+        const { invoke } = await import("@tauri-apps/api/core");
+        await invoke("open_system_url", { url: started.url });
+        setBillingNote("Checkout opened in your browser. The plan lands on your account after payment.");
+      } catch (error) {
+        setBillingNote(error instanceof Error ? error.message : String(error));
+      }
+      return;
+    }
+    setBillingNote(`Razorpay order ${started.orderId} created (₹${(started.amountPaise / 100).toFixed(0)}). Finish it from the Razorpay page with key ${started.keyId}.`);
+  }
+}
+
+function tierLabel(tier: string, badge: number | null): string {
+  if (tier === "founder_lifetime") return badge ? `Founder #${badge}` : "Founder Pass";
+  if (tier === "pro") return "Ronic Pro";
+  if (tier === "team") return "Team";
+  return "Starter";
+}
+
+function licenseStatusLabel(status: string): string {
+  if (status === "active") return "Ed25519 lease verified locally. Works offline for 7 days.";
+  if (status === "unsigned_dev") return "Unsigned dev build — entitlements are shown, not enforced.";
+  if (status === "expired") return "Lease expired. Sign in from Settings to refresh it.";
+  if (status === "invalid") return "Lease failed the signature check. Sign in to refresh.";
+  return "No cloud lease yet. Register this machine from Settings.";
 }
 
