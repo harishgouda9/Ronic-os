@@ -460,10 +460,63 @@ pub fn remove_mcp(conn: &Connection, home: &Path, id: &str) -> Result<()> {
     Ok(())
 }
 
+// Marketplace items whose integration is an MCP server. Installing one of
+// these slugs registers the real server entry (untrusted until the user
+// reviews it) instead of only writing a documentation skill.
+struct CatalogMcp {
+    name: &'static str,
+    transport: &'static str, // "sse" for remote URLs, "stdio" for local commands
+    command: &'static str,
+    args: &'static [&'static str],
+    url: &'static str,
+    note: &'static str,
+}
+
+fn catalog_mcp(slug: &str) -> Option<CatalogMcp> {
+    let found: CatalogMcp = match slug {
+        "notion-mcp" => CatalogMcp { name: "Notion", transport: "sse", command: "", args: &[], url: "https://mcp.notion.com/mcp", note: "Notion asks you to sign in the first time it connects." },
+        "linear-mcp" => CatalogMcp { name: "Linear", transport: "sse", command: "", args: &[], url: "https://mcp.linear.app/sse", note: "Linear asks you to sign in the first time it connects." },
+        "sentry-mcp" => CatalogMcp { name: "Sentry", transport: "sse", command: "", args: &[], url: "https://mcp.sentry.dev/mcp", note: "Sentry asks you to authorize the connection." },
+        "slack-mcp" => CatalogMcp { name: "Slack", transport: "sse", command: "", args: &[], url: "https://slack.com/api/mcp", note: "Slack asks you to install the app into your workspace." },
+        "composio-mcp" => CatalogMcp { name: "Composio MCP", transport: "sse", command: "", args: &[], url: "https://connect.composio.dev/mcp", note: "Composio asks you to connect apps from its dashboard." },
+        "github-mcp" => CatalogMcp { name: "GitHub MCP", transport: "sse", command: "", args: &[], url: "https://api.githubcopilot.com/mcp/", note: "GitHub asks you to authorize with your account." },
+        "supabase-mcp" => CatalogMcp { name: "Supabase", transport: "stdio", command: "npx", args: &["-y", "supabase-mcp@latest"], url: "", note: "Supabase needs a personal access token in the server command." },
+        "filesystem-mcp" => CatalogMcp { name: "Filesystem MCP", transport: "stdio", command: "npx", args: &["-y", "@modelcontextprotocol/server-filesystem"], url: "", note: "The server opens the workspace folder on this computer." },
+        "memory-mcp" => CatalogMcp { name: "Memory MCP", transport: "stdio", command: "npx", args: &["-y", "@modelcontextprotocol/server-memory"], url: "", note: "" },
+        "playwright-cdp" => CatalogMcp { name: "Playwright MCP", transport: "stdio", command: "npx", args: &["-y", "@playwright/mcp@latest"], url: "", note: "" },
+        "razorpay-upi" => CatalogMcp { name: "Razorpay MCP", transport: "stdio", command: "npx", args: &["-y", "razorpay-mcp"], url: "", note: "Razorpay needs your key id and secret in the server command." },
+        _ => return None,
+    };
+    Some(found)
+}
+
 pub fn install_catalog(conn: &Connection, home: &Path, profile_id: &str, slug: &str, title: &str, blurb: &str) -> Result<String> {
     let slug = skill_doc::sanitize_slug(slug);
     if slug.is_empty() {
         return Err(err("unknown marketplace item"));
+    }
+    // The skill stays as the readable playbook; MCP-backed items also get the
+    // real server registered so the integration exists, not just its docs.
+    let mut installed_mcp = false;
+    let mut mcp_note = String::new();
+    if let Some(mcp) = catalog_mcp(&slug) {
+        let mut args: Vec<String> = mcp.args.iter().map(|arg| arg.to_string()).collect();
+        if slug == "filesystem-mcp" {
+            // Point the official filesystem server at this workspace.
+            args.push(home.display().to_string());
+        }
+        save_mcp(conn, home, McpDraft {
+            id: String::new(),
+            name: mcp.name.into(),
+            transport: mcp.transport.into(),
+            command: mcp.command.into(),
+            args,
+            url: mcp.url.into(),
+            tools: Vec::new(),
+            secret: String::new(),
+        })?;
+        installed_mcp = true;
+        mcp_note = mcp.note.to_string();
     }
     let body = skill_doc::render_skill(&slug, title, &format!("/{slug}"), &[], &["windows".into(), "macos".into(), "linux".into()], &format!("# {title}\n\n{blurb}\n"));
     let catalog = home.join("catalog").join("skills").join(&slug).join("SKILL.md");
@@ -475,8 +528,13 @@ pub fn install_catalog(conn: &Connection, home: &Path, profile_id: &str, slug: &
     }
     let parsed = skill_doc::parse_skill(&fs::read_to_string(&catalog)?, &slug);
     upsert_skill(conn, &format!("sk-catalog-{slug}"), &slug, "catalog", "", "", &parsed, &display_path(home, &catalog))?;
+    let mcp_suffix = if installed_mcp {
+        format!(" The MCP server entry is saved — review and trust it on the Skills screen before enabling it. {mcp_note}").trim_end().to_string()
+    } else {
+        String::new()
+    };
     if profile_id.is_empty() || !profile_exists(conn, profile_id)? {
-        return Ok("Catalog skill saved. Create a bot profile to enable it.".into());
+        return Ok(format!("Catalog skill saved. Create a bot profile to enable it.{mcp_suffix}"));
     }
     let copy = home.join("profiles").join(profile_id).join("skills").join(&slug).join("SKILL.md");
     if let Some(parent) = copy.parent() {
@@ -489,7 +547,7 @@ pub fn install_catalog(conn: &Connection, home: &Path, profile_id: &str, slug: &
     upsert_skill(conn, &id, &slug, "profile", profile_id, "", &parsed, &display_path(home, &copy))?;
     ensure_enable(conn, &id, profile_id, true)?;
     note_delta(conn, profile_id, &format!("Skill index changed: /{slug} is on."))?;
-    Ok("Installed into the selected profile.".into())
+    Ok(format!("Installed into the selected profile.{mcp_suffix}"))
 }
 
 struct SkillRow {

@@ -6,11 +6,8 @@ use crate::util::{nid, now_ms, run_capture};
 use crate::AppState;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::Path;
-use std::process::Child;
 use std::sync::atomic::Ordering;
-use std::sync::Mutex;
 use std::time::Duration;
 use tauri::State;
 
@@ -56,10 +53,7 @@ pub struct FleetStatusPayload {
     pub logs: Vec<FleetLogEntry>,
 }
 
-static FLEET_CHILDREN: Mutex<Option<HashMap<String, Child>>> = Mutex::new(None);
-
-fn guard(state: &AppState) -> std::sync::MutexGuard<'_, Connection> {
-    state.conn.lock().unwrap_or_else(|e| e.into_inner())
+fn guard(state: &AppState) -> std::sync::MutexGuard<'_, Connection> {    state.conn.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn finish_result(state: &AppState, toast: Option<String>) -> Result<CommandResult> {
@@ -118,7 +112,9 @@ pub fn get_fleet_daemons(conn: &Connection, proxy_port: u16) -> Result<Vec<Fleet
             category: "kernel".into(),
             pid: Some(std::process::id() as i64),
             status: "alive".into(),
-            ram_mb: 4,
+            // Working set is not measured; 0 renders as "—" instead of a
+            // made-up number.
+            ram_mb: 0,
             detail_path_or_url: "500ms heartbeat & WAL guard".into(),
             ghost_runner_active: false,
         },
@@ -128,7 +124,7 @@ pub fn get_fleet_daemons(conn: &Connection, proxy_port: u16) -> Result<Vec<Fleet
             category: "kernel".into(),
             pid: None,
             status: if proxy_port == 0 { "starting".into() } else { "listening".into() },
-            ram_mb: 8,
+            ram_mb: 0,
             detail_path_or_url: format!("127.0.0.1:{port}/v1 (OpenAI-Compatible Multiplexer)"),
             ghost_runner_active: false,
         },
@@ -172,24 +168,31 @@ pub fn get_fleet_daemons(conn: &Connection, proxy_port: u16) -> Result<Vec<Fleet
 pub fn get_fleet_routines(conn: &Connection) -> Result<Vec<FleetRoutine>> {
     let mut routines = Vec::new();
 
-    // Query real routines from chat_threads
-    let mut stmt = conn.prepare("SELECT id, title, routine_schedule FROM chat_threads WHERE routine_schedule IS NOT NULL AND routine_schedule != ''")?;
+    // Query real routines from chat_threads, joined to the owning bot profile
+    // so the handle and last-activity time are real instead of placeholders.
+    let mut stmt = conn.prepare(
+        "SELECT t.id, t.title, t.routine_schedule, COALESCE(NULLIF(b.handle, ''), 'thread'), t.updated_at \
+         FROM chat_threads t LEFT JOIN bot_profiles b ON b.id = t.bot_profile_id \
+         WHERE t.routine_schedule IS NOT NULL AND t.routine_schedule != ''",
+    )?;
     let rows = stmt.query_map([], |r| {
         Ok((
             r.get::<_, String>(0)?,
             r.get::<_, String>(1)?,
             r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, i64>(4)?,
         ))
     })?;
 
     for row in rows.flatten() {
-        let (id, title, sched) = row;
+        let (id, title, sched, handle, updated_at) = row;
         routines.push(FleetRoutine {
             id: id.clone(),
             title: if title.trim().is_empty() { "Untitled Routine".into() } else { title },
-            bot_handle: "Thread Bot".into(),
+            bot_handle: handle,
             schedule: sched,
-            last_run: "Scheduled".into(),
+            last_run: format!("last activity {ts}", ts = format_time(updated_at)),
             enabled: true,
         });
     }
@@ -296,16 +299,6 @@ pub async fn start_fleet_daemon(state: State<'_, AppState>, id: String) -> Resul
 #[tauri::command]
 pub async fn stop_fleet_daemon(state: State<'_, AppState>, id: String) -> Result<CommandResult> {
     let toast = {
-        // Kill from child handles if tracked
-        {
-            let mut lock = FLEET_CHILDREN.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(map) = lock.as_mut() {
-                if let Some(mut child) = map.remove(&id) {
-                    let _ = child.kill();
-                }
-            }
-        }
-
         let conn = guard(&state);
         let pid_opt: Option<(Option<i64>, String)> = conn
             .query_row(
@@ -389,15 +382,23 @@ pub async fn send_fleet_daemon_input(
     id: String,
     input: String,
 ) -> Result<CommandResult> {
+    // Daemons run in their own console, so their stdin is not reachable from
+    // here. This is a note in the shared fleet log that every daemon screen
+    // shows — an operator ping, not a keystroke to a process.
     let trimmed = input.trim();
-    if !trimmed.is_empty() {
-        let conn = guard(&state);
-        let source = if id.is_empty() { "Fleet" } else { &id };
-        let log_line = format!("input: {trimmed}");
-        let _ = append_log(&conn, source, &log_line, "stdout");
+    if trimmed.is_empty() {
+        return finish_result(&state, None);
     }
-
-    finish_result(&state, None)
+    let name = {
+        let conn = guard(&state);
+        let name: Option<String> = conn
+            .query_row("SELECT app_name FROM linked_local_apps WHERE id=?1", params![id], |r| r.get(0))
+            .ok();
+        let source = name.as_deref().or(if id.is_empty() { Some("Fleet") } else { None }).unwrap_or(&id);
+        let _ = append_log(&conn, source, &format!("operator note: {trimmed}"), "stdout");
+        source.to_string()
+    };
+    finish_result(&state, Some(format!("Note saved to the {name} fleet log. The daemon's own stdin is not reachable from Ronic OS.")))
 }
 
 #[tauri::command]

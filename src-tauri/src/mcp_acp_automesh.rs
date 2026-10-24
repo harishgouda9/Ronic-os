@@ -480,14 +480,15 @@ fn webapp_status(home: &Path, id: &str, url: &str) -> (bool, String, String) {
     let p3 = crate::site_window::profile_dir(home, &format!("omni_webapp_{id}_web"));
     let active = p1.exists() || p2.exists() || p3.exists();
     // The page script reports a real sign-in signal from the site's own DOM.
-    // A profile folder only proves the window was opened once.
+    // A profile folder only proves the window was opened once. A web app that
+    // was never opened is not installed — the dot stays gray until then.
     let signed_in = read_webapp_auth(home, id);
     if let Some(when) = signed_in {
         (true, url.into(), format!("Signed in · site chat only · signal {when}"))
     } else if active {
         (true, url.into(), "Opened · no sign-in signal yet · chat only".into())
     } else {
-        (true, url.into(), "Not opened yet".into())
+        (false, url.into(), "Not opened yet".into())
     }
 }
 
@@ -533,7 +534,7 @@ fn locate(id: &str, settings: &crate::models::Settings, home: &Path) -> (bool, S
                 } else if web_dir.exists() || web_dir2.exists() {
                     (true, "https://grok.com".into(), "Grok web session on disk · chat only".into())
                 } else {
-                    (true, "https://grok.com".into(), "Not opened yet".into())
+                    (false, "https://grok.com".into(), "Not opened yet".into())
                 }
             }
         }
