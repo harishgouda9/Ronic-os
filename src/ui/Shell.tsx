@@ -16,6 +16,7 @@ import {
   Puzzle,
   Zap,
   ScrollText,
+  Search,
   Sparkles,
   Settings,
   Store,
@@ -27,7 +28,7 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, Suspense, lazy, type ReactNode } from "react";
 import { RAIL, type ScreenId } from "../types";
-import { useOmni } from "../store";
+import { useRonic } from "../store";
 import { Pill } from "./bits";
 import { isTauri } from "../api";
 import { SuperchargeControl } from "../components/Harness2Studio";
@@ -38,7 +39,7 @@ import { useDesktopChrome, WindowControls } from "./WindowChrome";
 // only when the terminal drawer is first opened.
 const TerminalPanel = lazy(() => import("../components/TerminalPanel"));
 
-const RAIL_KEY = "omni.railWidth";
+const RAIL_KEY = "ronic.railWidth";
 
 function clampRail(width: number) {
   return Math.min(320, Math.max(56, Math.round(width)));
@@ -63,7 +64,7 @@ function writeRail(width: number) {
 
 const ICONS: Record<string, LucideIcon> = {
   chat: MessageSquare,
-  bots: Bot,
+  bots: MessageSquare,
   providers: Cable,
   memory: Brain,
   skills: Sparkles,
@@ -85,21 +86,21 @@ const ICONS: Record<string, LucideIcon> = {
 };
 
 export function Shell({ children }: { children: ReactNode }) {
-  const snap = useOmni((s) => s.snap)!;
-  const screen = useOmni((s) => s.screen);
-  const go = useOmni((s) => s.go);
-  const palette = useOmni((s) => s.palette);
-  const debug = useOmni((s) => s.debug);
-  const bug = useOmni((s) => s.bug);
-  const toast = useOmni((s) => s.toast);
-  const setPalette = useOmni((s) => s.setPalette);
-  const setDebug = useOmni((s) => s.setDebug);
-  const setBug = useOmni((s) => s.setBug);
-  const setToast = useOmni((s) => s.setToast);
-  const recover = useOmni((s) => s.recover);
-  const recovering = useOmni((s) => s.recovering);
-  const terminal = useOmni((s) => s.terminal);
-  const setTerminal = useOmni((s) => s.setTerminal);
+  const snap = useRonic((s) => s.snap)!;
+  const screen = useRonic((s) => s.screen);
+  const go = useRonic((s) => s.go);
+  const palette = useRonic((s) => s.palette);
+  const debug = useRonic((s) => s.debug);
+  const bug = useRonic((s) => s.bug);
+  const toast = useRonic((s) => s.toast);
+  const setPalette = useRonic((s) => s.setPalette);
+  const setDebug = useRonic((s) => s.setDebug);
+  const setBug = useRonic((s) => s.setBug);
+  const setToast = useRonic((s) => s.setToast);
+  const recover = useRonic((s) => s.recover);
+  const recovering = useRonic((s) => s.recovering);
+  const terminal = useRonic((s) => s.terminal);
+  const setTerminal = useRonic((s) => s.setTerminal);
   // The panel stays mounted after its first open (the PTY session survives
   // drawer close); before that nothing xterm-shaped is loaded at all.
   const [terminalMounted, setTerminalMounted] = useState(false);
@@ -131,7 +132,7 @@ export function Shell({ children }: { children: ReactNode }) {
   }, []);
   const [terminalHeight, setTerminalHeight] = useState(() => {
     try {
-      const saved = localStorage.getItem("omni.terminalHeight");
+      const saved = localStorage.getItem("ronic.terminalHeight");
       return saved ? Math.max(140, Math.min(window.innerHeight * 0.75, parseInt(saved, 10))) : 280;
     } catch {
       return 280;
@@ -153,7 +154,7 @@ export function Shell({ children }: { children: ReactNode }) {
       const height = Math.max(140, Math.min(window.innerHeight * 0.75, next));
       setTerminalHeight(height);
       try {
-        localStorage.setItem("omni.terminalHeight", String(next));
+        localStorage.setItem("ronic.terminalHeight", String(next));
       } catch {}
     };
     const end = () => {
@@ -207,12 +208,19 @@ export function Shell({ children }: { children: ReactNode }) {
   }
 
   const [history, setHistory] = useState<ScreenId[]>([]);
+  const [navDir, setNavDir] = useState<"fwd" | "back">("fwd");
 
   useEffect(() => {
+    setNavDir(
+      history.length >= 2 && history[history.length - 2] === screen && history[history.length - 1] !== screen
+        ? "back"
+        : "fwd",
+    );
     setHistory((prev) => {
       if (prev.length > 0 && prev[prev.length - 1] === screen) return prev;
       return [...prev, screen];
     });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [screen]);
 
   function handleBack() {
@@ -277,6 +285,7 @@ export function Shell({ children }: { children: ReactNode }) {
         </div>
 
         <button className="cmdk" onClick={() => setPalette(true)}>
+          <Search size={13} />
           <span>Jump to a screen</span>
           <span className="kbd">Ctrl K</span>
         </button>
@@ -290,7 +299,7 @@ export function Shell({ children }: { children: ReactNode }) {
           <button className="wallet-pill" onClick={() => navigate("wallet")}>
             <span>{usdc?.nativeAmount ?? "—"}</span>
             <span className="faint">{inr?.nativeAmount ?? ""}</span>
-            {snap.sandbox ? <span className="sandbox-tag">SANDBOX</span> : <span className="sandbox-tag">LIVE OFF</span>}
+            {snap.ledgerMode === "live_signer" ? <span className="sandbox-tag">LIVE·SIGNED</span> : snap.sandbox ? <span className="sandbox-tag">SANDBOX</span> : <span className="sandbox-tag">LIVE OFF</span>}
           </button>
           {snap.kernel === "browser" ? (
             <span className="quote-chip" title="The watchdog runs in the desktop shell">no watchdog</span>
@@ -319,7 +328,13 @@ export function Shell({ children }: { children: ReactNode }) {
               <span className="terminal-active-dot agent-pulse" title="Agent active in terminal" />
             ) : null}
           </button>
-          <button className="btn ghost small" onClick={() => setBug(true)}>
+          <button
+            type="button"
+            className="btn ghost small"
+            onClick={() => navigate("repair")}
+            title="Self-Repair & Autonomous Sentinel Center (remediation-core)"
+            aria-label="Open Self-Repair & Sentinel Center"
+          >
             <Bug size={14} />
           </button>
         </div>
@@ -341,7 +356,7 @@ export function Shell({ children }: { children: ReactNode }) {
             <div className="resize-handle vertical rail-handle" onPointerDown={beginRailDrag} aria-label="Resize rail" role="separator" tabIndex={0} />
           </>
         )}
-        <main className={`main ${screen === "chat" || screen === "ide" ? "main-flush" : ""}`}>{children}</main>
+        <main className={`main ${screen === "chat" || screen === "ide" ? "main-flush" : ""}`} data-nav={navDir}>{children}</main>
       </div>
       <div
         className="global-terminal-drawer"
@@ -358,7 +373,7 @@ export function Shell({ children }: { children: ReactNode }) {
         {terminalMounted ? (
           <Suspense fallback={null}>
             <TerminalPanel
-              sessionId="omni_global"
+              sessionId="ronic_global"
               onClose={() => setTerminal(false)}
               title="Ronic Shell"
             />
@@ -391,12 +406,12 @@ function RailButton({ id, label, active, onClick, labeled }: { id: string; label
 
 function Palette({ onClose, navigate }: { onClose: () => void; navigate: (id: ScreenId) => void }) {
   const [query, setQuery] = useState("");
-  const setDebug = useOmni((s) => s.setDebug);
-  const setBug = useOmni((s) => s.setBug);
-  const run = useOmni((s) => s.run);
-  const recover = useOmni((s) => s.recover);
-  const snap = useOmni((s) => s.snap);
-  const toggleTerminal = useOmni((s) => s.toggleTerminal);
+  const setDebug = useRonic((s) => s.setDebug);
+  const setBug = useRonic((s) => s.setBug);
+  const run = useRonic((s) => s.run);
+  const recover = useRonic((s) => s.recover);
+  const snap = useRonic((s) => s.snap);
+  const toggleTerminal = useRonic((s) => s.toggleTerminal);
   const items = useMemo(() => {
     const screens = new Set(RAIL.map((item) => item.id));
     const pluginCommands = (snap?.plugins ?? []).filter((plugin) => plugin.desktopEnabled && plugin.trust === "trusted").flatMap((plugin) =>
@@ -453,7 +468,7 @@ function Palette({ onClose, navigate }: { onClose: () => void; navigate: (id: Sc
 }
 
 function DebugDrawer({ onClose }: { onClose: () => void }) {
-  const snap = useOmni((s) => s.snap)!;
+  const snap = useRonic((s) => s.snap)!;
   return (
     <aside className="drawer">
       <div className="pane-h between" style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
@@ -480,9 +495,9 @@ function DebugDrawer({ onClose }: { onClose: () => void }) {
 }
 
 function BugModal({ onClose }: { onClose: () => void }) {
-  const snap = useOmni((s) => s.snap)!;
-  const run = useOmni((s) => s.run);
-  const busy = useOmni((s) => s.busy);
+  const snap = useRonic((s) => s.snap)!;
+  const run = useRonic((s) => s.run);
+  const busy = useRonic((s) => s.busy);
   const [category, setCategory] = useState("agent");
   const [notes, setNotes] = useState("");
   return (

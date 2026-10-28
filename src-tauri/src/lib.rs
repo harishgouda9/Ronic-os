@@ -4,6 +4,7 @@ mod bots;
 mod capabilities;
 mod commands;
 mod computer;
+mod computer_subsystem;
 mod db;
 mod embed;
 mod error;
@@ -13,24 +14,31 @@ mod policy;
 mod proxy;
 mod redact;
 mod repair;
+mod remediation_core;
 mod scan;
 mod site_window;
 mod siwc;
 mod snapshot;
+mod squad_computer_orchestrator;
 mod textutil;
 mod util;
 mod vault;
 mod wallet;
+mod wallet_engine;
 mod workspace_apps;
 mod workspace_bridge;
 mod workspace_git;
 mod yaml_flow;
 mod terminal_pty;
+mod mini_computer;
 pub mod bot_fleet;
 mod code_mode;
+mod coworker;
 pub mod licensing;
 mod harness2_engine;
+mod kernel_ops;
 mod mcp_acp_automesh;
+pub mod messaging_gateway;
 pub mod tunnel;
 
 use crate::util::{ipc_push, now_ms, product_home};
@@ -75,6 +83,7 @@ pub fn run() {
     let ipc = Arc::new(Mutex::new(VecDeque::new()));
     proxy::spawn(proxy_port.clone(), ipc.clone());
     spawn_watchdog(db_path.clone(), heartbeat.clone());
+    spawn_sentinel_monitor(db_path.clone(), home.clone());
     ipc_push(&ipc, "kernel started");
     let state = AppState {
         conn: Mutex::new(conn),
@@ -147,6 +156,19 @@ pub fn run() {
             commands::set_policy,
             commands::wallet_tx,
             commands::review_tx,
+            commands::add_sandbox_funds,
+            commands::set_ledger_mode,
+            commands::bot_circuit_toggle,
+            commands::quant_dispatch,
+            commands::self_heal_drill,
+            commands::sentinel_scan,
+            commands::sentinel_scan_all,
+            commands::sentinel_remediate,
+            commands::acknowledge_sentinel,
+            commands::reset_sentinel_ack,
+            commands::list_shadow_backups,
+            commands::restore_shadow_backup,
+            commands::snapshot_poll,
             commands::refresh_workspace,
             commands::run_repair,
             commands::preview_bug,
@@ -208,6 +230,8 @@ pub fn run() {
             bot_fleet::run_fleet_routine,
             bot_fleet::send_fleet_daemon_input,
             bot_fleet::clear_fleet_logs,
+            messaging_gateway::reclaim_gateway_pid_and_connect,
+            messaging_gateway::dispatch_remote_messaging_command,
             mcp_acp_automesh::mesh_status,
             mcp_acp_automesh::mesh_connect_all,
             mcp_acp_automesh::mesh_set_flags,
@@ -215,14 +239,14 @@ pub fn run() {
             mcp_acp_automesh::open_mcp_connected_webapp,
             mcp_acp_automesh::open_harness_mcp_setup,
             mcp_acp_automesh::get_webapp_mcp_context_bundle,
-            mcp_acp_automesh::omni_ask_peer_app,
+            mcp_acp_automesh::ronic_ask_peer_app,
             tunnel::mesh_tunnel_status,
             tunnel::mesh_tunnel_start,
             tunnel::mesh_tunnel_stop,
             tunnel::mesh_tunnel_download,
             code_mode::compile_mcp_acp_to_typescript_dts,
             code_mode::execute_code_mode_script,
-            code_mode::omni_search_capabilities,
+            code_mode::ronic_search_capabilities,
             licensing::license_status,
             licensing::refresh_license,
             licensing::device_fingerprint,
@@ -230,6 +254,12 @@ pub fn run() {
             licensing::cloud_keychain_restore,
             licensing::cloud_keychain_clear,
             licensing::open_system_url,
+            kernel_ops::kernel_diagnostics,
+            kernel_ops::db_maintenance,
+            kernel_ops::shadow_git_prune,
+            kernel_ops::workspace_backup,
+            licensing::register_local_machine,
+            licensing::unregister_local_machine,
             harness2_engine::harness2_status,
             harness2_engine::harness2_set_flags,
             harness2_engine::harness2_install,
@@ -240,6 +270,36 @@ pub fn run() {
             harness2_engine::harness2_keep,
             harness2_engine::harness2_promote,
             harness2_engine::harness2_revert,
+            computer_subsystem::spawn_bot_mini_computer_window,
+            computer_subsystem::list_bot_mini_computer_windows,
+            computer_subsystem::close_bot_mini_computer_window,
+            computer_subsystem::set_bot_mini_window_takeover,
+            computer_subsystem::drive_bot_computer_window,
+            computer_subsystem::inspect_native_os_uia_tree,
+            mini_computer::mini_shell_boot,
+            mini_computer::mini_shell_layout,
+            mini_computer::mini_shell_set_app,
+            mini_computer::mini_open_tab,
+            mini_computer::mini_close_tab,
+            mini_computer::mini_focus_tab,
+            mini_computer::mini_chrome_nav,
+            mini_computer::mini_fs_list,
+            mini_computer::mini_fs_read,
+            mini_computer::mini_fs_write,
+            mini_computer::mini_fs_write_bytes,
+            mini_computer::mini_fs_mkdir,
+            mini_computer::mini_fs_rename,
+            mini_computer::mini_fs_delete,
+            mini_computer::mini_history,
+            computer_subsystem::generate_som_annotated_snapshot,
+            computer_subsystem::execute_som_or_uia_action,
+            computer_subsystem::trigger_emergency_computer_halt,
+            computer_subsystem::computer_halt_status,
+            squad_computer_orchestrator::launch_tiling_squad_mini_windows,
+            squad_computer_orchestrator::squad_window_status,
+            squad_computer_orchestrator::dismiss_squad_windows,
+            squad_computer_orchestrator::publish_squad_blackboard_packet,
+            squad_computer_orchestrator::list_squad_blackboard_packets,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
@@ -262,7 +322,7 @@ pub fn run() {
                             if let Some(state) = emitter.try_state::<AppState>() {
                                 ipc_push(&state.ipc, &format!("auth/deep_link {query}"));
                             }
-                            let _ = emitter.emit("omni://auth-code", query);
+                            let _ = emitter.emit("ronic://auth-code", query);
                         }
                     }
                 });
@@ -295,6 +355,10 @@ pub fn run() {
                     }
                 });
             }
+            // Only auto-start the Vite dev server in debug builds. In release
+            // builds, Tauri already serves frontendDist (dist/) directly, and
+            // navigating away from it to the loading page breaks asset paths.
+            #[cfg(debug_assertions)]
             ensure_dev_server(handle);
             Ok(())
         })
@@ -313,14 +377,14 @@ fn clear_stale_instances() {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let self_pid = std::process::id();
         let output = std::process::Command::new("tasklist")
-            .args(["/FI", "IMAGENAME eq omniworkspace.exe", "/FO", "CSV", "/NH"])
+            .args(["/FI", "IMAGENAME eq ronicos.exe", "/FO", "CSV", "/NH"])
             .creation_flags(CREATE_NO_WINDOW)
             .output();
         let Ok(output) = output else { return };
         let text = String::from_utf8_lossy(&output.stdout);
         for line in text.lines() {
             let parts: Vec<&str> = line.split(',').map(str::trim).collect();
-            if parts.len() < 2 || !parts[0].trim_matches('"').eq_ignore_ascii_case("omniworkspace.exe") {
+            if parts.len() < 2 || !parts[0].trim_matches('"').eq_ignore_ascii_case("ronicos.exe") {
                 continue;
             }
             let Ok(pid) = parts[1].trim_matches('"').parse::<u32>() else { continue };
@@ -336,7 +400,7 @@ fn clear_stale_instances() {
         // msedgewebview2.exe children that survive the parent. A restart also
         // leaves the previous instance's tunnel behind. Clear both, or the
         // new window still hits "resource is in use" and tunnels pile up.
-        let sweep = "Get-CimInstance Win32_Process -Filter \"Name = 'msedgewebview2.exe' OR Name = 'cloudflared.exe'\" | Where-Object { $_.CommandLine -like '*omniworkspace*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }";
+        let sweep = "Get-CimInstance Win32_Process -Filter \"Name = 'msedgewebview2.exe' OR Name = 'cloudflared.exe'\" | Where-Object { $_.CommandLine -like '*ronicos*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }";
         let _ = std::process::Command::new("powershell.exe")
             .args(["-NoProfile", "-Command", sweep])
             .creation_flags(CREATE_NO_WINDOW)
@@ -436,16 +500,9 @@ fn ensure_dev_server(handle: tauri::AppHandle) {
             }
         }
 
-        // If Vite still didn't respond after 15s, check if dist/index.html exists as fallback
-        if let Some(root) = find_project_root() {
-            let dist_index = root.join("dist").join("index.html");
-            if dist_index.exists() {
-                if let Ok(dist_url) = url::Url::from_file_path(&dist_index) {
-                    if let Some(window) = handle.get_webview_window("main") {
-                        let _ = window.navigate(dist_url);
-                    }
-                }
-            }
+        // If Vite still didn't respond after 15s, update the loading page with a clear error.
+        if let Some(window) = handle.get_webview_window("main") {
+            let _ = window.eval("document.getElementById('msg').innerText='Dev server did not start. Run npm run dev in a terminal first, or build a release binary.'");
         }
     });
 }
@@ -469,6 +526,21 @@ fn spawn_watchdog(db_path: PathBuf, beat: Arc<AtomicU64>) {
     });
 }
 
+/// Keep the sentinel fleet genuinely autonomous while the desktop app is
+/// running. Monitoring is read/checkpoint work only; destructive remediation
+/// remains an explicit user action behind the incident gate.
+fn spawn_sentinel_monitor(db_path: PathBuf, home: PathBuf) {
+    std::thread::spawn(move || {
+        let Ok(conn) = Connection::open(&db_path) else { return };
+        let _ = conn.pragma_update(None, "busy_timeout", "5000");
+        std::thread::sleep(Duration::from_secs(3));
+        loop {
+            let _ = crate::remediation_core::sentinel_scan_all(&conn, &home);
+            std::thread::sleep(Duration::from_secs(30));
+        }
+    });
+}
+
 #[cfg(test)]
 mod kernel_flow {
     use crate::snapshot::Meta;
@@ -476,7 +548,7 @@ mod kernel_flow {
 
     #[test]
     fn seed_loads_and_the_policy_gate_moves_only_approved_funds() {
-        let home = std::env::temp_dir().join(format!("omni-kernel-{}", std::process::id()));
+        let home = std::env::temp_dir().join(format!("ronic-kernel-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).unwrap();
         let conn = crate::db::open(&home.join("state.db")).unwrap();
@@ -525,8 +597,79 @@ mod kernel_flow {
     }
 
     #[test]
+    fn quant_engine_routes_orders_and_the_circuit_breaker_freezes_spend() {
+        let home = std::env::temp_dir().join(format!("ronic-quant-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let conn = crate::db::open(&home.join("state.db")).unwrap();
+        crate::db::migrate(&conn).unwrap();
+        crate::db::drop_reference_fixture(&conn, &home).unwrap();
+        crate::db::seed_if_empty(&conn, &home).unwrap();
+
+        assert_eq!(crate::wallet_engine::ledger_mode(&conn), "sandbox");
+        crate::wallet::set_policy(&conn, 250.0, 5000.0, 250.0, 35, false).unwrap();
+        crate::wallet::settle(&conn, "", "hyperliquid_ws", 1000.0, "1000.00 USDC", "faucet", "margin", "user", "topup", None, "credit").unwrap();
+        conn.execute(
+            "INSERT INTO bot_profiles (id, handle, display_name, avatar, soul_markdown, primary_account_id, long_context_account_id, fallback_account_id, daily_wallet_limit_usd, created_at) VALUES ('bot_q','@Quant-Trader','Quant','NW','soul','prov_deepseek','prov_gemini','prov_openrouter',500,1)",
+            [],
+        )
+        .unwrap();
+
+        let order = crate::wallet_engine::dispatch_quant_order(&conn, "bot_q", "BTC-USD-PERP", "DeepSeek-V4", "funding divergence", "LONG", 100.0).unwrap();
+        assert_eq!(order.status, "SIMULATED", "{}", order.reference);
+        assert!((order.rebate_usd - 0.05).abs() < 1e-9, "5 bps rebate on $100 must be $0.05");
+        assert!(order.ws_latency_ms < 1000.0, "policy-signer latency should be far under a second");
+
+        let held = crate::wallet_engine::dispatch_quant_order(&conn, "bot_q", "SOL-USD-PERP", "Grok Pro", "breakout", "LONG", 400.0).unwrap();
+        assert_eq!(held.status, "WORKING", "{}", held.reference);
+
+        crate::wallet_engine::toggle_circuit(&conn, "bot_q").unwrap();
+        let frozen = crate::wallet_engine::dispatch_quant_order(&conn, "bot_q", "ETH-USD-PERP", "Claude", "mean reversion", "SHORT", 1.0).unwrap();
+        assert_eq!(frozen.status, "REJECTED", "{}", frozen.reference);
+        assert!(frozen.reference.contains("circuit_breaker"), "{}", frozen.reference);
+
+        crate::wallet_engine::toggle_circuit(&conn, "bot_q").unwrap();
+        crate::wallet_engine::set_ledger_mode(&conn, "live_signer").unwrap();
+        let live = crate::wallet_engine::dispatch_quant_order(&conn, "bot_q", "ETH-USD-PERP", "Claude", "mean reversion", "SHORT", 1.0).unwrap();
+        assert_eq!(live.status, "FILLED", "{}", live.reference);
+
+        let drained: f64 = conn.query_row("SELECT native_value FROM wallet_balances WHERE rail='hyperliquid_ws'", [], |r| r.get(0)).unwrap();
+        assert!((drained - 899.0).abs() < 1e-6, "signed notional leaves the ledger: {drained}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn sentinels_seed_scan_and_remediate() {
+        let home = std::env::temp_dir().join(format!("ronic-sentinel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let conn = crate::db::open(&home.join("state.db")).unwrap();
+        crate::db::migrate(&conn).unwrap();
+        crate::db::drop_reference_fixture(&conn, &home).unwrap();
+        crate::db::seed_if_empty(&conn, &home).unwrap();
+
+        crate::remediation_core::sentinels_ensure(&conn).unwrap();
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM sentinels", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 5);
+
+        let note = crate::remediation_core::sentinel_scan(&conn, &home, "supabase_sentinel").unwrap();
+        assert!(note.contains("healthy") || note.contains("incident_detected"), "{note}");
+        let all = crate::remediation_core::sentinel_scan_all(&conn, &home).unwrap();
+        assert!(all.contains("Fleet scan complete"), "{all}");
+        let invalid = crate::remediation_core::run_drill(&conn, &home, 9);
+        assert!(invalid.is_err(), "invalid tier must be rejected");
+        let safe_remediation = crate::remediation_core::sentinel_remediate(&conn, &home, "supabase_sentinel").unwrap();
+        assert!(safe_remediation.contains("No action taken") || safe_remediation.contains("Verify:"), "{safe_remediation}");
+        let tiers = crate::remediation_core::tier_status(&conn, &home, crate::util::now_ms() as u64).unwrap();
+        assert_eq!(tiers.len(), 4);
+        let drill = crate::remediation_core::run_drill(&conn, &home, 0).unwrap();
+        assert!(drill.contains("Tier 4"), "{drill}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn turn_id_survives_migrate_and_snapshot() {
-        let home = std::env::temp_dir().join(format!("omni-turn-{}", std::process::id()));
+        let home = std::env::temp_dir().join(format!("ronic-turn-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).unwrap();
         let conn = crate::db::open(&home.join("state.db")).unwrap();

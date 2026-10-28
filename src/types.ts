@@ -46,6 +46,9 @@ export type BotProfile = {
   harnessLaneId: string;
   agUiEndpointUrl: string;
   browserPartition: string;
+  engineKind: string;
+  apiBase: string;
+  apiModel: string;
   workspaceDir: string;
   allowFileWrite: boolean;
   requireApprovalExternal: boolean;
@@ -57,6 +60,7 @@ export type BotProfile = {
   screenNodes: DomNode[];
   screenMs: number;
   shellOutput: string;
+  walletFrozen: boolean;
 };
 
 export type BotGroup = {
@@ -117,8 +121,11 @@ export type Step = {
     | "bot_handoff"
     | "gateway_approval"
     | "wallet_tx"
+    | "workflow"
+    | "routine"
     | "plan"
     | "thinking"
+    | "turn_activity"
     | "harness2_pipeline";
   actionPayload: StepPayload;
   executionLatencyMs: number;
@@ -338,6 +345,63 @@ export type Position = {
   open: boolean;
 };
 
+export type QuantOrder = {
+  id: string;
+  createdAt: number;
+  pair: string;
+  analyst: string;
+  thesis: string;
+  side: string;
+  sizeUsd: number;
+  wsLatencyMs: number;
+  rebateUsd: number;
+  status: string;
+  mode: string;
+  botHandle: string;
+  reference: string;
+};
+
+export type BotAllowance = {
+  botId: string;
+  handle: string;
+  role: string;
+  railsAllowed: string;
+  perTxCap: string;
+  spentTodayUsd: number;
+  dailyLimitUsd: number;
+  frozen: boolean;
+};
+
+export type SentinelUnit = {
+  id: string;
+  name: string;
+  source: string;
+  status: string;
+  severity: string;
+  acknowledged: boolean;
+  lastScan: number;
+  finding: string;
+  stagedFix: string;
+};
+
+export type SentinelEvent = {
+  id: string;
+  sentinelId: string;
+  message: string;
+  createdAt: number;
+};
+
+export type TierStatus = {
+  tier: number;
+  name: string;
+  title: string;
+  detail: string;
+  status: string;
+  badge: string;
+  repairCount: number;
+  lastRunAt: number;
+};
+
 export type Remediation = {
   id: string;
   tier: number;
@@ -347,6 +411,12 @@ export type Remediation = {
   recoveryDurationMs: number;
   status: string;
   createdAt: number;
+};
+
+export type ShadowBackup = {
+  name: string;
+  bytes: number;
+  mtime: number;
 };
 
 export type ProcessRow = {
@@ -374,12 +444,13 @@ export type Extension = {
 
 export type LicenseInfo = {
   planTier: "free" | "pro" | "founder_lifetime" | "team" | string;
-  status: "active" | "expired" | "invalid" | "unsigned_dev" | "none" | string;
+  status: "active" | "local" | "expired" | "invalid" | "unsigned_dev" | "none" | string;
   founderBadge: number | null;
   maxDevices: number;
   walletMicroUsd: number;
   leaseExpUnix: number;
   hardwareHash: string;
+  proEntitled: boolean;
 };
 
 export type MarketItem = {
@@ -440,6 +511,9 @@ export type Snapshot = {
   kernel: "rust" | "browser";
   activeProfileId: string;
   activeThreadId: string | null;
+  /** Live line describing what the in-flight model turn is doing right now,
+   * e.g. "terminal_command · npm test". Empty when no turn is running. */
+  turnActivity?: string;
   profiles: BotProfile[];
   threads: ChatThread[];
   steps: Step[];
@@ -462,7 +536,14 @@ export type Snapshot = {
   balances: Balance[];
   transactions: WalletTx[];
   positions: Position[];
+  quantOrders: QuantOrder[];
+  botAllowances: BotAllowance[];
+  ledgerMode: string;
+  sentinels: SentinelUnit[];
+  sentinelEvents: SentinelEvent[];
+  tierStatus: TierStatus[];
   remediation: Remediation[];
+  shadowBackups: ShadowBackup[];
   processes: ProcessRow[];
   fleetLogs: FleetLog[];
   extensions: Extension[];
@@ -488,7 +569,7 @@ export type CommandResult = { snapshot: Snapshot; toast: string | null; installC
 
 export const RAIL: { id: ScreenId; label: string; group: "main" | "tail" }[] = [
   { id: "chat", label: "Bots & groups", group: "main" },
-  { id: "bots", label: "External bots", group: "main" },
+  { id: "bots", label: "Messaging Gateway", group: "main" },
   { id: "providers", label: "Apps & providers", group: "main" },
   { id: "memory", label: "Memory", group: "main" },
   { id: "skills", label: "Skills & Capabilities", group: "main" },
@@ -502,6 +583,6 @@ export const RAIL: { id: ScreenId; label: string; group: "main" | "tail" }[] = [
   { id: "wallet", label: "Wallet & trading", group: "main" },
   { id: "extensions", label: "Self-modify", group: "tail" },
   { id: "repair", label: "Self-repair", group: "tail" },
-  { id: "billing", label: "Plan & act", group: "tail" },
+  { id: "billing", label: "Plan & setup", group: "tail" },
   { id: "settings", label: "Settings", group: "tail" },
 ];
