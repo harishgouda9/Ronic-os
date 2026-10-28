@@ -39,6 +39,7 @@ mod harness2_engine;
 mod kernel_ops;
 mod mcp_acp_automesh;
 pub mod messaging_gateway;
+pub mod bi_directional_push;
 pub mod tunnel;
 
 use crate::util::{ipc_push, now_ms, product_home};
@@ -232,6 +233,8 @@ pub fn run() {
             bot_fleet::clear_fleet_logs,
             messaging_gateway::reclaim_gateway_pid_and_connect,
             messaging_gateway::dispatch_remote_messaging_command,
+            bi_directional_push::send_interactive_push_alert,
+            bi_directional_push::handle_remote_push_button_callback,
             mcp_acp_automesh::mesh_status,
             mcp_acp_automesh::mesh_connect_all,
             mcp_acp_automesh::mesh_set_flags,

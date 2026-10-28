@@ -41,6 +41,10 @@ export default function RonicMessagingGateway() {
   const [remoteTestCmd, setRemoteTestCmd] = useState<string>(
     "@claude run cargo check, fix any warning, and send /screen snapshot"
   );
+  const [pushAlertTitle, setPushAlertTitle] = useState<string>(
+    "Fail-Closed Wallet Gate: @dots wants to spend $5.00 USDC"
+  );
+  const [pushAlertEvent, setPushAlertEvent] = useState<string>("wallet_approval_gate");
   const [remoteLogs, setRemoteLogs] = useState<string[]>([
     "21:14:02 [Security Firewall] Enforcing strict 'Only-If-Connected' & Owner-ID allowlist across all 16 channels.",
     "21:14:05 [Telegram Gateway] Detected orphaned default profile gateway holding token on PID 19268.",
@@ -326,6 +330,61 @@ export default function RonicMessagingGateway() {
         return { ...c, routableBots: nextBots };
       })
     );
+  };
+
+  // Bi-Directional Push: send an interactive alert card with action buttons
+  // to the phone via the connected gateway.
+  const handleSendPushAlert = async () => {
+    const buttons =
+      pushAlertEvent === "wallet_approval_gate"
+        ? [
+            { label: "✅ Approve ($5.00)", callback_action_id: "approve_tx_901" },
+            { label: "❌ Reject", callback_action_id: "reject_tx_901" },
+            { label: "📸 View Screen", callback_action_id: "view_pip_screenshot" },
+          ]
+        : pushAlertEvent === "sentinel_incident"
+        ? [
+            { label: "📸 View Screen", callback_action_id: "view_pip_screenshot" },
+            { label: "✅ Acknowledge", callback_action_id: "ack_sentinel_supabase" },
+          ]
+        : [{ label: "📸 View Screen", callback_action_id: "view_pip_screenshot" }];
+
+    if (activeChannel.status !== "connected" || !activeChannel.enabled) {
+      pushLog(
+        `[BLOCKED • NOT CONNECTED] Push alert to ${activeChannel.name} dropped — channel is '${activeChannel.status}'.`
+      );
+      return;
+    }
+    try {
+      const msg = await invokeRaw<string>("send_interactive_push_alert", {
+        channelId: activeChannel.id,
+        alert: {
+          alert_id: `alert_${Date.now()}`,
+          event_type: pushAlertEvent,
+          title: pushAlertTitle,
+          body_markdown: `**${pushAlertTitle}**\nTap an action below to resolve from your phone.`,
+          actionable_buttons: buttons,
+          timestamp: new Date().toISOString(),
+        },
+      });
+      pushLog(`[Push → ${activeChannel.name}] ${msg} Buttons: ${buttons.map((b) => b.label).join(" | ")}`);
+    } catch (err) {
+      pushLog(`[Push → ${activeChannel.name}] Backend unavailable (${String(err)}).`);
+    }
+  };
+
+  // Bi-Directional Push: simulate the phone owner tapping an inline button.
+  const handlePushButtonTap = async (callbackActionId: string) => {
+    try {
+      const msg = await invokeRaw<string>("handle_remote_push_button_callback", {
+        callbackActionId,
+        senderId: activeChannel.ownerUserId || ownerIdInput,
+        allowlistedOwnerId: activeChannel.ownerUserId || ownerIdInput,
+      });
+      pushLog(`[Callback ← Phone] ${msg}`);
+    } catch (err) {
+      pushLog(`[Callback ← Phone] ${String(err)}`);
+    }
   };
 
   // Runs the command through the Rust "Only-If-Connected & Allowlisted" firewall.
@@ -668,7 +727,69 @@ export default function RonicMessagingGateway() {
           </div>
         </div>
 
-        {/* 4. LIVE REMOTE COMMAND SIMULATOR & GATEWAY AUDIT STREAM */}
+        {/* 4. BI-DIRECTIONAL PUSH NOTIFICATIONS & INLINE ACTIONS */}
+        <div className="bg-white border border-[#E5E5E5] rounded-[8px] p-5 space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[#E5E5E5] pb-3">
+            <div>
+              <h2 className="text-sm font-bold">
+                Bi-Directional Push Alerts to Your Phone
+              </h2>
+              <p className="text-xs text-[#64748B]">
+                When a Fail-Closed wallet gate pauses a transaction, a Sentinel flags an incident, or a long task finishes, Ronic OS pushes an interactive card with action buttons to your connected {activeChannel.name}. Tap Approve / Reject / View Screen on your phone and the Rust Policy Signer executes the callback in &lt;1ms.
+              </p>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-2.5 text-xs">
+            <label className="space-y-1 md:col-span-2">
+              <span className="font-semibold text-[#0F172A]">Alert Title</span>
+              <input
+                value={pushAlertTitle}
+                onChange={(e) => setPushAlertTitle(e.target.value)}
+                className="w-full px-3 py-2 font-mono bg-[#FAFAFA] border border-[#E5E5E5] rounded-[6px]"
+              />
+            </label>
+            <label className="space-y-1">
+              <span className="font-semibold text-[#0F172A]">Trigger</span>
+              <select
+                value={pushAlertEvent}
+                onChange={(e) => setPushAlertEvent(e.target.value)}
+                className="w-full px-3 py-2 bg-[#FAFAFA] border border-[#E5E5E5] rounded-[6px]"
+              >
+                <option value="wallet_approval_gate">Fail-Closed Wallet Gate</option>
+                <option value="sentinel_incident">Sentinel Incident</option>
+                <option value="task_completed">Task Completed</option>
+              </select>
+            </label>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              onClick={() => void handleSendPushAlert()}
+              className="px-4 py-2 text-xs font-semibold bg-[#111111] text-white rounded-[6px]"
+            >
+              🔔 Push Interactive Alert to {activeChannel.name}
+            </button>
+            <span className="text-[11px] text-[#64748B]">
+              Then simulate the phone tapping a button:
+            </span>
+            {[
+              { label: "✅ Approve", action: "approve_tx_901" },
+              { label: "❌ Reject", action: "reject_tx_901" },
+              { label: "📸 View Screen", action: "view_pip_screenshot" },
+            ].map((b) => (
+              <button
+                key={b.action}
+                onClick={() => void handlePushButtonTap(b.action)}
+                className="px-3 py-1.5 text-xs font-semibold bg-white border border-[#E5E5E5] rounded-full hover:border-[#0F172A]"
+              >
+                {b.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* 5. LIVE REMOTE COMMAND SIMULATOR & GATEWAY AUDIT STREAM */}
         <div className="bg-white border border-[#E5E5E5] rounded-[8px] p-5 space-y-3">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div>
