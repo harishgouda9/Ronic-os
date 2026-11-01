@@ -9,24 +9,16 @@ the core loop.
 
 These are the running desktop app.
 
-Chat, with bots and the web apps dock.
-
-![Chat and the web apps dock](docs/screenshots/chat-apps.png)
-
-A bot's computer, with a site open beside the chat.
-
-![Bot computer](docs/screenshots/bot-computer.png)
-
-<details>
-<summary><mark>View screenshots</mark></summary>
-
-The same chat, with each web app's own icon.
+The chat, with each web app's own icon.
 
 ![Chat with app icons](docs/screenshots/chat-icons.png)
 
 A site window opened from the bot computer.
 
 ![Site window](docs/screenshots/site-window.png)
+
+<details>
+<summary><mark>View screenshots</mark></summary>
 
 Apps and providers already found on this computer.
 
