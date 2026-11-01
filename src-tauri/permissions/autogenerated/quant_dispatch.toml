@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-quant-dispatch"
+description = "Enables the quant_dispatch command without any pre-configured scope."
+commands.allow = ["quant_dispatch"]
+
+[[permission]]
+identifier = "deny-quant-dispatch"
+description = "Denies the quant_dispatch command without any pre-configured scope."
+commands.deny = ["quant_dispatch"]

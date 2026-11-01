@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-publish-squad-blackboard-packet"
+description = "Enables the publish_squad_blackboard_packet command without any pre-configured scope."
+commands.allow = ["publish_squad_blackboard_packet"]
+
+[[permission]]
+identifier = "deny-publish-squad-blackboard-packet"
+description = "Denies the publish_squad_blackboard_packet command without any pre-configured scope."
+commands.deny = ["publish_squad_blackboard_packet"]

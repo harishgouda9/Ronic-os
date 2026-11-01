@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-computer-halt-status"
+description = "Enables the computer_halt_status command without any pre-configured scope."
+commands.allow = ["computer_halt_status"]
+
+[[permission]]
+identifier = "deny-computer-halt-status"
+description = "Denies the computer_halt_status command without any pre-configured scope."
+commands.deny = ["computer_halt_status"]

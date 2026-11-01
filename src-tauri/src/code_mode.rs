@@ -1,7 +1,7 @@
 //! Cloudflare-style Code Mode on top of the local MCP bridge.
 //!
-//! The model sees a compact `omni.d.ts` and writes one TypeScript block. The
-//! host interprets `await omni.*` calls in-process. User JavaScript is never
+//! The model sees a compact `ronic.d.ts` and writes one TypeScript block. The
+//! host interprets `await ronic.*` calls in-process. User JavaScript is never
 //! evaluated in Node or Bun. Remote MCP keys stay in the vault.
 
 mod interp;
@@ -17,7 +17,7 @@ use rusqlite::{params, Connection};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tauri::State;
 
 const MAX_SCRIPT: usize = 12_000;
@@ -94,7 +94,7 @@ pub fn execute(home: &Path, ts_code: &str) -> Result<CodeModeExecutionResult, St
     let mut calls = Vec::new();
     let mut dispatch_fn = |method: &str, args: &Value| {
         if calls.len() >= MAX_RPC {
-            return Err("too many omni calls".into());
+            return Err("too many ronic calls".into());
         }
         calls.push(method.to_string());
         dispatch(&conn, home, method, args)
@@ -158,7 +158,7 @@ pub async fn execute_code_mode_script(state: State<'_, AppState>, ts_script: Str
 }
 
 #[tauri::command]
-pub async fn omni_search_capabilities(state: State<'_, AppState>, query: String) -> Result<Value, String> {
+pub async fn ronic_search_capabilities(state: State<'_, AppState>, query: String) -> Result<Value, String> {
     let conn = state.conn.lock().unwrap_or_else(|poison| poison.into_inner());
     Ok(search_capabilities(&conn, &state.home, &query))
 }
@@ -208,8 +208,28 @@ fn dispatch(conn: &Connection, home: &Path, method: &str, args: &Value) -> Resul
         "mcp.searchCapabilities" => Ok(search_capabilities(conn, home, arg(args, "query"))),
         "mcp.call" => mcp_call(conn, home, arg(args, "server"), arg(args, "tool"), args.get("params").cloned().unwrap_or_else(|| json!({}))),
         "acp.askPeer" => mcp_acp_automesh::ask_peer(conn, home, "codemode", arg(args, "target"), first_present(args, &["prompt", "task"])),
+        "computer.somClick" => match crate::computer_subsystem::som_click_sync(mark_id_arg(args)) {
+            Ok(message) => Ok(json!({ "ok": true, "message": message })),
+            Err(error) => Err(error),
+        },
+        "computer.somType" => match crate::computer_subsystem::som_type_sync(mark_id_arg(args), arg(args, "text")) {
+            Ok(message) => Ok(json!({ "ok": true, "message": message })),
+            Err(error) => Err(error),
+        },
+        "computer.inspectNative" => {
+            let nodes = crate::computer_subsystem::inspect_and_cache(arg(args, "windowFilter")).map_err(|error| error.0)?;
+            Ok(json!({ "marks": nodes }))
+        }
+        "computer.haltStatus" => Ok(json!({ "halted": crate::computer_subsystem::halt_engaged() })),
         _ => Err(format!("`{method}` is not an Ronic Code Mode binding.")),
     }
+}
+
+fn mark_id_arg(args: &Value) -> u32 {
+    args.get("markId")
+        .or_else(|| args.get("mark_id"))
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0) as u32
 }
 
 fn mcp_call(conn: &Connection, home: &Path, server: &str, tool: &str, params: Value) -> Result<Value, String> {
@@ -217,25 +237,105 @@ fn mcp_call(conn: &Connection, home: &Path, server: &str, tool: &str, params: Va
     if tool.is_empty() {
         return Err("mcp.call needs a tool name.".into());
     }
-    if tool == "omni_execute_codemode" || tool == "execute_code_mode_script" {
+    if tool == "ronic_execute_codemode" || tool == "execute_code_mode_script" {
         return Err("Code Mode does not start another Code Mode worker.".into());
     }
-    let local = server.is_empty() || server.eq_ignore_ascii_case("omni-workspace") || server.eq_ignore_ascii_case("workspace");
+    let local = server.is_empty() || server.eq_ignore_ascii_case("ronic-os") || server.eq_ignore_ascii_case("workspace");
     if local && workspace_bridge::is_local_tool(tool) {
         let text = workspace_bridge::call_tool(conn, home, tool, &params)?;
         return Ok(json!({ "text": text }));
     }
-    let saved = saved_servers(conn, home);
-    let known = saved.iter().any(|item| item.eq_ignore_ascii_case(server));
-    if known {
-        return Ok(json!({
-            "executed": false,
-            "server": server,
-            "tool": tool,
-            "message": format!("{server} is saved in Ronic OS. Code Mode does not open that server or attach its key. Use the signed-in client that holds the credential.")
-        }));
+    let Some(found) = find_mcp_server(conn, server) else {
+        return Err(format!("MCP server `{server}` is not connected."));
+    };
+    let profile = active_profile(conn);
+    if mcp_switch_off(conn, &found.id, &profile) {
+        return Err(format!("The profile switch is Off for {}.", found.name));
     }
-    Err(format!("MCP server `{server}` is not connected."))
+    if found.trust != "trusted" {
+        return Err(format!("{} is saved, and the profile switch defaults to Active, but the server is not trusted.", found.name));
+    }
+    if !(found.url.starts_with("http://") || found.url.starts_with("https://")) {
+        return Err(format!("{} is a local command. Code Mode does not spawn it.", found.name));
+    }
+    if found.url.contains("mcp.google.com") {
+        return Err("This catalog URL is not a live Google MCP host. A Google token can be checked at connect time, but tool calls need the provider's real endpoint.".into());
+    }
+    let secret = mcp_secret(home, &found.id)?;
+    if secret.trim().is_empty() {
+        return Err(format!("No credential is stored for {}. The profile switch can still be Active.", found.name));
+    }
+    call_remote_mcp(&found.url, &secret, tool, &params)
+}
+
+struct SavedMcp {
+    id: String,
+    name: String,
+    url: String,
+    trust: String,
+}
+
+fn find_mcp_server(conn: &Connection, server: &str) -> Option<SavedMcp> {
+    let mut stmt = conn.prepare("SELECT id, name, url, trust FROM mcp_servers").ok()?;
+    let rows = stmt.query_map([], |row| {
+        Ok(SavedMcp { id: row.get(0)?, name: row.get(1)?, url: row.get(2)?, trust: row.get(3)? })
+    }).ok()?;
+    let needle = server.trim();
+    for row in rows.flatten() {
+        if row.id.eq_ignore_ascii_case(needle) || row.name.eq_ignore_ascii_case(needle) || ident(&row.name).eq_ignore_ascii_case(needle) {
+            return Some(row);
+        }
+    }
+    None
+}
+
+fn mcp_switch_off(conn: &Connection, id: &str, profile: &str) -> bool {
+    if profile.trim().is_empty() {
+        return false;
+    }
+    let enabled: Option<i64> = conn
+        .query_row("SELECT enabled FROM mcp_enables WHERE server_id = ?1 AND profile_id = ?2", params![id, profile], |row| row.get(0))
+        .ok();
+    enabled == Some(0)
+}
+
+fn mcp_secret(home: &Path, id: &str) -> Result<String, String> {
+    if home.join("secrets.vault").exists() {
+        return Err("The vault is locked for Code Mode. Unlock it in Settings, then try the MCP call again.".into());
+    }
+    let secrets = crate::vault::load_plaintext(home);
+    secrets.get(&format!("mcp:{id}")).cloned().ok_or_else(|| "No credential is stored for this server.".to_string())
+}
+
+fn call_remote_mcp(url: &str, secret: &str, tool: &str, params: &Value) -> Result<Value, String> {
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(8))
+        .timeout(Duration::from_secs(20))
+        .build()
+        .map_err(|_| "The MCP client could not start.".to_string())?;
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": { "name": tool, "arguments": params }
+    });
+    let response = client
+        .post(url)
+        .header("Authorization", format!("Bearer {secret}"))
+        .header("Accept", "application/json, text/event-stream")
+        .json(&body)
+        .send()
+        .map_err(|_| format!("MCP server {url} did not answer."))?;
+    let status = response.status();
+    let text = response.text().unwrap_or_default();
+    if status.as_u16() == 401 || status.as_u16() == 403 {
+        return Err("The MCP server rejected the stored credential.".into());
+    }
+    if !status.is_success() {
+        return Err(format!("The MCP server returned {}. The tool call did not succeed.", status.as_u16()));
+    }
+    let clipped: String = text.chars().take(4000).collect();
+    Ok(json!({ "status": status.as_u16(), "body": clipped }))
 }
 
 fn search_memory(conn: &Connection, query: &str) -> Value {
@@ -334,13 +434,16 @@ fn load_playbook(conn: &Connection, home: &Path, slug: &str) -> Result<Value, St
 
 fn capability_rows(conn: &Connection, home: &Path) -> Vec<(String, String, String)> {
     let mut rows = vec![
-        ("omni-workspace".into(), "search_memory".into(), "search_memory(query: string)".into()),
-        ("omni-workspace".into(), "save_memory".into(), "save_memory(title: string, content: string)".into()),
-        ("omni-workspace".into(), "list_skills".into(), "list_skills()".into()),
-        ("omni-workspace".into(), "load_skill".into(), "load_skill(slug: string)".into()),
-        ("omni-workspace".into(), "list_plugins".into(), "list_plugins()".into()),
-        ("omni-workspace".into(), "list_mcp".into(), "list_mcp()".into()),
-        ("omni-workspace".into(), "omni_ask_peer_app".into(), "omni_ask_peer_app(target: string, task: string)".into()),
+        ("ronic-os".into(), "search_memory".into(), "search_memory(query: string)".into()),
+        ("ronic-os".into(), "save_memory".into(), "save_memory(title: string, content: string)".into()),
+        ("ronic-os".into(), "list_skills".into(), "list_skills()".into()),
+        ("ronic-os".into(), "load_skill".into(), "load_skill(slug: string)".into()),
+        ("ronic-os".into(), "list_plugins".into(), "list_plugins()".into()),
+        ("ronic-os".into(), "list_mcp".into(), "list_mcp()".into()),
+        ("ronic-os".into(), "ronic_ask_peer_app".into(), "ronic_ask_peer_app(target: string, task: string)".into()),
+        ("ronic-os".into(), "som_click".into(), "som_click(mark_id: number)".into()),
+        ("ronic-os".into(), "som_type".into(), "som_type(mark_id: number, text: string)".into()),
+        ("ronic-os".into(), "inspect_native_os".into(), "inspect_native_os(window_filter: string)".into()),
     ];
     let profile = active_profile(conn);
     if let Ok(view) = capabilities::view(conn, home, &profile) {
@@ -396,7 +499,7 @@ fn surface(conn: &Connection, home: &Path) -> Surface {
 fn render_dts(skills: &[(String, String, String)], servers: &[SurfaceServer]) -> String {
     let mut out = String::from(
         "// Generated by Ronic OS from the live skill index, Mem0 vault, and saved MCP servers.\n\
-declare namespace omni {\n\
+declare namespace ronic {\n\
   namespace mem0 {\n\
     function search(query: string): Promise<Array<{ title: string; excerpt: string }>>;\n\
     function add(fact: string, opts?: { title?: string }): Promise<{ id: string; status: string }>;\n\
@@ -431,6 +534,12 @@ declare namespace omni {\n\
     }
     out.push_str(
         "  }\n\
+  namespace computer {\n\
+    function somClick(markId: number): Promise<{ ok: boolean; message: string }>;\n\
+    function somType(markId: number, text: string): Promise<{ ok: boolean; message: string }>;\n\
+    function inspectNative(windowFilter: string): Promise<{ marks: Array<{ markId: number; controlType: string; name: string; automationId: string; bounds: number[]; centerXY: number[]; backgroundReady: boolean; origin: string }> }>;\n\
+    function haltStatus(): Promise<{ halted: boolean }>;\n\
+  }\n\
   namespace acp {\n\
     function askPeer(target: string, prompt: string): Promise<{ ticketId: string; executed: boolean; reply: string }>;\n\
   }\n\
@@ -522,7 +631,7 @@ mod tests {
 
     #[test]
     fn blocks_process_and_network() {
-        assert!(script_blocked("await omni.mem0.search('x')").is_none());
+        assert!(script_blocked("await ronic.mem0.search('x')").is_none());
         assert_eq!(script_blocked("process.env.KEY"), Some("process access"));
         assert_eq!(script_blocked("fetch('https://example.com')"), Some("network access"));
     }
@@ -546,8 +655,8 @@ mod tests {
     }
 
     #[test]
-    fn host_interpreter_runs_omni_calls() {
-        let home = std::env::temp_dir().join(format!("omni-cm-{}", std::process::id()));
+    fn host_interpreter_runs_ronic_calls() {
+        let home = std::env::temp_dir().join(format!("ronic-cm-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).unwrap();
         let conn = crate::db::open(&home.join("state.db")).unwrap();
@@ -557,8 +666,8 @@ mod tests {
         let result = execute(
             &home,
             r#"
-            const skills = await omni.skills.listIndex();
-            const facts = await omni.mem0.search("workspace");
+            const skills = await ronic.skills.listIndex();
+            const facts = await ronic.mem0.search("workspace");
             return { skillCount: skills.length, factCount: facts.length, first: skills[0] || null };
             "#,
         )
@@ -572,7 +681,7 @@ mod tests {
 
     #[test]
     fn host_interpreter_does_not_eval_javascript() {
-        let home = std::env::temp_dir().join(format!("omni-cm-deny-{}", std::process::id()));
+        let home = std::env::temp_dir().join(format!("ronic-cm-deny-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).unwrap();
         let conn = crate::db::open(&home.join("state.db")).unwrap();
@@ -582,7 +691,7 @@ mod tests {
         assert!(eval_denied.contains("eval"), "{eval_denied}");
         let process_denied = execute(&home, "return process.env").unwrap_err();
         assert!(process_denied.contains("process"), "{process_denied}");
-        let host_denied = execute(&home, "return await omni.shell.exec('dir')").unwrap();
+        let host_denied = execute(&home, "return await ronic.shell.exec('dir')").unwrap();
         assert!(!host_denied.ok, "{}", host_denied.final_return_json);
         let _ = std::fs::remove_dir_all(&home);
     }

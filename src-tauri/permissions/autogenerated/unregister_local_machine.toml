@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-unregister-local-machine"
+description = "Enables the unregister_local_machine command without any pre-configured scope."
+commands.allow = ["unregister_local_machine"]
+
+[[permission]]
+identifier = "deny-unregister-local-machine"
+description = "Denies the unregister_local_machine command without any pre-configured scope."
+commands.deny = ["unregister_local_machine"]

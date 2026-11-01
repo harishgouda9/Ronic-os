@@ -11,17 +11,18 @@ import {
   X,
 } from "lucide-react";
 import { isTauri, pickPaths } from "../api";
+import {
+  dispatchOutput,
+  clampFileIndex,
+  filesAfterDispatch,
+  filesFromPayload,
+  ideToOpen,
+  indexAfterRefresh,
+  type ModifiedFile,
+} from "../kernel/codingAgents";
 import { launchDesktopApp } from "../lib/tauriBridge";
-import { useOmni } from "../store";
+import { useRonic } from "../store";
 import TerminalPanel from "../components/TerminalPanel";
-
-export interface ModifiedFile {
-  path: string;
-  additions: number;
-  deletions: number;
-  staged: boolean;
-  diff: string;
-}
 
 interface AgentHarness {
   id: "claude" | "aider" | "opencode" | "codex" | "gemini" | "cursor" | "vscode";
@@ -39,29 +40,15 @@ const HARNESSES: AgentHarness[] = [
   { id: "vscode", label: "VS Code", category: "ide" },
 ];
 
-function filesFromPayload(payload: unknown): ModifiedFile[] | null {
-  if (!payload || typeof payload !== "object") return null;
-  const files = (payload as { files?: unknown }).files;
-  if (!Array.isArray(files)) return null;
-  return files.flatMap((item) => {
-    if (!item || typeof item !== "object") return [];
-    const row = item as Partial<ModifiedFile>;
-    if (typeof row.path !== "string" || row.path.length === 0) return [];
-    return [{
-      path: row.path,
-      additions: Number(row.additions) || 0,
-      deletions: Number(row.deletions) || 0,
-      staged: Boolean(row.staged),
-      diff: typeof row.diff === "string" ? row.diff : "",
-    }];
-  });
+function labelFor(id: string): string {
+  return HARNESSES.find((item) => item.id === id)?.label ?? id;
 }
 
 export function CodingAgentsWorkspace() {
-  const snap = useOmni((s) => s.snap)!;
-  const run = useOmni((s) => s.run);
-  const setToast = useOmni((s) => s.setToast);
-  const go = useOmni((s) => s.go);
+  const snap = useRonic((s) => s.snap)!;
+  const run = useRonic((s) => s.run);
+  const setToast = useRonic((s) => s.setToast);
+  const go = useRonic((s) => s.go);
 
   const [activeAgent, setActiveAgent] = useState<AgentHarness["id"]>(
     (snap.ideAgent as AgentHarness["id"]) || "claude"
@@ -73,6 +60,7 @@ export function CodingAgentsWorkspace() {
   const [files, setFiles] = useState<ModifiedFile[]>([]);
   const [treeNote, setTreeNote] = useState<string>("Reading the git working tree…");
   const [actionNotice, setActionNotice] = useState<string | null>(null);
+  const [runLog, setRunLog] = useState<string>("");
 
   const projectRoot = snap.settings.projectRoot || "";
 
@@ -93,7 +81,13 @@ export function CodingAgentsWorkspace() {
       const match = HARNESSES.find((h) => h.id === snap.ideAgent);
       if (match) setActiveAgent(match.id);
     }
-  }, [snap.ideAgent]);
+  }, [snap.ideAgent, activeAgent]);
+
+  function showFiles(previous: ModifiedFile[], next: ModifiedFile[], note?: string) {
+    setFiles(next);
+    setSelectedFileIndex((current) => indexAfterRefresh(previous, next, current));
+    if (note !== undefined) setTreeNote(note);
+  }
 
   async function refreshTree() {
     setIsScanningGit(true);
@@ -101,9 +95,7 @@ export function CodingAgentsWorkspace() {
       const res = await run("workspace_git", { action: "status", path: "", agent: "", prompt: "" });
       const next = filesFromPayload(res?.payload);
       if (next) {
-        setFiles(next);
-        setSelectedFileIndex(0);
-        setTreeNote(next.length === 0 ? (res?.toast || "Working tree is clean.") : (res?.toast || ""));
+        showFiles(files, next, next.length === 0 ? (res?.toast || "Working tree is clean.") : (res?.toast || ""));
       } else {
         setTreeNote(res?.toast || "Could not read git status.");
       }
@@ -116,7 +108,7 @@ export function CodingAgentsWorkspace() {
     void refreshTree();
   }, [projectRoot]);
 
-  const activeFile = files[selectedFileIndex];
+  const activeFile = files[clampFileIndex(selectedFileIndex, files.length)];
   const agentPath = detectedPaths[activeAgent] || "";
   const agentReady = agentPath.trim().length > 0;
 
@@ -144,9 +136,10 @@ export function CodingAgentsWorkspace() {
   }
 
   async function handleDispatch() {
-    if (!taskPrompt.trim()) return;
+    const prompt = taskPrompt.trim();
+    if (!prompt) return;
     if (!agentReady) {
-      setActionNotice(`${activeAgent} is not installed. Scan this computer, or set its path in Apps.`);
+      setActionNotice(`${labelFor(activeAgent)} is not linked. Scan this computer, or set its path in Apps.`);
       return;
     }
     setIsDispatching(true);
@@ -156,12 +149,18 @@ export function CodingAgentsWorkspace() {
         action: "dispatch",
         path: "",
         agent: activeAgent,
-        prompt: taskPrompt.trim(),
+        prompt,
       });
-      const next = filesFromPayload(res?.payload);
-      if (next) setFiles(next);
-      const exitCode = res?.payload && typeof res.payload === "object" ? (res.payload as { exitCode?: number }).exitCode : undefined;
-      setActionNotice(res?.toast || "Dispatch did not run. Restart the desktop app if this command is new.");
+      if (!res) {
+        setActionNotice("The agent did not finish. The notice at the top of the window has the reason.");
+        return;
+      }
+      const next = filesAfterDispatch(files, res.payload);
+      showFiles(files, next);
+      const output = dispatchOutput(res.payload);
+      if (output) setRunLog(output);
+      const exitCode = res.payload && typeof res.payload === "object" ? (res.payload as { exitCode?: number }).exitCode : undefined;
+      setActionNotice(res.toast || "Dispatch did not run. Restart the desktop app if this command is new.");
       if (typeof exitCode === "number") setTaskPrompt("");
     } finally {
       setIsDispatching(false);
@@ -172,7 +171,7 @@ export function CodingAgentsWorkspace() {
     if (!activeFile) return;
     const res = await run("workspace_git", { action: "stage", path: activeFile.path, agent: "", prompt: "" });
     const next = filesFromPayload(res?.payload);
-    if (next) setFiles(next);
+    if (next) showFiles(files, next);
     setActionNotice(res?.toast || `Staged ${activeFile.path}.`);
   }
 
@@ -180,7 +179,7 @@ export function CodingAgentsWorkspace() {
     if (!activeFile) return;
     const res = await run("workspace_git", { action: "restore", path: activeFile.path, agent: "", prompt: "" });
     const next = filesFromPayload(res?.payload);
-    if (next) setFiles(next);
+    if (next) showFiles(files, next);
     setActionNotice(res?.toast || `Restored ${activeFile.path}.`);
   }
 
@@ -189,20 +188,32 @@ export function CodingAgentsWorkspace() {
     setTaskPrompt(`Refine the changes in ${activeFile.path}.`);
   }
 
-  const idePartner = activeAgent === "vscode" ? "vscode" : "cursor";
+  const idePartner = ideToOpen(activeAgent, {
+    cursor: Boolean(detectedPaths.cursor),
+    vscode: Boolean(detectedPaths.vscode),
+  });
   const ideLabel = idePartner === "vscode" ? "VS Code" : "Cursor";
   const ideReady = Boolean(detectedPaths[idePartner]);
+  const activeLabel = labelFor(activeAgent);
 
   function handleOpenIde() {
-    if (isTauri() && ideReady) {
-      void launchDesktopApp(idePartner, "desktop").catch(() => {});
+    if (!isTauri()) {
+      setActionNotice("The desktop app opens Cursor or VS Code on this computer.");
+      return;
     }
-    setActionNotice(ideReady ? `Opening ${ideLabel} beside this window.` : `${ideLabel} is not installed on this computer.`);
+    if (!ideReady) {
+      setActionNotice(`${ideLabel} is not installed on this computer.`);
+      return;
+    }
+    void launchDesktopApp(idePartner, "desktop", projectRoot ? { path: projectRoot } : undefined)
+      .then((res) => setActionNotice(res?.toast || `Opening ${ideLabel} on the project folder.`))
+      .catch((err: unknown) => setActionNotice(err instanceof Error ? err.message : `Could not open ${ideLabel}.`));
   }
 
   return (
-    <div className="flex flex-col h-full w-full bg-[#f8fafc] text-[#0f172a] overflow-hidden select-none font-sans">
-      <header className="h-14 bg-white border-b border-[#e2e8f0] px-4 flex items-center justify-between shrink-0 shadow-xs z-10">
+    <div className="flex-1 h-full bg-[#eceef2] p-3 sm:p-5 lg:p-6 overflow-hidden select-none flex flex-col font-sans">
+      <div className="w-full max-w-[1600px] flex-1 min-h-0 bg-white rounded-3xl shadow-[0_12px_40px_-8px_rgba(0,0,0,0.06),0_2px_8px_-1px_rgba(0,0,0,0.03)] border border-slate-200/70 flex flex-col mx-auto overflow-hidden transition-all duration-300">
+        <header className="h-14 bg-white border-b border-slate-100 px-4 flex items-center justify-between shrink-0 z-10">
         <div className="flex items-center gap-2 overflow-x-auto py-1 scrollbar-none">
           <div className="flex items-center gap-1.5 mr-2 shrink-0">
             <button
@@ -234,7 +245,7 @@ export function CodingAgentsWorkspace() {
                 title={isDetected ? `${harness.label} (${pathVal})` : `${harness.label} is not installed`}
                 className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-2 transition shrink-0 cursor-pointer ${
                   isSelected
-                    ? "bg-[#0f172a] text-white shadow-xs"
+                    ? "bg-zinc-800 text-white border border-zinc-700/50 shadow-xs"
                     : "bg-white border border-[#e2e8f0] text-[#475569] hover:text-[#0f172a] hover:border-[#cbd5e1]"
                 }`}
               >
@@ -285,13 +296,22 @@ export function CodingAgentsWorkspace() {
                 <span className="text-[10px] font-mono font-bold uppercase tracking-wider text-[#64748b] flex items-center gap-1">
                   <Folder size={11} /> Project Root
                 </span>
-                <button
-                  type="button"
-                  onClick={() => void handleChangeProjectRoot()}
-                  className="text-[11px] font-medium text-[#2563eb] hover:text-[#1d4ed8] hover:underline cursor-pointer"
-                >
-                  Change Folder
-                </button>
+                <span className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => void run("scan_environment")}
+                    className="text-[11px] font-medium text-[#2563eb] hover:text-[#1d4ed8] hover:underline cursor-pointer"
+                  >
+                    Scan
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void handleChangeProjectRoot()}
+                    className="text-[11px] font-medium text-[#2563eb] hover:text-[#1d4ed8] hover:underline cursor-pointer"
+                  >
+                    Change Folder
+                  </button>
+                </span>
               </div>
               <div
                 className="text-xs font-mono font-semibold truncate text-[#0f172a] bg-white border border-[#e2e8f0] px-2 py-1 rounded-md"
@@ -361,7 +381,7 @@ export function CodingAgentsWorkspace() {
             <div className="space-y-2 pt-3 border-t border-[#e2e8f0]">
               <div className="flex items-center justify-between">
                 <label htmlFor="agent-task-input" className="text-xs font-bold text-[#0f172a]">
-                  Assign Task to {activeAgent.toUpperCase()}
+                  Assign task to {activeLabel}
                 </label>
                 <span className={`text-[10px] font-mono font-medium ${agentReady ? "text-[#059669]" : "text-[#94a3b8]"}`}>
                   {agentReady ? "Program found" : "Not linked"}
@@ -373,6 +393,12 @@ export function CodingAgentsWorkspace() {
                 rows={3}
                 value={taskPrompt}
                 onChange={(e) => setTaskPrompt(e.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+                    event.preventDefault();
+                    void handleDispatch();
+                  }
+                }}
                 placeholder={agentReady ? "What should this agent change in the project?" : "Link this agent before dispatching a task."}
                 className="w-full p-2.5 text-xs font-sans border border-[#cbd5e1] rounded-lg outline-none focus:border-[#0f172a] focus:ring-1 focus:ring-[#0f172a] bg-[#f8fafc] text-[#0f172a] placeholder-[#94a3b8] resize-none"
               />
@@ -388,18 +414,32 @@ export function CodingAgentsWorkspace() {
                 }`}
               >
                 <Play size={12} className={isDispatching ? "spin" : "fill-current"} />
-                <span>{isDispatching ? "Agent running…" : `Dispatch to ${activeAgent.toUpperCase()}`}</span>
+                <span>{isDispatching ? "Agent running…" : `Run ${activeLabel}`}</span>
               </button>
+              <div className="text-[10px] font-mono text-[#64748b] truncate" title={agentPath || "No program path yet"}>
+                {agentPath || "No program path yet"}
+              </div>
             </div>
           </div>
 
           <div className="text-[10px] font-mono text-[#64748b] border-t border-[#e2e8f0] pt-2.5 mt-3">
-            Dispatch runs the installed program in this project folder.
+            CLI agents run in this folder. Cursor and VS Code open it, and the task stays in the run log. Ctrl+Enter runs the task.
           </div>
         </aside>
 
         <main className="flex-1 flex flex-col justify-between overflow-hidden bg-[#f8fafc]">
           <div className="flex-1 p-4 overflow-y-auto space-y-3">
+            {runLog && (
+              <div className="bg-white border border-[#e2e8f0] rounded-xl overflow-hidden shadow-xs">
+                <div className="bg-[#f8fafc] border-b border-[#e2e8f0] px-4 py-2 text-[11px] font-bold text-[#475569] flex items-center justify-between">
+                  <span>Last run</span>
+                  <button type="button" onClick={() => setRunLog("")} className="text-[#94a3b8] hover:text-[#0f172a] cursor-pointer">
+                    Clear
+                  </button>
+                </div>
+                <pre className="p-3 whitespace-pre-wrap leading-relaxed text-xs font-mono text-[#0f172a] max-h-48 overflow-auto">{runLog}</pre>
+              </div>
+            )}
             {activeFile ? (
               <>
                 <div className="flex items-center justify-between bg-white border border-[#e2e8f0] p-3 rounded-xl shadow-xs">
@@ -456,6 +496,7 @@ export function CodingAgentsWorkspace() {
             <TerminalPanel sessionId="coding_workspace" title="Interactive Shell (PowerShell / Bash)" />
           </div>
         </main>
+      </div>
       </div>
     </div>
   );

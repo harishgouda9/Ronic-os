@@ -31,7 +31,7 @@ pub fn known_names(plugins: &[PluginPackage], servers: &[McpServer]) -> std::col
     names
 }
 
-pub fn assemble(plugins: &[PluginPackage], servers: &[McpServer]) -> Vec<RegistryTool> {
+pub fn assemble(plugins: &[PluginPackage], servers: &[McpServer], profile_id: &str) -> Vec<RegistryTool> {
     let mut tools = Vec::new();
     for (name, description) in BUILTINS {
         tools.push(RegistryTool {
@@ -54,13 +54,23 @@ pub fn assemble(plugins: &[PluginPackage], servers: &[McpServer]) -> Vec<Registr
         }
     }
     for server in servers {
+        let switch_off = !profile_id.is_empty() && server.enables.iter().any(|flag| flag.profile_id == profile_id && !flag.enabled);
+        let (available, reason) = if switch_off {
+            (false, "Profile switch is Off.")
+        } else if server.trust != "trusted" {
+            (false, "Profile switch is Active. Trust the server before a bot can call it.")
+        } else if server.url.starts_with("http") || !server.command.trim().is_empty() {
+            (true, "Profile switch is Active. A call uses the stored credential when one is saved.")
+        } else {
+            (false, "Profile switch is Active. This server has no URL or command.")
+        };
         for tool in &server.declared_tools {
             tools.push(RegistryTool {
                 name: tool.name.clone(),
                 description: tool.description.clone(),
                 source: format!("mcp:{}", server.id),
-                available: false,
-                reason: "MCP sessions are not open in this version.".into(),
+                available,
+                reason: reason.into(),
             });
         }
     }

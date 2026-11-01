@@ -1,11 +1,11 @@
 import { useState } from "react";
-import { useOmni } from "../store";
+import { useRonic } from "../store";
 import { Pill } from "../ui/bits";
 
 export function Onboarding() {
-  const snap = useOmni((s) => s.snap)!;
-  const run = useOmni((s) => s.run);
-  const busy = useOmni((s) => s.busy);
+  const snap = useRonic((s) => s.snap)!;
+  const run = useRonic((s) => s.run);
+  const busy = useRonic((s) => s.busy);
   return (
     <div className="screen">
       <div className="center-card stack" style={{ width: "min(640px, 100%)" }}>
@@ -43,9 +43,9 @@ export function Onboarding() {
 }
 
 export function Vault() {
-  const snap = useOmni((s) => s.snap)!;
-  const run = useOmni((s) => s.run);
-  const busy = useOmni((s) => s.busy);
+  const snap = useRonic((s) => s.snap)!;
+  const run = useRonic((s) => s.run);
+  const busy = useRonic((s) => s.busy);
   const [password, setPassword] = useState("");
   const [again, setAgain] = useState("");
   const mismatch = again.length > 0 && password !== again;

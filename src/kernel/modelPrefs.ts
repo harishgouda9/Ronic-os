@@ -1,10 +1,10 @@
 import { anthropicHeaders, ollamaModel, PROVIDER_ROUTES, routeFor, secretFor, type ChatModel, type Effort } from "./liveChat";
 
-const CUSTOM = "omni.customModels.v1";
-const EDITS = "omni.modelEdits.v1";
-const STARS = "omni.modelStars.v1";
-const EFFORTS = "omni.modelEffort.v1";
-const LIVE = "omni.liveModels.v1";
+const CUSTOM = "ronic.customModels.v1";
+const EDITS = "ronic.modelEdits.v1";
+const STARS = "ronic.modelStars.v1";
+const EFFORTS = "ronic.modelEffort.v1";
+const LIVE = "ronic.liveModels.v1";
 
 export type ModelEdit = { label?: string; upstreamModel?: string; hidden?: boolean };
 

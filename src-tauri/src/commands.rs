@@ -20,11 +20,11 @@ fn sanitize_mark(raw: &str) -> String {
     "NW".into()
 }
 
-fn guard(state: &AppState) -> std::sync::MutexGuard<'_, Connection> {
+pub(crate) fn guard(state: &AppState) -> std::sync::MutexGuard<'_, Connection> {
     state.conn.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn finish(state: &AppState, toast: Option<String>) -> Result<CommandResult> {
+pub(crate) fn finish(state: &AppState, toast: Option<String>) -> Result<CommandResult> {
     finish_with(state, toast, None)
 }
 
@@ -64,7 +64,7 @@ fn finish_with(state: &AppState, toast: Option<String>, install_choice: Option<S
     Ok(CommandResult { snapshot: snapshot::load(&conn, &meta)?, toast, install_choice, payload: None })
 }
 
-fn finish_payload(state: &AppState, toast: Option<String>, payload: Option<Value>) -> Result<CommandResult> {
+pub(crate) fn finish_payload(state: &AppState, toast: Option<String>, payload: Option<Value>) -> Result<CommandResult> {
     let meta = Meta {
         home: state.home.display().to_string(),
         heartbeat_ms: state.heartbeat.load(Ordering::Relaxed),
@@ -334,6 +334,11 @@ pub struct NewGroup {
 pub async fn create_bot_group(state: State<'_, AppState>, draft: NewGroup) -> Result<CommandResult> {
     {
         let conn = guard(&state);
+        // Freemium gate: autonomous bot-to-bot squads are the Pro converter.
+        // Starter keeps 1-on-1 bot chat; dev builds are entitled.
+        if !crate::licensing::pro_entitled(&conn) {
+            return Err(err("Multi-bot squads are a Ronic Pro feature. Starter keeps 1-on-1 bot chat — upgrade any time from Plan & setup."));
+        }
         let id = crate::bots::create_group(&conn, &state.home, &draft.title, &draft.purpose, &draft.coordination_mode, &draft.member_bot_ids)?;
         crate::bots::open_group(&conn, &id)?;
     }
@@ -717,9 +722,22 @@ pub async fn scan_memory_engines(state: State<'_, AppState>) -> Result<CommandRe
 pub async fn set_memory_route(state: State<'_, AppState>, scope: String, engine_id: String) -> Result<CommandResult> {
     let note = {
         let conn = guard(&state);
+        ensure_memory_engine_entitled(&conn, &engine_id)?;
         crate::memory::set_route(&conn, &scope, &engine_id)?
     };
     finish(&state, Some(format!("Memory engine updated. {note}")))
+}
+
+// Freemium gate: the built-in Mem0 vault and the Obsidian vault are free
+// forever; external graph/code engines (Zep, Cognee, Letta, …) are Pro. Dev
+// builds are entitled, so this only bites on a verified Starter lease.
+fn ensure_memory_engine_entitled(conn: &Connection, engine_id: &str) -> Result<()> {
+    let free = matches!(engine_id, "mem0_builtin" | "openmemory_builtin" | "mem0_sdk" | "obsidian_khoj");
+    if free || crate::licensing::pro_entitled(conn) {
+        Ok(())
+    } else {
+        Err(err(format!("{engine_id} is a Pro memory engine. The built-in Mem0 vault and Obsidian sync are free forever — upgrade from Plan & setup to switch engines.")))
+    }
 }
 
 #[tauri::command]
@@ -744,6 +762,7 @@ pub async fn unmount_memory_companion(state: State<'_, AppState>) -> Result<Comm
 pub async fn sync_memories_to_engine(state: State<'_, AppState>, target_engine_id: String) -> Result<CommandResult> {
     let note = {
         let conn = guard(&state);
+        ensure_memory_engine_entitled(&conn, &target_engine_id)?;
         crate::memory::sync_to_engine(&conn, &target_engine_id)?
     };
     finish(&state, Some(note))
@@ -753,6 +772,7 @@ pub async fn sync_memories_to_engine(state: State<'_, AppState>, target_engine_i
 pub async fn refresh_memory_vault(state: State<'_, AppState>, engine_id: String) -> Result<CommandResult> {
     let note = {
         let conn = guard(&state);
+        ensure_memory_engine_entitled(&conn, &engine_id)?;
         crate::memory::refresh_vault(&conn, &engine_id)?
     };
     finish(&state, Some(note))
@@ -873,9 +893,9 @@ pub async fn save_mcp(state: State<'_, AppState>, draft: crate::capabilities::Mc
         }
     }
     let note = if secret.is_empty() {
-        "MCP server saved. It is not connected."
+        "MCP server saved. It is not connected until a credential check succeeds. Profile switches default to Active."
     } else {
-        "MCP server saved. The key stays in the vault. Trust the server on Capabilities before a bot can use it."
+        "MCP server saved. The key stays in the vault. Profile switches default to Active. Turn one off on Capabilities if you want."
     };
     finish(&state, Some(note.into()))
 }
@@ -895,7 +915,7 @@ pub async fn trust_mcp(state: State<'_, AppState>, id: String) -> Result<Command
         let conn = guard(&state);
         crate::capabilities::trust_mcp(&conn, &id)?;
     }
-    finish(&state, Some("MCP server trusted. The enable switch is still off.".into()))
+    finish(&state, Some("MCP server trusted. Profile switches default to Active. Turn one off on Capabilities if you want.".into()))
 }
 
 #[tauri::command]
@@ -931,6 +951,64 @@ pub async fn install_market(state: State<'_, AppState>, slug: String) -> Result<
 }
 
 #[tauri::command]
+pub async fn install_skill_from_url(state: State<'_, AppState>, url: String, slug: Option<String>) -> Result<CommandResult> {
+    let note = {
+        let conn = guard(&state);
+        let profile = db::kv_get(&conn, "active_profile")?.unwrap_or_default();
+        crate::capabilities::install_skill_from_source(&conn, &state.home, &profile, &url, slug.as_deref())?
+    };
+    finish(&state, Some(note))
+}
+
+#[tauri::command]
+pub async fn install_plugin_from_url(state: State<'_, AppState>, url: String, slug: Option<String>) -> Result<CommandResult> {
+    let note = {
+        let conn = guard(&state);
+        let profile = db::kv_get(&conn, "active_profile")?.unwrap_or_default();
+        crate::capabilities::install_plugin_from_source(&conn, &state.home, &profile, &url, slug.as_deref())?
+    };
+    finish(&state, Some(note))
+}
+
+#[tauri::command]
+pub async fn connect_mcp_server(
+    state: State<'_, AppState>,
+    name: String,
+    transport: Option<String>,
+    command: Option<String>,
+    args: Option<Vec<String>>,
+    url: Option<String>,
+    secret: Option<String>,
+) -> Result<CommandResult> {
+    let secret_value = secret.unwrap_or_default();
+    let note = {
+        let conn = guard(&state);
+        let profile = db::kv_get(&conn, "active_profile")?.unwrap_or_default();
+        let args_vec = args.unwrap_or_default();
+        let message = crate::capabilities::connect_mcp_server(
+            &conn,
+            &state.home,
+            &profile,
+            &name,
+            transport.as_deref(),
+            command.as_deref(),
+            &args_vec,
+            url.as_deref(),
+            Some(secret_value.as_str()),
+        )?;
+        if !secret_value.trim().is_empty() {
+            let server_id = crate::capabilities::server_id_for_name(&name);
+            let key_guard = state.vault_key.lock().unwrap_or_else(|error| error.into_inner());
+            let mut secrets = state.secrets.lock().unwrap_or_else(|error| error.into_inner());
+            secrets.insert(format!("mcp:{server_id}"), secret_value.trim().to_string());
+            crate::vault::persist(&state.home, &conn, key_guard.as_ref(), &secrets)?;
+        }
+        message
+    };
+    finish(&state, Some(note))
+}
+
+#[tauri::command]
 pub async fn set_policy(state: State<'_, AppState>, max_per_tx_usd: f64, daily_cap_usd: f64, require_human_approval_above_usd: f64, max_slippage_bps: i64, killswitch_engaged: bool) -> Result<CommandResult> {
     {
         let conn = guard(&state);
@@ -958,10 +1036,6 @@ pub struct WalletRequest {
 pub async fn wallet_tx(state: State<'_, AppState>, request: WalletRequest) -> Result<CommandResult> {
     let toast = {
         let conn = guard(&state);
-        let settings = db::settings_of(&conn)?;
-        if settings.live_rails {
-            return Err(err("Live rails are switched on, and this build will not send a real charge. Turn live rails off to use the sandbox ledger."));
-        }
         let actor = if request.actor.trim().is_empty() { "user" } else { request.actor.trim() };
         crate::wallet::settle(&conn, &request.bot_profile_id, &request.rail, request.amount_usd, &request.native_amount, &request.counterparty, &request.purpose, actor, &request.kind, request.slippage_bps, &request.effect)?
     };
@@ -973,6 +1047,332 @@ pub async fn review_tx(state: State<'_, AppState>, tx_id: String, approve: bool)
     let toast = {
         let conn = guard(&state);
         crate::wallet::review(&conn, &tx_id, approve)?
+    };
+    finish(&state, Some(toast))
+}
+
+#[tauri::command]
+pub async fn add_sandbox_funds(state: State<'_, AppState>) -> Result<CommandResult> {
+    let _ = &state;
+    Err(err("Sandbox faucet is disabled. Connect a wallet and refresh its on-chain balance."))
+}
+
+#[tauri::command]
+pub async fn probe_local_tool(state: State<'_, AppState>, kind: String, path: Option<String>) -> Result<CommandResult> {
+    let note = tauri::async_runtime::spawn_blocking(move || probe_local_blocking(&kind, path.as_deref()))
+        .await
+        .map_err(|error| err(error.to_string()))??;
+    finish(&state, Some(note))
+}
+
+fn probe_local_blocking(kind: &str, path: Option<&str>) -> Result<String> {
+    match kind {
+        "docker" => {
+            let output = std::process::Command::new("docker")
+                .args(["version", "--format", "{{.Server.Version}}"])
+                .output()
+                .map_err(|_| err("Docker is not on PATH. It was not marked connected."))?;
+            if !output.status.success() {
+                return Err(err("Docker did not answer `docker version`. It was not marked connected."));
+            }
+            let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if version.is_empty() {
+                return Err(err("Docker did not report a version. It was not marked connected."));
+            }
+            Ok(format!("Docker {version}"))
+        }
+        "path" => {
+            let folder = std::path::Path::new(path.unwrap_or("").trim());
+            if folder.as_os_str().is_empty() || !folder.is_dir() {
+                return Err(err("That folder does not exist. It was not mounted."));
+            }
+            Ok(format!("Folder {}", folder.display()))
+        }
+        _ => Err(err("Unknown local check.")),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectWalletRequest {
+    chain: String,
+    #[serde(default)]
+    label: String,
+    address: String,
+    #[serde(default)]
+    connection_type: String,
+    #[serde(default)]
+    secret: String,
+    #[serde(default)]
+    daily_limit_usd: f64,
+}
+
+#[tauri::command]
+pub async fn connect_watched_wallet(state: State<'_, AppState>, request: ConnectWalletRequest) -> Result<CommandResult> {
+    crate::wallet_live::validate_address(&request.chain, &request.address)?;
+    let chain = request.chain.clone();
+    let address = request.address.trim().to_string();
+    let secret = request.secret.clone();
+    let connection = if request.connection_type.trim().is_empty() { "address_watch".to_string() } else { request.connection_type.clone() };
+    let connection_for_fetch = connection.clone();
+    let proof = tauri::async_runtime::spawn_blocking(move || crate::wallet_live::fetch_balance(&chain, &address, &secret, &connection_for_fetch))
+        .await
+        .map_err(|error| err(error.to_string()))??;
+    let id = nid("wallet");
+    let native = proof.balance_native.clone();
+    let detail = proof.detail.clone();
+    {
+        let conn = guard(&state);
+        let mask = mask_secret(&request.secret);
+        crate::wallet_live::insert_wallet(&conn, &id, &request.chain, &request.label, request.address.trim(), &connection, request.daily_limit_usd, &mask, &proof)?;
+        if !request.secret.trim().is_empty() {
+            let key_guard = state.vault_key.lock().unwrap_or_else(|error| error.into_inner());
+            let mut secrets = state.secrets.lock().unwrap_or_else(|error| error.into_inner());
+            secrets.insert(format!("wallet:{id}"), request.secret.trim().to_string());
+            crate::vault::persist(&state.home, &conn, key_guard.as_ref(), &secrets)?;
+        }
+    }
+    finish(&state, Some(format!("Read {native}. {detail} No deposit was credited.")))
+}
+
+#[tauri::command]
+pub async fn refresh_wallet_balance(state: State<'_, AppState>, id: String) -> Result<CommandResult> {
+    let (chain, address, connection_type, status) = {
+        let conn = guard(&state);
+        crate::wallet_live::load_row(&conn, &id)?
+    };
+    if status == "frozen" {
+        return Err(err("This wallet is frozen. Unfreeze it before refreshing."));
+    }
+    let secret = {
+        let secrets = state.secrets.lock().unwrap_or_else(|error| error.into_inner());
+        secrets.get(&format!("wallet:{id}")).cloned().unwrap_or_default()
+    };
+    let proof = tauri::async_runtime::spawn_blocking(move || crate::wallet_live::fetch_balance(&chain, &address, &secret, &connection_type))
+        .await
+        .map_err(|error| err(error.to_string()))??;
+    let native = proof.balance_native.clone();
+    {
+        let conn = guard(&state);
+        crate::wallet_live::update_balance(&conn, &id, &proof)?;
+    }
+    finish(&state, Some(format!("Refreshed {native}. The typed deposit form is not used.")))
+}
+
+#[tauri::command]
+pub async fn disconnect_watched_wallet(state: State<'_, AppState>, id: String) -> Result<CommandResult> {
+    {
+        let conn = guard(&state);
+        crate::wallet_live::delete_wallet(&conn, &id)?;
+        let key_guard = state.vault_key.lock().unwrap_or_else(|error| error.into_inner());
+        let mut secrets = state.secrets.lock().unwrap_or_else(|error| error.into_inner());
+        secrets.remove(&format!("wallet:{id}"));
+        crate::vault::persist(&state.home, &conn, key_guard.as_ref(), &secrets)?;
+    }
+    finish(&state, Some("Wallet removed. Its key was dropped from the vault.".into()))
+}
+
+#[tauri::command]
+pub async fn update_watched_wallet(state: State<'_, AppState>, id: String, status: String, make_default: bool) -> Result<CommandResult> {
+    {
+        let conn = guard(&state);
+        if !status.trim().is_empty() {
+            crate::wallet_live::set_status(&conn, &id, status.trim())?;
+        }
+        if make_default {
+            crate::wallet_live::set_default(&conn, &id)?;
+        }
+    }
+    finish(&state, Some("Wallet updated.".into()))
+}
+
+#[tauri::command]
+pub async fn assign_bot_spend(state: State<'_, AppState>, bot_id: String, limit_usd: f64) -> Result<CommandResult> {
+    let note = {
+        let conn = guard(&state);
+        crate::wallet_live::assign_bot_spend(&conn, &bot_id, limit_usd)?
+    };
+    finish(&state, Some(note))
+}
+
+#[tauri::command]
+pub async fn set_wallet_pin(state: State<'_, AppState>, pin: String, current: Option<String>) -> Result<CommandResult> {
+    let note = {
+        let conn = guard(&state);
+        crate::wallet_live::set_pin(&conn, pin.trim(), current.unwrap_or_default().trim())?
+    };
+    finish(&state, Some(note))
+}
+
+#[tauri::command]
+pub async fn check_wallet_pin(state: State<'_, AppState>, pin: String) -> Result<CommandResult> {
+    {
+        let conn = guard(&state);
+        crate::wallet_live::check_pin(&conn, pin.trim())?;
+    }
+    finish(&state, Some("PIN accepted.".into()))
+}
+
+fn mask_secret(secret: &str) -> String {
+    let secret = secret.trim();
+    if secret.len() <= 8 || secret.contains('\n') {
+        return if secret.is_empty() { String::new() } else { "stored".into() };
+    }
+    format!("{}...{}", &secret[..4], &secret[secret.len() - 4..])
+}
+
+#[tauri::command]
+pub async fn set_ledger_mode(state: State<'_, AppState>, mode: String) -> Result<CommandResult> {
+    let toast = {
+        let conn = guard(&state);
+        crate::wallet_engine::set_ledger_mode(&conn, &mode)?
+    };
+    finish(&state, Some(toast))
+}
+
+#[tauri::command]
+pub async fn bot_circuit_toggle(state: State<'_, AppState>, bot_id: String) -> Result<CommandResult> {
+    let toast = {
+        let conn = guard(&state);
+        let (_, note) = crate::wallet_engine::toggle_circuit(&conn, &bot_id)?;
+        note
+    };
+    finish(&state, Some(toast))
+}
+
+#[tauri::command]
+pub async fn quant_dispatch(state: State<'_, AppState>, pair: String, side: String, size_usd: f64, analyst: String, thesis: String) -> Result<CommandResult> {
+    let toast = {
+        let conn = guard(&state);
+        let bot_id = db::kv_get(&conn, "active_profile")?.unwrap_or_default();
+        let order = crate::wallet_engine::dispatch_quant_order(&conn, &bot_id, &pair, &analyst, &thesis, &side, size_usd)?;
+        match order.status.as_str() {
+            "WORKING" => format!(
+                "⏸ {} order for {} held in the fail-closed approval queue — it exceeds the policy cap. Review it on the wallet screen.",
+                order.side, order.pair
+            ),
+            "REJECTED" => format!("✕ {} order rejected by the policy gate (cap, drawdown, or frozen bot). {}", order.side, order.reference),
+            _ => format!(
+                "⚡ Routed {} ${:.2} on {} over the Rust WebSocket in {:.1}ms · builder rebate ${:.4} (5 bps) · {}",
+                order.side, order.size_usd, order.pair, order.ws_latency_ms, order.rebate_usd, order.status
+            ),
+        }
+    };
+    finish(&state, Some(toast))
+}
+
+#[tauri::command]
+pub async fn self_heal_drill(state: State<'_, AppState>, tier: i64) -> Result<CommandResult> {
+    let toast = {
+        let conn = guard(&state);
+        crate::remediation_core::run_drill(&conn, &state.home, tier)?
+    };
+    finish(&state, Some(toast))
+}
+
+#[tauri::command]
+pub async fn sentinel_scan(state: State<'_, AppState>, sentinel_id: String) -> Result<CommandResult> {
+    let toast = {
+        let conn = guard(&state);
+        crate::remediation_core::sentinel_scan(&conn, &state.home, &sentinel_id)?
+    };
+    finish(&state, Some(toast))
+}
+
+#[tauri::command]
+pub async fn sentinel_scan_all(state: State<'_, AppState>) -> Result<CommandResult> {
+    let toast = {
+        let conn = guard(&state);
+        crate::remediation_core::sentinel_scan_all(&conn, &state.home)?
+    };
+    finish(&state, Some(toast))
+}
+
+#[tauri::command]
+pub async fn acknowledge_sentinel(state: State<'_, AppState>, sentinel_id: String) -> Result<CommandResult> {
+    let toast = {
+        let conn = guard(&state);
+        crate::remediation_core::sentinel_acknowledge(&conn, &sentinel_id)?
+    };
+    finish(&state, Some(toast))
+}
+
+#[tauri::command]
+pub async fn reset_sentinel_ack(state: State<'_, AppState>, sentinel_id: String) -> Result<CommandResult> {
+    let toast = {
+        let conn = guard(&state);
+        crate::remediation_core::sentinel_reset(&conn, &sentinel_id)?
+    };
+    finish(&state, Some(toast))
+}
+
+#[tauri::command]
+pub async fn list_shadow_backups(state: State<'_, AppState>) -> Result<CommandResult> {
+    let _ = crate::remediation_core::shadow_backups(&state.home);
+    finish(&state, None)
+}
+
+#[tauri::command]
+pub async fn restore_shadow_backup(state: State<'_, AppState>, backup_name: String) -> Result<CommandResult> {
+    let toast = crate::remediation_core::restore_shadow_backup(&state.home, &backup_name)?;
+    finish(&state, Some(toast))
+}
+
+#[tauri::command]
+pub async fn snapshot_poll(state: State<'_, AppState>) -> Result<CommandResult> {
+    finish(&state, None)
+}
+
+#[tauri::command]
+pub async fn save_exported_file(
+    filename: String,
+    base64_data: String,
+    open_after: Option<bool>,
+) -> Result<String> {
+    use base64::Engine;
+    let clean_b64 = if let Some(idx) = base64_data.find(',') {
+        &base64_data[idx + 1..]
+    } else {
+        &base64_data
+    };
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(clean_b64.trim())
+        .map_err(|e| err(format!("Invalid base64 payload: {e}")))?;
+
+    let dl_dir = std::env::var("USERPROFILE")
+        .map(|p| std::path::PathBuf::from(p).join("Downloads"))
+        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let _ = std::fs::create_dir_all(&dl_dir);
+
+    let safe_name = filename
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
+        .collect::<String>();
+    let target = dl_dir.join(&safe_name);
+
+    std::fs::write(&target, &bytes).map_err(|e| err(format!("Failed to save file: {e}")))?;
+    let target_str = target.to_string_lossy().to_string();
+
+    if open_after.unwrap_or(false) {
+        #[cfg(windows)]
+        {
+            let escaped = target_str.replace('\'', "''");
+            let mut cmd = std::process::Command::new("powershell.exe");
+            cmd.args(["-NoProfile", "-Command", &format!("Start-Process -FilePath '{}'", escaped)]);
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000);
+            let _ = cmd.spawn();
+        }
+    }
+
+    Ok(target_str)
+}
+
+#[tauri::command]
+pub async fn sentinel_remediate(state: State<'_, AppState>, sentinel_id: String) -> Result<CommandResult> {
+    let toast = {
+        let conn = guard(&state);
+        crate::remediation_core::sentinel_remediate(&conn, &state.home, &sentinel_id)?
     };
     finish(&state, Some(toast))
 }
@@ -1125,7 +1525,7 @@ pub async fn save_extension(state: State<'_, AppState>, id: String, code: String
         std::fs::write(&full, &code)?;
         conn.execute("UPDATE extensions SET code=?1 WHERE id=?2", params![code, id])?;
     }
-    finish(&state, Some("Extension written under ~/.omniworkspace.".into()))
+    finish(&state, Some("Extension written under ~/.ronicos.".into()))
 }
 
 #[tauri::command]
@@ -1255,6 +1655,14 @@ pub struct ConnectBot {
     pub engine: String,
     pub mode: String,
     pub command_or_url: String,
+    #[serde(default)]
+    pub api_base: String,
+    #[serde(default)]
+    pub api_model: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default)]
+    pub provider_ref: String,
 }
 
 #[tauri::command]
@@ -1270,7 +1678,53 @@ pub async fn connect_external_bot(state: State<'_, AppState>, draft: ConnectBot)
         let trimmed = draft.display_name.trim();
         if trimmed.is_empty() { handle.trim_start_matches('@').to_string() } else { trimmed.to_string() }
     };
+    let mut engine_kind = "";
+    let mut api_base = String::new();
+    let mut api_model = String::new();
+    let mut provider_ref = draft.provider_ref.trim().to_string();
     let (engine, command, detail) = match draft.mode.as_str() {
+        "api" => {
+            let base = draft.api_base.trim().trim_end_matches('/').to_string();
+            crate::util::https_or_loopback(&base).map_err(|_| err("the API base must be https, or http on localhost"))?;
+            let model = draft.api_model.trim().to_string();
+            if model.is_empty() {
+                return Err(err("add the model id this bot speaks, for example grok-4"));
+            }
+            if model.contains(char::is_whitespace) {
+                return Err(err("the model id must not contain spaces — use the id shown in the provider's model list"));
+            }
+            api_base = base.clone();
+            api_model = model;
+            engine_kind = "openai_api";
+            if provider_ref.is_empty() {
+                let slug = handle.trim_start_matches('@').to_ascii_lowercase();
+                provider_ref = format!("botprov_{slug}");
+            }
+            let engine = if draft.engine.trim().is_empty() {
+                url::Url::parse(&base).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_else(|| "Cloud API".into())
+            } else {
+                draft.engine.trim().to_string()
+            };
+            let engine_copy = engine.clone();
+            (engine, base, format!("connected to {engine_copy} at {api_base} as {api_model}"))
+        }
+        "subscription" => {
+            // The ORIGINAL bot: the service's own product, used with the user's
+            // subscription login. The provider row holds the official site; chat
+            // in Ronic OS uses the plan/CLI login where the service allows it.
+            let site = draft.api_base.trim().trim_end_matches('/').to_string();
+            crate::util::https_or_loopback(&site).map_err(|_| err("the original bot's site must be an https URL"))?;
+            api_base = site.clone();
+            api_model = draft.api_model.trim().to_string();
+            engine_kind = "subscription";
+            let engine = if draft.engine.trim().is_empty() {
+                url::Url::parse(&site).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_else(|| "Original bot".into())
+            } else {
+                draft.engine.trim().to_string()
+            };
+            let detail = format!("bound to the original {engine} at {site}");
+            (engine, site, detail)
+        }
         "github" => {
             let (clone_url, repo) = github_clone_target(&draft.command_or_url)?;
             let dest = state.home.join("bots").join(&repo);
@@ -1305,22 +1759,78 @@ pub async fn connect_external_bot(state: State<'_, AppState>, draft: ConnectBot)
         let conn = guard(&state);
         let existing: Option<String> = conn.query_row("SELECT id FROM bot_profiles WHERE handle = ?1", params![handle], |row| row.get(0)).ok();
         let soul = format!("External bot {handle}. {detail}");
+        // A cloud bot gets a dedicated engine account whose endpoint and key the
+        // chat turn calls directly, so the reply really comes from that service.
+        // An original bot gets a webview provider for its official site instead.
+        let mut needs_key = false;
+        if engine_kind == "openai_api" {
+            let has_new_key = !draft.api_key.trim().is_empty();
+            let had_secret: i64 = conn.query_row("SELECT has_secret FROM provider_accounts WHERE id = ?1", params![provider_ref], |r| r.get(0)).unwrap_or(0);
+            needs_key = had_secret == 0 && !has_new_key;
+            let health = if needs_key { format!("Bound to {handle}. Needs an API key before it can chat.") } else { format!("Bound to {handle}.") };
+            conn.execute(
+                "INSERT INTO provider_accounts (id, name, provider_type, binary_or_endpoint, has_secret, is_active, allow_cli_dispatch, health_detail, created_at)
+                 VALUES (?1, ?2, 'byok_api', ?3, ?4, 1, 0, ?5, ?6)
+                 ON CONFLICT(id) DO UPDATE SET name = ?2, binary_or_endpoint = ?3, health_detail = ?5, is_active = 1,
+                   has_secret = CASE WHEN ?4 = 1 THEN 1 ELSE provider_accounts.has_secret END",
+                params![provider_ref, &engine, &api_base, has_new_key as i64, &health, now_ms()],
+            )?;
+            if has_new_key {
+                let key = draft.api_key.trim().to_string();
+                let key_guard = state.vault_key.lock().unwrap_or_else(|e| e.into_inner());
+                let mut secrets = state.secrets.lock().unwrap_or_else(|e| e.into_inner());
+                secrets.insert(provider_ref.clone(), key);
+                crate::vault::persist(&state.home, &conn, key_guard.as_ref(), &secrets)?;
+            }
+        }
+        if engine_kind == "subscription" && provider_ref.is_empty() {
+            let slug = handle.trim_start_matches('@').to_ascii_lowercase();
+            provider_ref = format!("botsite_{slug}");
+        }
+        if engine_kind == "subscription" {
+            let exists: i64 = conn.query_row("SELECT COUNT(*) FROM provider_accounts WHERE id = ?1", params![provider_ref], |r| r.get(0)).unwrap_or(0);
+            if exists == 0 {
+                conn.execute(
+                    "INSERT INTO provider_accounts (id, name, provider_type, binary_or_endpoint, has_secret, is_active, allow_cli_dispatch, health_detail, created_at)
+                     VALUES (?1, ?2, 'isolated_webview', ?3, 0, 1, 0, ?4, ?5)",
+                    params![provider_ref, &engine, &api_base, format!("The original {engine}. Sign in on the site with your subscription — no API key needed there."), now_ms()],
+                )?;
+            }
+        }
+        let status_line = if engine_kind == "subscription" {
+            format!("Original {engine} — press Check after signing in")
+        } else if needs_key {
+            format!("Needs an API key for {engine} — reconnect with the key, or add it in Apps & providers.")
+        } else if engine_kind == "openai_api" {
+            format!("Live endpoint · {api_model} · press Check to verify")
+        } else {
+            "Ready for tasks".to_string()
+        };
+        let primary = if engine_kind == "openai_api" { provider_ref.clone() } else { "prov_ollama".to_string() };
         let id = if let Some(id) = existing {
             conn.execute(
-                "UPDATE bot_profiles SET display_name = ?1, engine = ?2, command_or_url = ?3, run_status = 'ready', role = ?4, soul_markdown = ?5 WHERE id = ?6",
-                params![name, &engine, &command, &engine, soul, id],
+                "UPDATE bot_profiles SET display_name = ?1, engine = ?2, command_or_url = ?3, run_status = 'ready', role = ?4, soul_markdown = ?5, engine_kind = ?6, api_base = ?7, api_model = ?8, primary_account_id = CASE WHEN ?6 = '' THEN primary_account_id ELSE ?9 END, status_line = ?10 WHERE id = ?11",
+                params![name, &engine, &command, &engine, soul, engine_kind, &api_base, &api_model, &primary, &status_line, id],
             )?;
             id
         } else {
             let id = nid("bot");
             conn.execute(
-                "INSERT INTO bot_profiles (id, handle, display_name, avatar, soul_markdown, primary_account_id, long_context_account_id, fallback_account_id, allow_computer_use, allow_browser_use, allow_code_exec, scoped_obsidian_folder, daily_wallet_limit_usd, is_pinned, role, created_at, engine, command_or_url, run_status) VALUES (?1,?2,?3,'XB',?4,'prov_ollama','prov_gemini','prov_openrouter',1,1,1,'',5,1,?5,?6,?7,?8,'ready')",
-                params![id, handle, name, soul, &engine, now_ms(), &engine, command],
+                "INSERT INTO bot_profiles (id, handle, display_name, avatar, soul_markdown, primary_account_id, long_context_account_id, fallback_account_id, allow_computer_use, allow_browser_use, allow_code_exec, scoped_obsidian_folder, daily_wallet_limit_usd, is_pinned, role, created_at, engine, command_or_url, run_status, engine_kind, api_base, api_model, status_line) VALUES (?1,?2,?3,'XB',?4,?5,'prov_gemini','prov_openrouter',1,1,1,'',5,1,?6,?7,?8,?9,'ready',?10,?11,?12,?13)",
+                params![id, handle, name, soul, &primary, &engine, now_ms(), &engine, &command, engine_kind, &api_base, &api_model, &status_line],
             )?;
             id
         };
         kv_set(&conn, "active_profile", &id)?;
-        format!("{handle} is linked. {detail}")
+        if engine_kind == "subscription" {
+            format!("{handle} is bound to the original {engine} at {api_base}. Open it from the bot card to chat with your subscription, and press Check for its status.")
+        } else if needs_key {
+            format!("{handle} is linked to {engine} as {api_model}. Add its API key, then press Check to go live.")
+        } else if engine_kind == "openai_api" {
+            format!("{handle} is live on {engine} ({api_model}). Open it in chat — replies come from {engine}.")
+        } else {
+            format!("{handle} is linked. {detail}")
+        }
     };
     finish(&state, Some(toast))
 }
@@ -1344,12 +1854,157 @@ fn github_clone_target(raw: &str) -> Result<(String, String)> {
 
 #[tauri::command]
 pub async fn set_bot_run(state: State<'_, AppState>, id: String, action: String) -> Result<CommandResult> {
-    let (handle, command, pid): (String, String, Option<i64>) = {
+    let (handle, command, pid, engine_kind, api_base, api_model, provider): (String, String, Option<i64>, String, String, String, String) = {
         let conn = guard(&state);
-        conn.query_row("SELECT handle, command_or_url, active_pid FROM bot_profiles WHERE id = ?1", params![id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-            .map_err(|_| err("bot not found"))?
+        conn.query_row("SELECT handle, command_or_url, active_pid, engine_kind, api_base, api_model, primary_account_id FROM bot_profiles WHERE id = ?1", params![id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?))
+        })
+        .map_err(|_| err("bot not found"))?
     };
     let trimmed = command.trim().to_string();
+    if action == "start" && engine_kind == "subscription" {
+        let (ptype, pendpoint, pname): (String, String, String) = {
+            let conn = guard(&state);
+            conn.query_row(
+                "SELECT provider_type, binary_or_endpoint, name FROM provider_accounts WHERE id = ?1",
+                params![provider],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap_or_default()
+        };
+        let secret = state.secrets.lock().unwrap_or_else(|e| e.into_inner()).get(&provider).cloned();
+        let site = if api_base.trim().is_empty() { trimmed.clone() } else { api_base.trim().to_string() };
+        // Readiness by subscription type: CLI login (Claude/Gemini), plan OAuth
+        // (ChatGPT), or the original site with an optional key for in-chat.
+        let (run_status, status_line, toast) = match ptype.as_str() {
+            "cli_subprocess" => {
+                // No stored path means look the CLI up by name: "Claude Code"
+                // -> `claude`, "Gemini" -> `gemini`; where.exe resolves .cmd/.exe.
+                let bin = if pendpoint.trim().is_empty() {
+                    pname.split_whitespace().next().unwrap_or("").to_ascii_lowercase()
+                } else {
+                    pendpoint.trim().to_string()
+                };
+                let installed = !bin.is_empty() && (std::path::Path::new(&bin).exists() || crate::util::which(&bin).is_some());
+                if installed {
+                    (
+                        "running",
+                        format!("Signed in via {pname} — in-chat replies come from your subscription."),
+                        format!("{handle} is live: {pname} is installed and signed in on this machine."),
+                    )
+                } else {
+                    (
+                        "stopped",
+                        format!("{pname} is not installed or not signed in yet. Connect it in Apps & providers — your subscription covers it, no API key."),
+                        format!("{handle} needs {pname} installed and signed in. That uses your subscription, no API key."),
+                    )
+                }
+            }
+            "official_oauth" => match secret.filter(|s| !s.trim().is_empty()) {
+                None => (
+                    "stopped",
+                    format!("Sign in to {pname} from Apps & providers — your plan covers in-chat replies, no API key."),
+                    format!("{handle} needs a ChatGPT sign-in. Use Continue with ChatGPT in Apps & providers — your plan, no API key."),
+                ),
+                Some(s) if crate::siwc::is_plan_secret(&s) => {
+                    let mut model = api_model.trim().to_string();
+                    if model.is_empty() {
+                        // Auto-pick the plan's first model so the bot needs no setup.
+                        if let Ok(bearer) = crate::siwc::fresh_bearer(&state) {
+                            if let Ok(list) = crate::siwc::fetch_models(&bearer) {
+                                if let Some((id, _)) = list.first() {
+                                    model = id.clone();
+                                }
+                            }
+                        }
+                    }
+                    let model_note = if model.is_empty() { String::new() } else { format!(" · {model}") };
+                    if !model.is_empty() && model != api_model.trim() {
+                        let conn = guard(&state);
+                        let _ = conn.execute("UPDATE bot_profiles SET api_model = ?1 WHERE id = ?2", params![&model, id]);
+                    }
+                    (
+                        "running",
+                        format!("ChatGPT plan signed in{model_note} — replies come from your subscription."),
+                        format!("{handle} is live on your ChatGPT plan. Replies in chat come from the subscription, no API key."),
+                    )
+                }
+                Some(_) => (
+                    "running",
+                    format!("API key stored for {pname} — in-chat replies are live."),
+                    format!("{handle} is live with the stored key for {pname}."),
+                ),
+            },
+            _ => match secret.filter(|s| !s.trim().is_empty()) {
+                Some(_) => (
+                    "running",
+                    format!("API key stored for {pname} — in-chat replies are live. The original stays at {site}."),
+                    format!("{handle} is live in chat with the stored key for {pname}."),
+                ),
+                None => (
+                    "ready",
+                    format!("The original {pname} lives at {site}. Open it from this card to chat with your subscription; in-chat replies here also need an API key."),
+                    format!("{handle} opens the original {pname} from its card. In-chat replies need an API key for {pname}."),
+                ),
+            },
+        };
+        {
+            let conn = guard(&state);
+            conn.execute(
+                "UPDATE bot_profiles SET run_status = ?1, active_pid = NULL, status_line = ?2 WHERE id = ?3",
+                params![run_status, &status_line, id],
+            )?;
+        }
+        return finish(&state, Some(toast));
+    }
+    if action == "start" && engine_kind == "openai_api" {
+        let base = if api_base.trim().is_empty() { trimmed } else { api_base.trim().trim_end_matches('/').to_string() };
+        let host = url::Url::parse(&base).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_else(|| base.clone());
+        let key = state.secrets.lock().unwrap_or_else(|e| e.into_inner()).get(&provider).cloned().filter(|k| !k.trim().is_empty());
+        let Some(key) = key else {
+            let conn = guard(&state);
+            conn.execute(
+                "UPDATE bot_profiles SET run_status = 'stopped', active_pid = NULL, status_line = ?1 WHERE id = ?2",
+                params![format!("Needs an API key for {host} — add it in Apps & providers, or reconnect the bot with the key."), id],
+            )?;
+            return finish(&state, Some(format!("{handle} has no API key for {host} yet. Store the key, then press Check again.")));
+        };
+        let outcome = probe_api(&base, &key);
+        let toast = {
+            let conn = guard(&state);
+            match outcome {
+                Ok((code, ms)) if (200..300).contains(&code) => {
+                    conn.execute(
+                        "UPDATE bot_profiles SET run_status = 'running', active_pid = NULL, status_line = ?1 WHERE id = ?2",
+                        params![format!("Live · {host} · {api_model} · {ms}ms"), id],
+                    )?;
+                    format!("{handle} is live: {host} accepted the key check in {ms}ms.")
+                }
+                Ok((code, _)) if code == 401 || code == 403 => {
+                    conn.execute(
+                        "UPDATE bot_profiles SET run_status = 'stopped', active_pid = NULL, status_line = ?1 WHERE id = ?2",
+                        params![format!("Key rejected by {host} (HTTP {code})."), id],
+                    )?;
+                    format!("{handle}'s API key was rejected by {host} (HTTP {code}). Replace the key and check again.")
+                }
+                Ok((code, ms)) => {
+                    conn.execute(
+                        "UPDATE bot_profiles SET run_status = 'ready', active_pid = NULL, status_line = ?1 WHERE id = ?2",
+                        params![format!("Reached {host} in {ms}ms but the key check returned HTTP {code} — chat may still work."), id],
+                    )?;
+                    format!("{handle} reached {host} (HTTP {code}). That endpoint may not expose /models; try chatting with it.")
+                }
+                Err(error) => {
+                    conn.execute(
+                        "UPDATE bot_profiles SET run_status = 'stopped', active_pid = NULL, status_line = ?1 WHERE id = ?2",
+                        params![format!("{host} unreachable: {error}"), id],
+                    )?;
+                    format!("{handle} could not reach {host}: {error}")
+                }
+            }
+        };
+        return finish(&state, Some(toast));
+    }
     if action == "start" && (trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
         let reached = probe_http(&trimmed);
         let toast = {
@@ -1391,6 +2046,26 @@ fn probe_http(url: &str) -> std::result::Result<(), String> {
         .build()
         .map_err(|error| error.without_url().to_string())?;
     client.get(url).send().map(|_| ()).map_err(|error| error.without_url().to_string())
+}
+
+// Key check for cloud bots: GET {base}/models with the stored key. 200 means
+// the endpoint is live and the key works; 401/403 mean the key is bad; other
+// codes are reported so the user can decide (some gateways lack /models).
+fn probe_api(base: &str, key: &str) -> std::result::Result<(u16, u128), String> {
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(6))
+        .timeout(Duration::from_secs(12))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let started = Instant::now();
+    let response = client
+        .get(format!("{base}/models"))
+        .bearer_auth(key)
+        .send()
+        .map_err(|error| error.without_url().to_string())?;
+    let code = response.status().as_u16();
+    let _ = response.text();
+    Ok((code, started.elapsed().as_millis()))
 }
 
 fn stop_pid(pid: i64) {
@@ -1685,19 +2360,26 @@ pub async fn memory_vault(state: State<'_, AppState>, action: String, query: Opt
 
 #[tauri::command]
 pub async fn workspace_git(
-    state: State<'_, AppState>,
+    app: AppHandle,
     action: String,
     path: Option<String>,
     agent: Option<String>,
     prompt: Option<String>,
 ) -> Result<CommandResult> {
-    let (toast, payload) = crate::workspace_git::perform(
-        &state,
-        action.trim(),
-        path.unwrap_or_default().trim(),
-        agent.unwrap_or_default().trim(),
-        prompt.unwrap_or_default().trim(),
-    )?;
+    let app_for_work = app.clone();
+    let (toast, payload) = tauri::async_runtime::spawn_blocking(move || {
+        let state = app_for_work.state::<AppState>();
+        crate::workspace_git::perform(
+            &state,
+            action.trim(),
+            path.unwrap_or_default().trim(),
+            agent.unwrap_or_default().trim(),
+            prompt.unwrap_or_default().trim(),
+        )
+    })
+    .await
+    .map_err(|error| err(format!("git work stopped: {error}")))??;
+    let state = app.state::<AppState>();
     finish_payload(&state, Some(toast), Some(payload))
 }
 
@@ -1946,6 +2628,33 @@ fn resolve_bot_profile(conn: &Connection, reference: &str) -> Option<String> {
 // node statuses, so two interleaved runs corrupt each other's state.
 static WORKFLOW_RUN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+fn usd_amount_from_prompt(prompt: &str) -> f64 {
+    let patterns = [r"\$\s*([0-9]+(?:\.[0-9]+)?)", r"(?i)([0-9]+(?:\.[0-9]+)?)\s*usd", r"(?i)usd\s*([0-9]+(?:\.[0-9]+)?)"];
+    for pattern in patterns {
+        if let Ok(expr) = regex::Regex::new(pattern) {
+            if let Some(found) = expr.captures(prompt).and_then(|caps| caps.get(1)).and_then(|item| item.as_str().parse::<f64>().ok()) {
+                if found > 0.0 {
+                    return found;
+                }
+            }
+        }
+    }
+    0.0
+}
+
+fn rail_from_prompt(prompt: &str) -> &'static str {
+    let lower = prompt.to_lowercase();
+    if lower.contains("upi") || lower.contains("razorpay") || prompt.contains('₹') {
+        "razorpay_upi"
+    } else if lower.contains("stripe") {
+        "stripe_card"
+    } else if lower.contains("hyperliquid") {
+        "hyperliquid_ws"
+    } else {
+        "crypto_x402"
+    }
+}
+
 fn execute_workflow(state: &AppState, id: &str, approve_paused_gate: bool) -> Result<String> {
     use tauri::Emitter;
     let _run_guard = WORKFLOW_RUN.try_lock().map_err(|_| err("another workflow run is already in progress; wait for it to finish or pause it first"))?;
@@ -2005,13 +2714,72 @@ fn execute_workflow(state: &AppState, id: &str, approve_paused_gate: bool) -> Re
                     persist_workflow(&conn, &state.home, id, &name, "paused_editable", Some(&node_id), &triggers, &nodes, &checkpoint)?;
                 }
                 if let Some(app) = &app {
-                    let _ = app.emit("omni://wf-progress", json!({ "id": id, "status": "paused_editable", "nodes": nodes }));
+                    let _ = app.emit("ronic://wf-progress", json!({ "id": id, "status": "paused_editable", "nodes": nodes }));
                 }
                 return Ok(if node_kind == "wallet_execution" {
-                    format!("Paused at the wallet step {node_id}. Wallet spends settle from the wallet screen; press Resume to mark it approved and continue.")
+                    format!("Paused at the wallet step {node_id}. Resume runs the policy gate against the ledger. It is not approved until that settlement succeeds.")
                 } else {
                     format!("Paused at the approval gate {node_id}. Press Resume to approve it and continue the run.")
                 });
+            }
+            if node_kind == "wallet_execution" {
+                let amount = usd_amount_from_prompt(&node_prompt);
+                let rail = rail_from_prompt(&node_prompt);
+                let bot = node_bot.trim().to_string();
+                let outcome = {
+                    let conn = guard(state);
+                    if amount <= 0.0 {
+                        Err(err("Wallet step has no dollar amount, so nothing was approved."))
+                    } else {
+                        crate::wallet::settle(&conn, &bot, rail, amount, &format!("{amount:.2} USD"), "workflow", &node_prompt, "agent", "payment", None, "spend")
+                    }
+                };
+                match outcome {
+                    Ok(note) if note.starts_with("pending_approval") => {
+                        nodes[index].status = "paused".into();
+                        checkpoint.insert(node_id.clone(), json!(note.clone()));
+                        {
+                            let conn = guard(state);
+                            persist_workflow(&conn, &state.home, id, &name, "paused_editable", Some(&node_id), &triggers, &nodes, &checkpoint)?;
+                        }
+                        if let Some(app) = &app {
+                            let _ = app.emit("ronic://wf-progress", json!({ "id": id, "status": "paused_editable", "nodes": nodes }));
+                        }
+                        return Ok(format!("Wallet step {node_id} is waiting in the approval queue. {note}"));
+                    }
+                    Ok(note) if note.starts_with("auto_signed") || note.starts_with("approved_by_user") => {
+                        nodes[index].status = "done".into();
+                        nodes[index].latency_ms = 0;
+                        checkpoint.insert(node_id.clone(), json!(note));
+                    }
+                    Ok(note) => {
+                        nodes[index].status = "error".into();
+                        checkpoint.insert(node_id.clone(), json!(note.clone()));
+                        {
+                            let conn = guard(state);
+                            persist_workflow(&conn, &state.home, id, &name, "error", Some(&node_id), &triggers, &nodes, &checkpoint)?;
+                        }
+                        return Err(err(format!("Wallet step {node_id} was not approved. {note}")));
+                    }
+                    Err(error) => {
+                        nodes[index].status = "error".into();
+                        checkpoint.insert(node_id.clone(), json!(format!("error: {error}")));
+                        {
+                            let conn = guard(state);
+                            persist_workflow(&conn, &state.home, id, &name, "error", Some(&node_id), &triggers, &nodes, &checkpoint)?;
+                        }
+                        return Err(err(format!("Wallet step {node_id} was not approved. {error}")));
+                    }
+                }
+                {
+                    let conn = guard(state);
+                    persist_workflow(&conn, &state.home, id, &name, "running", None, &triggers, &nodes, &checkpoint)?;
+                }
+                if let Some(app) = &app {
+                    let _ = app.emit("ronic://wf-progress", json!({ "id": id, "status": "running", "nodes": nodes }));
+                }
+                index += 1;
+                continue;
             }
             nodes[index].status = "done".into();
             nodes[index].latency_ms = 0;
@@ -2021,7 +2789,7 @@ fn execute_workflow(state: &AppState, id: &str, approve_paused_gate: bool) -> Re
                 persist_workflow(&conn, &state.home, id, &name, "running", None, &triggers, &nodes, &checkpoint)?;
             }
             if let Some(app) = &app {
-                let _ = app.emit("omni://wf-progress", json!({ "id": id, "status": "running", "nodes": nodes }));
+                let _ = app.emit("ronic://wf-progress", json!({ "id": id, "status": "running", "nodes": nodes }));
             }
             index += 1;
             continue;
@@ -2033,7 +2801,7 @@ fn execute_workflow(state: &AppState, id: &str, approve_paused_gate: bool) -> Re
             persist_workflow(&conn, &state.home, id, &name, "running", None, &triggers, &nodes, &checkpoint)?;
         }
         if let Some(app) = &app {
-            let _ = app.emit("omni://wf-progress", json!({ "id": id, "status": "running", "nodes": nodes }));
+            let _ = app.emit("ronic://wf-progress", json!({ "id": id, "status": "running", "nodes": nodes }));
         }
         if !node_bot.trim().is_empty() {
             let resolved = {
@@ -2074,7 +2842,7 @@ fn execute_workflow(state: &AppState, id: &str, approve_paused_gate: bool) -> Re
                     }
                 }
                 if let Some(app) = &app {
-                    let _ = app.emit("omni://wf-progress", json!({ "id": id, "status": "error", "nodes": nodes }));
+                    let _ = app.emit("ronic://wf-progress", json!({ "id": id, "status": "error", "nodes": nodes }));
                 }
                 return Err(err(format!("step {node_id} failed: {error}. The workflow is paused there; fix the step and resume.")));
             }
@@ -2084,7 +2852,7 @@ fn execute_workflow(state: &AppState, id: &str, approve_paused_gate: bool) -> Re
             persist_workflow(&conn, &state.home, id, &name, "running", None, &triggers, &nodes, &checkpoint)?;
         }
         if let Some(app) = &app {
-            let _ = app.emit("omni://wf-progress", json!({ "id": id, "status": "running", "nodes": nodes }));
+            let _ = app.emit("ronic://wf-progress", json!({ "id": id, "status": "running", "nodes": nodes }));
         }
         index += 1;
     }
@@ -2096,9 +2864,18 @@ fn execute_workflow(state: &AppState, id: &str, approve_paused_gate: bool) -> Re
         }
     }
     if let Some(app) = &app {
-        let _ = app.emit("omni://wf-progress", json!({ "id": id, "status": "completed", "nodes": nodes }));
+        let _ = app.emit("ronic://wf-progress", json!({ "id": id, "status": "completed", "nodes": nodes }));
     }
     Ok(format!("Workflow '{name}' completed. Every step ran through its assigned bot; outputs are on each step and in the chat."))
+}
+
+#[tauri::command]
+pub async fn delete_workflow(state: State<'_, AppState>, id: String) -> Result<CommandResult> {
+    {
+        let conn = guard(&state);
+        conn.execute("DELETE FROM workflows WHERE id=?1", params![id])?;
+    }
+    finish(&state, Some("Workflow deleted.".into()))
 }
 
 #[tauri::command]
@@ -2516,6 +3293,249 @@ pub async fn launch_desktop_app(app: AppHandle, id: String, kind: Option<String>
         .map_err(|error| err(error.to_string()))??;
     let state = app.state::<AppState>();
     finish_with(&state, Some(outcome.note), outcome.install_choice)
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct BackupDestination {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub path: String,
+    pub exists: bool,
+    pub description: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct BackupWriteResult {
+    pub success: bool,
+    pub file_path: String,
+    pub bytes_written: usize,
+    pub sha256: String,
+    pub timestamp: i64,
+}
+
+#[tauri::command]
+pub async fn detect_backup_destinations() -> std::result::Result<Vec<BackupDestination>, String> {
+    let mut dests = Vec::new();
+
+    if let Ok(user_profile) = std::env::var("USERPROFILE") {
+        let docs = std::path::Path::new(&user_profile).join("Documents").join("Ronic OS Memory Backups");
+        dests.push(BackupDestination {
+            id: "local_documents".into(),
+            name: "Local Documents Folder".into(),
+            kind: "documents".into(),
+            path: docs.display().to_string(),
+            exists: true,
+            description: "Default protected local storage in your Documents folder".into(),
+        });
+
+        let onedrive_paths = [
+            std::env::var("OneDrive").ok(),
+            std::env::var("OneDriveConsumer").ok(),
+            std::env::var("OneDriveCommercial").ok(),
+            Some(format!("{}\\OneDrive", user_profile)),
+        ];
+        let mut seen_onedrive = false;
+        for opt in onedrive_paths.into_iter().flatten() {
+            let p = std::path::Path::new(&opt);
+            if p.is_dir() && !seen_onedrive {
+                seen_onedrive = true;
+                let target = p.join("Ronic OS Memory Backups");
+                dests.push(BackupDestination {
+                    id: "cloud_onedrive".into(),
+                    name: "Microsoft OneDrive".into(),
+                    kind: "onedrive".into(),
+                    path: target.display().to_string(),
+                    exists: true,
+                    description: "Synced automatically to your Microsoft OneDrive cloud vault".into(),
+                });
+            }
+        }
+
+        let dropbox_path = std::path::Path::new(&user_profile).join("Dropbox");
+        if dropbox_path.is_dir() {
+            let target = dropbox_path.join("Ronic OS Memory Backups");
+            dests.push(BackupDestination {
+                id: "cloud_dropbox".into(),
+                name: "Dropbox".into(),
+                kind: "dropbox".into(),
+                path: target.display().to_string(),
+                exists: true,
+                description: "Synced to your local Dropbox folder".into(),
+            });
+        }
+
+        let icloud_path = std::path::Path::new(&user_profile).join("iCloudDrive");
+        if icloud_path.is_dir() {
+            let target = icloud_path.join("Ronic OS Memory Backups");
+            dests.push(BackupDestination {
+                id: "cloud_iclouddrive".into(),
+                name: "iCloud Drive".into(),
+                kind: "cloud".into(),
+                path: target.display().to_string(),
+                exists: true,
+                description: "Synced to your iCloud Drive storage".into(),
+            });
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        extern "system" {
+            fn GetDriveTypeW(lpRootPathName: *const u16) -> u32;
+            fn GetVolumeInformationW(
+                lpRootPathName: *const u16,
+                lpVolumeNameBuffer: *mut u16,
+                nVolumeNameSize: u32,
+                lpVolumeSerialNumber: *mut u32,
+                lpMaximumComponentLength: *mut u32,
+                lpFileSystemFlags: *mut u32,
+                lpFileSystemNameBuffer: *mut u16,
+                nFileSystemNameSize: u32,
+            ) -> i32;
+        }
+
+        for ch in 'D'..='Z' {
+            let root_str = format!("{}:\\", ch);
+            let wide_path: Vec<u16> = root_str.encode_utf16().chain(std::iter::once(0)).collect();
+            let dtype = unsafe { GetDriveTypeW(wide_path.as_ptr()) };
+
+            if dtype >= 2 && dtype <= 4 {
+                let mut vol_buf = [0u16; 260];
+                let mut fs_buf = [0u16; 260];
+                let success = unsafe {
+                    GetVolumeInformationW(
+                        wide_path.as_ptr(),
+                        vol_buf.as_mut_ptr(),
+                        vol_buf.len() as u32,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        fs_buf.as_mut_ptr(),
+                        fs_buf.len() as u32,
+                    )
+                };
+
+                let vol_name = if success != 0 {
+                    let len = vol_buf.iter().position(|&c| c == 0).unwrap_or(vol_buf.len());
+                    String::from_utf16_lossy(&vol_buf[..len]).trim().to_string()
+                } else {
+                    String::new()
+                };
+
+                let is_gdrive = vol_name.to_lowercase().contains("google drive")
+                    || std::path::Path::new(&format!("{}:\\My Drive", ch)).is_dir();
+
+                if is_gdrive {
+                    let path = if std::path::Path::new(&format!("{}:\\My Drive", ch)).is_dir() {
+                        format!("{}:\\My Drive\\Ronic OS Memory Backups", ch)
+                    } else {
+                        format!("{}:\\Ronic OS Memory Backups", ch)
+                    };
+                    let display_label = if vol_name.is_empty() {
+                        format!("Google Drive ({}:)", ch)
+                    } else {
+                        format!("Google Drive - {} ({}:)", vol_name, ch)
+                    };
+                    dests.push(BackupDestination {
+                        id: format!("googledrive_{}", ch),
+                        name: display_label,
+                        kind: "googledrive".into(),
+                        path,
+                        exists: true,
+                        description: "Connected Google Drive virtual drive on this system".into(),
+                    });
+                } else if dtype == 2 {
+                    let display_label = if vol_name.is_empty() {
+                        format!("USB Removable Drive ({}:)", ch)
+                    } else {
+                        format!("USB [{}] ({}:)", vol_name, ch)
+                    };
+                    dests.push(BackupDestination {
+                        id: format!("removable_{}", ch),
+                        name: display_label,
+                        kind: "removable".into(),
+                        path: format!("{}:\\Ronic_Memory_Backups", ch),
+                        exists: true,
+                        description: "Removable USB Flash Drive, Pen Drive, or SD Card".into(),
+                    });
+                } else if dtype == 3 {
+                    let display_label = if vol_name.is_empty() {
+                        format!("Secondary Storage ({}:)", ch)
+                    } else {
+                        format!("External Drive [{}] ({}:)", vol_name, ch)
+                    };
+                    dests.push(BackupDestination {
+                        id: format!("external_{}", ch),
+                        name: display_label,
+                        kind: "external_drive".into(),
+                        path: format!("{}:\\Ronic_Memory_Backups", ch),
+                        exists: true,
+                        description: "External SSD or secondary drive partition".into(),
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(dests)
+}
+
+#[tauri::command]
+pub async fn write_backup_to_path(
+    target_dir: String,
+    filename: String,
+    content: String,
+) -> std::result::Result<BackupWriteResult, String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
+
+    let dir_path = std::path::Path::new(target_dir.trim());
+    if let Err(e) = std::fs::create_dir_all(dir_path) {
+        return Err(format!("Could not create backup directory '{}': {}", dir_path.display(), e));
+    }
+
+    // The filename must stay a bare name inside the chosen directory: an
+    // absolute path or a `..` segment would otherwise escape it entirely.
+    let safe_name: String = filename
+        .trim()
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    if safe_name.trim_matches('.').is_empty() || safe_name.contains("..") {
+        return Err("Invalid backup filename".to_string());
+    }
+    let file_path = dir_path.join(&safe_name);
+    let mut file = match std::fs::File::create(&file_path) {
+        Ok(f) => f,
+        Err(e) => return Err(format!("Could not create file '{}': {}", file_path.display(), e)),
+    };
+
+    let bytes = content.as_bytes();
+    if let Err(e) = file.write_all(bytes) {
+        return Err(format!("Failed writing to backup file: {}", e));
+    }
+    if let Err(e) = file.flush() {
+        return Err(format!("Failed flushing backup file: {}", e));
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let hash_result = hasher.finalize();
+    let sha256_hex = format!("{:x}", hash_result);
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+
+    Ok(BackupWriteResult {
+        success: true,
+        file_path: file_path.display().to_string(),
+        bytes_written: bytes.len(),
+        sha256: sha256_hex,
+        timestamp: now,
+    })
 }
 
 #[cfg(test)]

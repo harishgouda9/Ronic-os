@@ -36,6 +36,12 @@ pub struct BotProfile {
     #[serde(default)]
     pub browser_partition: String,
     #[serde(default)]
+    pub engine_kind: String,
+    #[serde(default)]
+    pub api_base: String,
+    #[serde(default)]
+    pub api_model: String,
+    #[serde(default)]
     pub workspace_dir: String,
     #[serde(default = "default_true")]
     pub allow_file_write: bool,
@@ -43,6 +49,8 @@ pub struct BotProfile {
     pub require_approval_external: bool,
     #[serde(default = "default_true")]
     pub require_approval_wallet: bool,
+    #[serde(default = "default_approval_mode")]
+    pub approval_mode: String,
     #[serde(default = "default_stall")]
     pub stall_timeout_ms: i64,
     #[serde(default)]
@@ -59,6 +67,8 @@ pub struct BotProfile {
     pub shell_output: String,
     #[serde(default)]
     pub avatar_color: String,
+    #[serde(default)]
+    pub wallet_frozen: bool,
 }
 
 fn ready_line() -> String {
@@ -70,7 +80,11 @@ fn default_true() -> bool {
 }
 
 fn default_stall() -> i64 {
-    45_000
+    45000
+}
+
+fn default_approval_mode() -> String {
+    "ask".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -401,6 +415,79 @@ pub struct Position {
     pub open: bool,
 }
 
+/// One routed quant order from the two-layer pipeline (LLM signal → Rust
+/// WebSocket router). Status: FILLED / SIMULATED (signed), WORKING (held for
+/// human approval), REJECTED (policy or circuit breaker).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuantOrder {
+    pub id: String,
+    pub created_at: i64,
+    pub pair: String,
+    pub analyst: String,
+    pub thesis: String,
+    pub side: String,
+    pub size_usd: f64,
+    pub ws_latency_ms: f64,
+    pub rebate_usd: f64,
+    pub status: String,
+    pub mode: String,
+    pub bot_handle: String,
+    pub reference: String,
+}
+
+/// A per-bot spend allowance row: daily cap, spent today, and breaker state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BotAllowance {
+    pub bot_id: String,
+    pub handle: String,
+    pub role: String,
+    pub rails_allowed: String,
+    pub per_tx_cap: String,
+    pub spent_today_usd: f64,
+    pub daily_limit_usd: f64,
+    pub frozen: bool,
+}
+
+/// A production sentinel in the autonomous monitoring fleet.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SentinelUnit {
+    pub id: String,
+    pub name: String,
+    pub source: String,
+    pub status: String,
+    pub severity: String,
+    pub acknowledged: bool,
+    pub last_scan: i64,
+    pub finding: String,
+    pub staged_fix: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SentinelEvent {
+    pub id: String,
+    pub sentinel_id: String,
+    pub message: String,
+    pub created_at: i64,
+}
+
+/// Live status of one internal remediation tier.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TierStatus {
+    pub tier: i64,
+    pub name: String,
+    pub title: String,
+    pub detail: String,
+    pub status: String,
+    pub badge: String,
+    pub repair_count: i64,
+    pub last_run_at: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Remediation {
@@ -412,6 +499,21 @@ pub struct Remediation {
     pub recovery_duration_ms: i64,
     pub status: String,
     pub created_at: i64,
+}
+
+/// A rollback checkpoint retained by the shadow store, offered by the repair
+/// UI for one-click restores. `restorable` is false for entries that do not
+/// carry their original workspace-relative path (skill .bak files, ci-drift
+/// reports, mcp-acp backups) — the UI must not offer a working-looking
+/// Restore button for those.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShadowBackup {
+    pub name: String,
+    pub bytes: i64,
+    pub mtime: i64,
+    #[serde(default)]
+    pub restorable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -456,6 +558,10 @@ pub struct MarketItem {
     pub price: String,
 }
 
+fn default_update_mode() -> String {
+    "auto".into()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
@@ -469,6 +575,12 @@ pub struct Settings {
     pub auto_failover: bool,
     pub auto_act_under_usd: f64,
     pub update_channel: String,
+    #[serde(default = "default_update_mode")]
+    pub update_mode: String,
+    #[serde(default)]
+    pub update_notice_version: String,
+    #[serde(default)]
+    pub update_feed_url: String,
     pub version: String,
     pub available_version: String,
     pub plan: String,
@@ -499,6 +611,9 @@ impl Default for Settings {
             auto_failover: true,
             auto_act_under_usd: 0.5,
             update_channel: "stable".into(),
+            update_mode: "auto".into(),
+            update_notice_version: String::new(),
+            update_feed_url: String::new(),
             version: "2.1.4".into(),
             available_version: "2.1.4".into(),
             plan: "Local".into(),
@@ -545,6 +660,60 @@ pub struct DomNode {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ConnectedWallet {
+    pub id: String,
+    pub chain: String,
+    pub label: String,
+    pub address: String,
+    pub connection_type: String,
+    pub status: String,
+    pub balance_native: String,
+    pub balance_usd: f64,
+    pub daily_limit_usd: f64,
+    pub is_default: bool,
+    pub added_at: i64,
+    pub key_mask: String,
+    pub explorer_url: String,
+    pub verified_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DelegationContract {
+    pub id: String,
+    pub issuer_bot_id: String,
+    pub assignee_bot_id: String,
+    pub group_id: String,
+    pub scope_label: String,
+    pub sub_goal: String,
+    pub complexity_score: i64,
+    pub routed_endpoint: String,
+    pub cost_tier: String,
+    pub scopes: Vec<String>,
+    pub verifier_rule: String,
+    pub requires_human: bool,
+    pub status: String,
+    pub commitment: String,
+    pub friction_reason: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DelegationReport {
+    pub id: String,
+    pub contract_id: String,
+    pub from_bot_id: String,
+    pub to_bot_id: String,
+    pub report_type: String,
+    pub summary: String,
+    pub commitment: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Snapshot {
     pub home_dir: String,
     pub onboarding_complete: bool,
@@ -554,10 +723,20 @@ pub struct Snapshot {
     pub kernel: String,
     pub active_profile_id: String,
     pub active_thread_id: Option<String>,
+    /// Live line describing what the in-flight model turn is doing right now,
+    /// e.g. "terminal_command · npm test". Empty when no turn is running.
+    #[serde(default)]
+    pub turn_activity: String,
     pub profiles: Vec<BotProfile>,
     pub threads: Vec<ChatThread>,
     pub steps: Vec<Step>,
     pub bot_groups: Vec<BotGroup>,
+    #[serde(default)]
+    pub chief_bot_id: String,
+    #[serde(default)]
+    pub delegation_contracts: Vec<DelegationContract>,
+    #[serde(default)]
+    pub delegation_reports: Vec<DelegationReport>,
     pub gateway_audits: Vec<GatewayAudit>,
     pub providers: Vec<Provider>,
     pub apps: Vec<LinkedApp>,
@@ -574,9 +753,20 @@ pub struct Snapshot {
     pub workflows: Vec<Workflow>,
     pub policy: Policy,
     pub balances: Vec<Balance>,
+    #[serde(default)]
+    pub connected_wallets: Vec<ConnectedWallet>,
+    #[serde(default)]
+    pub wallet_pin_set: bool,
     pub transactions: Vec<WalletTx>,
     pub positions: Vec<Position>,
+    pub quant_orders: Vec<QuantOrder>,
+    pub bot_allowances: Vec<BotAllowance>,
+    pub ledger_mode: String,
+    pub sentinels: Vec<SentinelUnit>,
+    pub sentinel_events: Vec<SentinelEvent>,
+    pub tier_status: Vec<TierStatus>,
     pub remediation: Vec<Remediation>,
+    pub shadow_backups: Vec<ShadowBackup>,
     pub processes: Vec<ProcessRow>,
     pub fleet_logs: Vec<FleetLog>,
     pub extensions: Vec<Extension>,
@@ -742,6 +932,16 @@ pub fn catalog() -> Vec<MarketItem> {
             blurb: "Razorpay MCP server. The key is stored locally and the server starts with npx.".into(),
             installed: false,
             verified: false,
+            price: "Free".into(),
+        },
+        MarketItem {
+            slug: "mineru".into(),
+            title: "MinerU Document Extraction".into(),
+            author: "opendatalab/MinerU".into(),
+            category: "Productivity".into(),
+            blurb: "High-accuracy document parsing engine. Converts complex PDFs, DOCX, and PPTX into structured Markdown with LaTeX math and tables.".into(),
+            installed: false,
+            verified: true,
             price: "Free".into(),
         },
     ]

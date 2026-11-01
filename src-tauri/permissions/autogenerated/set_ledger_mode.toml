@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-set-ledger-mode"
+description = "Enables the set_ledger_mode command without any pre-configured scope."
+commands.allow = ["set_ledger_mode"]
+
+[[permission]]
+identifier = "deny-set-ledger-mode"
+description = "Denies the set_ledger_mode command without any pre-configured scope."
+commands.deny = ["set_ledger_mode"]

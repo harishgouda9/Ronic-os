@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-db-maintenance"
+description = "Enables the db_maintenance command without any pre-configured scope."
+commands.allow = ["db_maintenance"]
+
+[[permission]]
+identifier = "deny-db-maintenance"
+description = "Denies the db_maintenance command without any pre-configured scope."
+commands.deny = ["db_maintenance"]

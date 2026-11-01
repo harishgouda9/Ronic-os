@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-set-wallet-pin"
+description = "Enables the set_wallet_pin command without any pre-configured scope."
+commands.allow = ["set_wallet_pin"]
+
+[[permission]]
+identifier = "deny-set-wallet-pin"
+description = "Denies the set_wallet_pin command without any pre-configured scope."
+commands.deny = ["set_wallet_pin"]

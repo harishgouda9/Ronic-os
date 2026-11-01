@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-launch-tiling-squad-mini-windows"
+description = "Enables the launch_tiling_squad_mini_windows command without any pre-configured scope."
+commands.allow = ["launch_tiling_squad_mini_windows"]
+
+[[permission]]
+identifier = "deny-launch-tiling-squad-mini-windows"
+description = "Denies the launch_tiling_squad_mini_windows command without any pre-configured scope."
+commands.deny = ["launch_tiling_squad_mini_windows"]

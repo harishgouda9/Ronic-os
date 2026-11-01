@@ -6,7 +6,7 @@
 //! Promote is clicked.
 
 use crate::db;
-use crate::error::OmniError;
+use crate::error::RonicError;
 use crate::memory::{remember, MemoryInput};
 use crate::util::{nid, now_ms, run_capture, truncate_utf8};
 use rusqlite::{params, Connection};
@@ -349,9 +349,29 @@ fn proposal_text(prompt: &str, score: &Complexity, flags: &Flags, components: &[
 }
 
 pub fn score_prompt(prompt: &str, attachment_count: usize, squad: bool, skill_covered: bool) -> Complexity {
+    let clean = crate::agent::strip_directives(prompt);
+    let lower = clean.trim().to_ascii_lowercase();
+
+    if crate::coworker::is_greeting(&lower) || lower.is_empty() {
+        return Complexity {
+            value: 0,
+            reasons: vec!["greeting or brief conversational query".into()],
+            armed: false,
+            threshold: 65,
+        };
+    }
+
+    if (crate::coworker::question_only(&lower) || is_simple_question(&lower)) && !crate::coworker::asks_for_work(&lower) {
+        return Complexity {
+            value: 0,
+            reasons: vec!["informational question (no complex engineering work requested)".into()],
+            armed: false,
+            threshold: 65,
+        };
+    }
+
     let mut value: i32 = 0;
     let mut reasons = Vec::new();
-    let lower = prompt.to_ascii_lowercase();
     let mut hits = 0u8;
     for keyword in KEYWORDS {
         if lower.contains(keyword) {
@@ -367,24 +387,33 @@ pub fn score_prompt(prompt: &str, attachment_count: usize, squad: bool, skill_co
             }
         }
     }
-    if prompt.chars().count() > 180 {
-        value += 15;
-        reasons.push("prompt longer than 180 characters (+15)".into());
-    }
-    if attachment_count >= 2 {
-        value += 15;
-        reasons.push(format!("{attachment_count} attachments (+15)"));
-    }
-    if squad {
-        value += 20;
-        reasons.push("squad target (+20)".into());
-    }
-    if !skill_covered {
-        value += 12;
-        reasons.push("no skill slug from this workspace matched the prompt (+12)".into());
+    if hits > 0 || crate::coworker::asks_for_work(&lower) {
+        if clean.chars().count() > 180 {
+            value += 15;
+            reasons.push("prompt longer than 180 characters (+15)".into());
+        }
+        if attachment_count >= 2 {
+            value += 15;
+            reasons.push(format!("{attachment_count} attachments (+15)"));
+        }
+        if squad {
+            value += 20;
+            reasons.push("squad target (+20)".into());
+        }
+        if !skill_covered && hits > 0 {
+            value += 12;
+            reasons.push("no skill slug from this workspace matched the prompt (+12)".into());
+        }
     }
     let value = value.clamp(0, 100) as u8;
     Complexity { value, reasons, armed: false, threshold: 65 }
+}
+
+fn is_simple_question(lower: &str) -> bool {
+    const STARTERS: &[&str] = &[
+        "what ", "what's ", "whats ", "why ", "who ", "when ", "where ", "how ", "can you explain ", "explain ", "describe ", "tell me "
+    ];
+    STARTERS.iter().any(|s| lower.trim_start().starts_with(s))
 }
 
 fn skill_covered(conn: &Connection, prompt: &str) -> bool {
@@ -427,7 +456,7 @@ fn load_flags(conn: &Connection) -> Flags {
     serde_json::from_str(&raw).unwrap_or_default()
 }
 
-fn save_flags(conn: &Connection, flags: &Flags) -> Result<(), OmniError> {
+fn save_flags(conn: &Connection, flags: &Flags) -> Result<(), RonicError> {
     db::kv_set(conn, FLAGS_KEY, &serde_json::to_string(flags)?)
 }
 
@@ -1141,8 +1170,12 @@ mod tests {
     #[test]
     fn simple_prompt_stays_under_the_threshold() {
         let score = score_prompt("What time is it?", 0, false, false);
-        assert!(score.value < 65, "{}", score.value);
-        assert!(score.reasons.iter().any(|reason| reason.contains("no skill")));
+        assert_eq!(score.value, 0, "{}", score.value);
+        assert!(!score.armed);
+
+        let greeting = score_prompt("hey buddy, what's up", 0, false, false);
+        assert_eq!(greeting.value, 0, "{}", greeting.value);
+        assert!(!greeting.armed);
     }
 
     #[test]

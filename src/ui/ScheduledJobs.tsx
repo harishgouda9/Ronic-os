@@ -1,7 +1,7 @@
 import { useEffect, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { X } from "lucide-react";
 import { anchorFor, dueLabel, forgetSchedule, nextRun, parseSchedule, readFired, rememberSchedule, SCHEDULES, scheduleLabel } from "../kernel/workspaceChrome";
-import { useOmni } from "../store";
+import { useRonic } from "../store";
 import { botName } from "./BotCoworkers";
 
 const JOBS_KEY = "ronic.pane.jobs";
@@ -15,9 +15,9 @@ function readJobsWidth() {
 }
 
 export function ScheduledJobs({ open, canRun, onClose, onRun, nudge = 0 }: { open: boolean; canRun: boolean; onClose: () => void; onRun: (threadId: string) => void; nudge?: number }) {
-  const snap = useOmni((s) => s.snap)!;
-  const run = useOmni((s) => s.run);
-  const busy = useOmni((s) => s.busy);
+  const snap = useRonic((s) => s.snap)!;
+  const run = useRonic((s) => s.run);
+  const busy = useRonic((s) => s.busy);
   const [now, setNow] = useState(() => Date.now());
   const [pick, setPick] = useState<string>(SCHEDULES[0].value);
   const [width, setWidth] = useState(readJobsWidth);

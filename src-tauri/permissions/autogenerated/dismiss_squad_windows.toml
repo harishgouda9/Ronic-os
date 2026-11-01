@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-dismiss-squad-windows"
+description = "Enables the dismiss_squad_windows command without any pre-configured scope."
+commands.allow = ["dismiss_squad_windows"]
+
+[[permission]]
+identifier = "deny-dismiss-squad-windows"
+description = "Denies the dismiss_squad_windows command without any pre-configured scope."
+commands.deny = ["dismiss_squad_windows"]

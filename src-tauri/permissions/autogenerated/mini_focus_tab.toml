@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-mini-focus-tab"
+description = "Enables the mini_focus_tab command without any pre-configured scope."
+commands.allow = ["mini_focus_tab"]
+
+[[permission]]
+identifier = "deny-mini-focus-tab"
+description = "Denies the mini_focus_tab command without any pre-configured scope."
+commands.deny = ["mini_focus_tab"]

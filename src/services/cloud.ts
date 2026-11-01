@@ -59,7 +59,7 @@ export function supabase() {
   if (!cloudConfig.supabase) return null;
   if (!client) {
     client = createClient(url, anon, {
-      auth: { persistSession: true, storageKey: "omni.supabase.auth" },
+      auth: { persistSession: true, storageKey: "ronic.supabase.auth" },
     });
   }
   return client;
@@ -113,7 +113,7 @@ async function restoreFromKeychain() {
 // bounce -> ronic://auth/callback -> this webview completes the exchange.
 // ---------------------------------------------------------------------------
 
-const PKCE_VERIFIER_KEY = "omni.pkce.verifier";
+const PKCE_VERIFIER_KEY = "ronic.pkce.verifier";
 
 function b64url(bytes: Uint8Array): string {
   let binary = "";
@@ -144,7 +144,7 @@ async function waitForAuthCode(timeoutMs: number): Promise<string> {
         stop();
       }
     }, timeoutMs);
-    void listen<string>("omni://auth-code", (event) => {
+    void listen<string>("ronic://auth-code", (event) => {
       if (done) return;
       const params = new URLSearchParams(event.payload ?? "");
       const code = params.get("code");
@@ -409,4 +409,125 @@ export async function paidPack(listingId: string) {
   const { data, error } = await db.rpc("listing_body", { listing: listingId });
   if (error || typeof data !== "string") return "";
   return data;
+}
+
+
+// ---------------------------------------------------------------------------
+// Ronic OS Profile & Cloud VPS Management
+// ---------------------------------------------------------------------------
+
+export interface RonicUserProfile {
+  id: string;
+  email: string;
+  displayName: string;
+  role: string;
+  avatarUrl?: string;
+  tier: "Free Community" | "Pro Studio" | "Enterprise VPS";
+  createdAt: number;
+  lastLoginAt: number;
+  cloudSyncEnabled: boolean;
+  cloudProvider: "supabase" | "self_hosted_vps" | "local_only";
+  vpsNodeUrl?: string;
+  vpsNodeToken?: string;
+  vpsConnected?: boolean;
+}
+
+const PROFILE_KEY = "ronic.profile.user";
+const VPS_KEY = "ronic.vps.node";
+
+export function getLocalProfile(): RonicUserProfile {
+  try {
+    const raw = localStorage.getItem(PROFILE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object" && parsed.email) {
+        return parsed as RonicUserProfile;
+      }
+    }
+  } catch {}
+  return {
+    id: "usr_guest_" + Math.random().toString(36).substring(2, 9),
+    email: "",
+    displayName: "Workspace Operator",
+    role: "Local Developer",
+    tier: "Free Community",
+    createdAt: Date.now() - 86400000 * 14,
+    lastLoginAt: Date.now(),
+    cloudSyncEnabled: false,
+    cloudProvider: "local_only",
+  };
+}
+
+export function saveLocalProfile(patch: Partial<RonicUserProfile>): RonicUserProfile {
+  const current = getLocalProfile();
+  const updated: RonicUserProfile = { ...current, ...patch };
+  try {
+    localStorage.setItem(PROFILE_KEY, JSON.stringify(updated));
+  } catch {}
+  emit();
+  return updated;
+}
+
+export function clearLocalProfile(): void {
+  try {
+    localStorage.removeItem(PROFILE_KEY);
+  } catch {}
+  emit();
+}
+
+export function getStoredVpsNode(): { url: string; token: string; label: string; connected: boolean; lastPing?: number } | null {
+  try {
+    const raw = localStorage.getItem(VPS_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch {}
+  return null;
+}
+
+export function saveStoredVpsNode(node: { url: string; token: string; label: string; connected: boolean; lastPing?: number } | null): void {
+  try {
+    if (node) {
+      localStorage.setItem(VPS_KEY, JSON.stringify(node));
+    } else {
+      localStorage.removeItem(VPS_KEY);
+    }
+  } catch {}
+  emit();
+}
+
+export async function resetPassword(email: string): Promise<string> {
+  const db = supabase();
+  if (db) {
+    const { error } = await db.auth.resetPasswordForEmail(email.trim(), {
+      redirectTo: `${window.location.origin}/auth/reset-callback`,
+    });
+    if (error) return error.message;
+    return "";
+  }
+  if (!email || !email.includes("@")) return "Enter a valid email address.";
+  return "";
+}
+
+export async function updatePassword(password: string): Promise<string> {
+  if (password.length < 6) return "Password must be at least 6 characters.";
+  const db = supabase();
+  if (db && session) {
+    const { error } = await db.auth.updateUser({ password });
+    if (error) return error.message;
+    return "";
+  }
+  return "";
+}
+
+export async function deleteUserAccount(): Promise<string> {
+  const db = supabase();
+  if (db && session) {
+    try {
+      await db.rpc("delete_user");
+    } catch {}
+    await db.auth.signOut();
+  }
+  clearLocalProfile();
+  saveStoredVpsNode(null);
+  void invoke("cloud_keychain_clear").catch(() => {});
+  return "";
 }

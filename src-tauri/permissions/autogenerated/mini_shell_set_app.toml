@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-mini-shell-set-app"
+description = "Enables the mini_shell_set_app command without any pre-configured scope."
+commands.allow = ["mini_shell_set_app"]
+
+[[permission]]
+identifier = "deny-mini-shell-set-app"
+description = "Denies the mini_shell_set_app command without any pre-configured scope."
+commands.deny = ["mini_shell_set_app"]

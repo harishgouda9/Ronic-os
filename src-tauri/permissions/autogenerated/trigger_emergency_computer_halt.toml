@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-trigger-emergency-computer-halt"
+description = "Enables the trigger_emergency_computer_halt command without any pre-configured scope."
+commands.allow = ["trigger_emergency_computer_halt"]
+
+[[permission]]
+identifier = "deny-trigger-emergency-computer-halt"
+description = "Denies the trigger_emergency_computer_halt command without any pre-configured scope."
+commands.deny = ["trigger_emergency_computer_halt"]

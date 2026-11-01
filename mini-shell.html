@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Ronic Mini Computer</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #0b0b12; color: #ececf4; }
+      .msh-static-boot { display: flex; height: 100%; align-items: center; justify-content: center;
+        font: 500 13px "Segoe UI", system-ui, sans-serif; color: #8e8ea8; }
+      #root:empty ~ .msh-static-boot { display: flex; }
+      #root:not(:empty) ~ .msh-static-boot { display: none; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <div class="msh-static-boot">Starting the mini computer shell…</div>
+    <script type="module" src="/src/mini-shell/main.tsx"></script>
+  </body>
+</html>

@@ -39,12 +39,73 @@ pub struct Lease {
 #[serde(rename_all = "camelCase")]
 pub struct LicenseSnapshot {
     pub plan_tier: String,
-    pub status: String, // active | expired | unsigned_dev | none
+    pub status: String, // active | local | expired | unsigned_dev | invalid | none
     pub founder_badge: Option<i64>,
     pub max_devices: i64,
     pub wallet_micro_usd: i64,
     pub lease_exp_unix: i64,
     pub hardware_hash: String,
+    pub pro_entitled: bool,
+}
+
+/// The freemium gate every Pro feature asks. Dev builds (no compiled public
+/// key) are entitled so local development never fights the paywall; the UI
+/// labels that mode honestly. A cloud-verified lease on a Pro tier is the
+/// only other way in — Starter (free, locally registered or not) is not.
+pub fn pro_entitled(conn: &Connection) -> bool {
+    if public_key().is_none() {
+        return true;
+    }
+    let lease = kv_get(conn, "license_lease").ok().flatten().unwrap_or_default();
+    let sig = kv_get(conn, "license_sig").ok().flatten().unwrap_or_default();
+    if lease.is_empty() || sig.is_empty() {
+        return false;
+    }
+    matches!(verify_lease(&lease, &sig).map(|l| l.tier).unwrap_or_default().as_str(), "pro" | "founder_lifetime" | "team")
+}
+
+const LOCAL_LICENSE_KEY: &str = "local_license";
+
+#[derive(Serialize, Deserialize)]
+struct LocalLicense {
+    hardware_hash: String,
+    device_name: String,
+    registered_at_unix: i64,
+}
+
+fn local_license_valid(conn: &Connection) -> bool {
+    kv_get(conn, LOCAL_LICENSE_KEY)
+        .ok()
+        .flatten()
+        .and_then(|text| serde_json::from_str::<LocalLicense>(&text).ok())
+        .is_some_and(|local| local.hardware_hash == hardware_hash())
+}
+
+/// Register this machine on the free Starter plan without any cloud service.
+/// The PDF's own freemium rule: local adoption needs zero accounts. This is a
+/// real persisted registration (survives restarts, tied to the hardware hash),
+/// not a mock — cloud sign-in replaces it with a signed lease when configured.
+#[tauri::command]
+pub async fn register_local_machine(state: State<'_, AppState>) -> Result<CommandResult> {
+    let local = LocalLicense {
+        hardware_hash: hardware_hash(),
+        device_name: device_name(),
+        registered_at_unix: now_unix(),
+    };
+    {
+        let conn = state.conn.lock().unwrap_or_else(|e| e.into_inner());
+        kv_set(&conn, LOCAL_LICENSE_KEY, &serde_json::to_string(&local).map_err(|e| err(e.to_string()))?)?;
+    }
+    finish_result(&state, Some("This machine is registered on the free Starter plan (1/1 machines). Works offline — no account needed.".into()))
+}
+
+#[tauri::command]
+pub async fn unregister_local_machine(state: State<'_, AppState>) -> Result<CommandResult> {
+    {
+        let conn = state.conn.lock().unwrap_or_else(|e| e.into_inner());
+        kv_set(&conn, LOCAL_LICENSE_KEY, "")?;
+    }
+    finish_result(&state, Some("Machine registration cleared.".into()))
 }
 
 fn public_key() -> Option<&'static VerifyingKey> {
@@ -125,32 +186,47 @@ pub fn load_snapshot(conn: &Connection) -> LicenseSnapshot {
     let lease = kv_get(conn, "license_lease").ok().flatten().unwrap_or_default();
     let sig = kv_get(conn, "license_sig").ok().flatten().unwrap_or_default();
     let hash = hardware_hash();
+    let local_ok = local_license_valid(conn);
 
     if public_key().is_none() {
         // Dev build: cache is displayed but never treated as verified.
         return LicenseSnapshot {
             plan_tier: if tier.is_empty() { "free".into() } else { tier },
-            status: if lease.is_empty() { "none".into() } else { "unsigned_dev".into() },
+            status: if lease.is_empty() { if local_ok { "local".into() } else { "none".into() } } else { "unsigned_dev".into() },
             founder_badge: badge,
             max_devices,
             wallet_micro_usd: wallet,
             lease_exp_unix: exp,
             hardware_hash: hash,
+            pro_entitled: true,
         };
     }
     if lease.is_empty() || sig.is_empty() {
-        return LicenseSnapshot { plan_tier: "free".into(), status: "none".into(), founder_badge: None, max_devices: 1, wallet_micro_usd: 0, lease_exp_unix: 0, hardware_hash: hash };
+        return LicenseSnapshot {
+            plan_tier: "free".into(),
+            status: if local_ok { "local".into() } else { "none".into() },
+            founder_badge: None,
+            max_devices: 1,
+            wallet_micro_usd: 0,
+            lease_exp_unix: 0,
+            hardware_hash: hash,
+            pro_entitled: false,
+        };
     }
     match verify_lease(&lease, &sig) {
-        Ok(parsed) => LicenseSnapshot {
-            plan_tier: parsed.tier,
-            status: "active".into(),
-            founder_badge: badge,
-            max_devices: parsed.max_devices,
-            wallet_micro_usd: wallet,
-            lease_exp_unix: parsed.exp_unix,
-            hardware_hash: hash,
-        },
+        Ok(parsed) => {
+            let pro = matches!(parsed.tier.as_str(), "pro" | "founder_lifetime" | "team");
+            LicenseSnapshot {
+                plan_tier: parsed.tier,
+                status: "active".into(),
+                founder_badge: badge,
+                max_devices: parsed.max_devices,
+                wallet_micro_usd: wallet,
+                lease_exp_unix: parsed.exp_unix,
+                hardware_hash: hash,
+                pro_entitled: pro,
+            }
+        }
         Err(_) => LicenseSnapshot {
             plan_tier: "free".into(),
             status: if exp <= now_unix() { "expired".into() } else { "invalid".into() },
@@ -159,6 +235,7 @@ pub fn load_snapshot(conn: &Connection) -> LicenseSnapshot {
             wallet_micro_usd: 0,
             lease_exp_unix: exp,
             hardware_hash: hash,
+            pro_entitled: false,
         },
     }
 }
@@ -355,5 +432,33 @@ mod tests {
         let snap = load_snapshot(&conn);
         assert_eq!(snap.status, "none");
         assert_eq!(snap.plan_tier, "free");
+    }
+
+    #[test]
+    fn local_registration_round_trips_and_binds_to_this_machine() {
+        let conn = Connection::open_in_memory().expect("memory db");
+        crate::db::migrate(&conn).expect("schema");
+        if public_key().is_some() {
+            return; // dev-mode status mapping is asserted above
+        }
+        // Dev builds are entitled so local development never fights the paywall.
+        assert!(pro_entitled(&conn));
+
+        let local = LocalLicense { hardware_hash: hardware_hash(), device_name: "test rig".into(), registered_at_unix: now_unix() };
+        kv_set(&conn, LOCAL_LICENSE_KEY, &serde_json::to_string(&local).unwrap()).unwrap();
+        assert!(local_license_valid(&conn));
+        let snap = load_snapshot(&conn);
+        assert_eq!(snap.status, "local");
+        assert!(snap.pro_entitled);
+
+        // A registration from another machine does not count here.
+        let other = LocalLicense { hardware_hash: "deadbeef".into(), device_name: "other".into(), registered_at_unix: now_unix() };
+        kv_set(&conn, LOCAL_LICENSE_KEY, &serde_json::to_string(&other).unwrap()).unwrap();
+        assert!(!local_license_valid(&conn));
+        assert_eq!(load_snapshot(&conn).status, "none");
+
+        // Clearing the registration returns to unregistered.
+        kv_set(&conn, LOCAL_LICENSE_KEY, "").unwrap();
+        assert_eq!(load_snapshot(&conn).status, "none");
     }
 }

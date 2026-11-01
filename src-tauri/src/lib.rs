@@ -1,6 +1,7 @@
 mod agent;
 mod bot_screen;
 mod bots;
+mod chief_delegation;
 mod capabilities;
 mod commands;
 mod computer;
@@ -21,10 +22,12 @@ mod siwc;
 mod snapshot;
 mod squad_computer_orchestrator;
 mod textutil;
+mod updates;
 mod util;
 mod vault;
 mod wallet;
 mod wallet_engine;
+mod wallet_live;
 mod workspace_apps;
 mod workspace_bridge;
 mod workspace_git;
@@ -40,6 +43,7 @@ mod kernel_ops;
 mod mcp_acp_automesh;
 pub mod messaging_gateway;
 pub mod bi_directional_push;
+pub mod gateway_connections;
 pub mod tunnel;
 
 use crate::util::{ipc_push, now_ms, product_home};
@@ -97,9 +101,11 @@ pub fn run() {
         vault_key: Mutex::new(None),
         app_handle: Arc::new(Mutex::new(None)),
     };
+    let gateway_manager = Arc::new(gateway_connections::GatewayManager::new());
     tauri::Builder::default()
         .plugin(tauri_plugin_deep_link::init())
         .manage(state)
+        .manage(gateway_manager)
         .manage(terminal_pty::TerminalManager::new())
         .invoke_handler(tauri::generate_handler![
             commands::bootstrap,
@@ -116,6 +122,11 @@ pub fn run() {
             commands::create_profile,
             commands::duplicate_profile,
             commands::create_bot_group,
+            chief_delegation::appoint_chief_officer,
+            chief_delegation::dispatch_delegation,
+            chief_delegation::resolve_delegation_friction,
+            chief_delegation::attest_delegation_contract,
+            chief_delegation::handle_mobile_chief_command,
             commands::open_group,
             commands::set_group_mode,
             commands::set_routine,
@@ -137,6 +148,8 @@ pub fn run() {
             commands::unmount_memory_companion,
             commands::sync_memories_to_engine,
             commands::refresh_memory_vault,
+            commands::detect_backup_destinations,
+            commands::write_backup_to_path,
             commands::save_skill,
             commands::toggle_skill,
             commands::remove_skill,
@@ -154,10 +167,21 @@ pub fn run() {
             commands::remove_mcp,
             commands::scan_project_plugins,
             commands::install_market,
+            commands::install_skill_from_url,
+            commands::install_plugin_from_url,
+            commands::connect_mcp_server,
             commands::set_policy,
             commands::wallet_tx,
             commands::review_tx,
             commands::add_sandbox_funds,
+            commands::probe_local_tool,
+            commands::connect_watched_wallet,
+            commands::refresh_wallet_balance,
+            commands::disconnect_watched_wallet,
+            commands::update_watched_wallet,
+            commands::assign_bot_spend,
+            commands::set_wallet_pin,
+            commands::check_wallet_pin,
             commands::set_ledger_mode,
             commands::bot_circuit_toggle,
             commands::quant_dispatch,
@@ -175,6 +199,7 @@ pub fn run() {
             commands::preview_bug,
             commands::submit_bug,
             commands::save_settings,
+            updates::read_update_feed,
             commands::set_vault_passphrase,
             commands::unlock_vault,
             commands::lock_vault,
@@ -183,6 +208,7 @@ pub fn run() {
             commands::generate_extension,
             commands::open_provider_window,
             commands::pick_paths,
+            commands::save_exported_file,
             commands::connect_external_bot,
             commands::set_bot_run,
             commands::set_app_path,
@@ -198,6 +224,7 @@ pub fn run() {
             commands::pause_workflow,
             commands::resume_workflow,
             commands::run_workflow,
+            commands::delete_workflow,
             commands::set_ide_agent,
             commands::close_position,
             commands::reset_workspace,
@@ -235,6 +262,13 @@ pub fn run() {
             messaging_gateway::dispatch_remote_messaging_command,
             bi_directional_push::send_interactive_push_alert,
             bi_directional_push::handle_remote_push_button_callback,
+            gateway_connections::gateway_connect,
+            gateway_connections::gateway_pairing_qr,
+            gateway_connections::gateway_disconnect,
+            gateway_connections::gateway_connection_status,
+            gateway_connections::gateway_poll_messages,
+            gateway_connections::gateway_send_message,
+            gateway_connections::gateway_send_push_alert,
             mcp_acp_automesh::mesh_status,
             mcp_acp_automesh::mesh_connect_all,
             mcp_acp_automesh::mesh_set_flags,
@@ -307,6 +341,11 @@ pub fn run() {
         .setup(|app| {
             let handle = app.handle().clone();
             if let Ok(mut h) = app.state::<AppState>().app_handle.lock() {
+                *h = Some(handle.clone());
+            }
+            // Wire the GatewayManager's app_handle so emit_status can push
+            // real-time gateway-connection-changed events to the frontend.
+            if let Ok(mut h) = app.state::<Arc<gateway_connections::GatewayManager>>().app_handle.lock() {
                 *h = Some(handle.clone());
             }
             // ronic://auth/callback?code=... — the last hop of the PKCE
@@ -422,7 +461,7 @@ fn find_project_root() -> Option<PathBuf> {
     }
     if let Ok(exe) = std::env::current_exe() {
         let mut cur = exe.parent();
-        for _ in 0..5 {
+        for _ in 0..10 {
             if let Some(p) = cur {
                 if p.join("package.json").exists() {
                     return Some(p.to_path_buf());
@@ -430,6 +469,14 @@ fn find_project_root() -> Option<PathBuf> {
                 cur = p.parent();
             } else {
                 break;
+            }
+        }
+    }
+    if let Ok(home) = std::env::var("USERPROFILE") {
+        for sub in [r"OneDrive\Desktop\Omni Workspace OS", r"Desktop\Omni Workspace OS"] {
+            let candidate = PathBuf::from(&home).join(sub);
+            if candidate.join("package.json").exists() {
+                return Some(candidate);
             }
         }
     }
@@ -537,8 +584,16 @@ fn spawn_sentinel_monitor(db_path: PathBuf, home: PathBuf) {
         let Ok(conn) = Connection::open(&db_path) else { return };
         let _ = conn.pragma_update(None, "busy_timeout", "5000");
         std::thread::sleep(Duration::from_secs(3));
+        // Cheap DB checks every 30s; the git-drift probe forks two subprocesses
+        // with a 15s ceiling, so it runs on a 10-minute cadence instead.
+        let mut tick = 0u32;
         loop {
-            let _ = crate::remediation_core::sentinel_scan_all(&conn, &home);
+            if tick.is_multiple_of(20) {
+                let _ = crate::remediation_core::sentinel_scan_all(&conn, &home);
+            } else {
+                let _ = crate::remediation_core::scan_fleet_except(&conn, &home, &["github_sentinel"]);
+            }
+            tick = tick.wrapping_add(1);
             std::thread::sleep(Duration::from_secs(30));
         }
     });

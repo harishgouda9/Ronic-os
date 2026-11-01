@@ -7,7 +7,7 @@ import test from "node:test";
 import { pathToFileURL } from "node:url";
 
 const root = path.resolve(import.meta.dirname, "..");
-const outDir = mkdtempSync(path.join(tmpdir(), "omni-chrome-"));
+const outDir = mkdtempSync(path.join(tmpdir(), "ronic-chrome-"));
 
 const compile = spawnSync(
   process.execPath,

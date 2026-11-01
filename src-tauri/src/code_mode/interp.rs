@@ -1,7 +1,7 @@
-//! Restricted `await omni.*` interpreter.
+//! Restricted `await ronic.*` interpreter.
 //!
 //! User Code Mode scripts never run in Node or Bun. The host parses a small
-//! TypeScript subset and performs each `omni` call through `dispatch`.
+//! TypeScript subset and performs each `ronic` call through `dispatch`.
 
 use serde_json::{json, Map, Value};
 
@@ -196,7 +196,7 @@ fn tokenize(src: &str) -> Result<Vec<Token>, String> {
             continue;
         }
         if c == '=' && i + 1 < chars.len() && chars[i + 1] == '>' {
-            return Err("Code Mode does not run arrow functions. Use await omni.* calls and return a value.".into());
+            return Err("Code Mode does not run arrow functions. Use await ronic.* calls and return a value.".into());
         }
         if c.is_ascii_alphabetic() || c == '_' || c == '$' {
             let start = i;
@@ -386,7 +386,7 @@ impl Parser {
         }
         if let Token::Ident(name) = self.peek() {
             if FORBIDDEN.contains(&name.as_str()) && name != "constructor" {
-                return Err(format!("Code Mode does not run `{name}`. Use await omni.* calls and return a value."));
+                return Err(format!("Code Mode does not run `{name}`. Use await ronic.* calls and return a value."));
             }
         }
         let expr = self.parse_expr()?;
@@ -479,7 +479,7 @@ impl Parser {
                     left = Expr::Sub(Box::new(left), Box::new(right));
                 }
                 Token::Star | Token::Slash | Token::Percent | Token::Lt | Token::Gt => {
-                    return Err("Code Mode does not run that operator. Use await omni.* calls and return a value.".into());
+                    return Err("Code Mode does not run that operator. Use await ronic.* calls and return a value.".into());
                 }
                 _ => break,
             }
@@ -617,7 +617,7 @@ impl Parser {
                 Ok(expr)
             }
             Token::Eof => Err("Code Mode script ended in the middle of an expression.".into()),
-            _ => Err("Code Mode only runs await omni.* TypeScript, assignments, and return.".into()),
+            _ => Err("Code Mode only runs await ronic.* TypeScript, assignments, and return.".into()),
         }
     }
 
@@ -681,7 +681,7 @@ impl Parser {
 
 enum Runtime {
     Json(Value),
-    Omni(Vec<String>),
+    Ronic(Vec<String>),
 }
 
 fn eval_expr(
@@ -696,7 +696,7 @@ fn eval_expr(
     }
     match eval_runtime(expr, env, dispatch, servers, depth)? {
         Runtime::Json(value) => Ok(value),
-        Runtime::Omni(path) => Err(format!("`{}` is a binding. Call it as a function.", path.join("."))),
+        Runtime::Ronic(path) => Err(format!("`{}` is a binding. Call it as a function.", path.join("."))),
     }
 }
 
@@ -716,8 +716,8 @@ fn eval_runtime(
         Expr::Number(n) => Ok(Runtime::Json(json!(n))),
         Expr::String(s) => Ok(Runtime::Json(Value::String(s.clone()))),
         Expr::Ident(name) => {
-            if name == "omni" {
-                return Ok(Runtime::Omni(vec!["omni".into()]));
+            if name == "ronic" {
+                return Ok(Runtime::Ronic(vec!["ronic".into()]));
             }
             if FORBIDDEN.contains(&name.as_str()) {
                 return Err(format!("Code Mode does not expose `{name}`."));
@@ -739,16 +739,16 @@ fn eval_runtime(
             Ok(Runtime::Json(Value::Object(out)))
         }
         Expr::Member(base, name) => match eval_runtime(base, env, dispatch, servers, depth + 1)? {
-            Runtime::Omni(mut path) => {
+            Runtime::Ronic(mut path) => {
                 path.push(name.clone());
-                Ok(Runtime::Omni(path))
+                Ok(Runtime::Ronic(path))
             }
             Runtime::Json(value) => Ok(Runtime::Json(json_member(&value, name))),
         },
         Expr::Index(base, index) => {
             let index = eval_expr(index, env, dispatch, servers, depth + 1)?;
             match eval_runtime(base, env, dispatch, servers, depth + 1)? {
-                Runtime::Omni(_) => Err("Code Mode omni paths use dot names, not brackets.".into()),
+                Runtime::Ronic(_) => Err("Code Mode ronic paths use dot names, not brackets.".into()),
                 Runtime::Json(value) => Ok(Runtime::Json(json_index(&value, &index))),
             }
         }
@@ -758,11 +758,11 @@ fn eval_runtime(
                 values.push(eval_expr(arg, env, dispatch, servers, depth + 1)?);
             }
             match eval_runtime(callee, env, dispatch, servers, depth + 1)? {
-                Runtime::Omni(path) => {
-                    let value = omni_call(&path, &values, dispatch, servers)?;
+                Runtime::Ronic(path) => {
+                    let value = ronic_call(&path, &values, dispatch, servers)?;
                     Ok(Runtime::Json(value))
                 }
-                Runtime::Json(_) => Err("Code Mode only calls omni.* functions.".into()),
+                Runtime::Json(_) => Err("Code Mode only calls ronic.* functions.".into()),
             }
         }
         Expr::Await(inner) => eval_runtime(inner, env, dispatch, servers, depth + 1),
@@ -868,14 +868,14 @@ fn display(value: &Value) -> String {
     }
 }
 
-fn omni_call(
+fn ronic_call(
     path: &[String],
     args: &[Value],
     dispatch: &mut dyn FnMut(&str, &Value) -> Result<Value, String>,
     servers: &[(String, String)],
 ) -> Result<Value, String> {
-    if path.first().map(String::as_str) != Some("omni") {
-        return Err("Code Mode only calls omni.* functions.".into());
+    if path.first().map(String::as_str) != Some("ronic") {
+        return Err("Code Mode only calls ronic.* functions.".into());
     }
     let rest: Vec<&str> = path.iter().skip(1).map(String::as_str).collect();
     match rest.as_slice() {
@@ -901,13 +901,13 @@ fn omni_call(
         ),
         ["mcp", "workspace", "searchMemory"] => dispatch(
             "mcp.call",
-            &json!({ "server": "omni-workspace", "tool": "search_memory", "params": { "query": arg_string(args, 0) } }),
+            &json!({ "server": "ronic-os", "tool": "search_memory", "params": { "query": arg_string(args, 0) } }),
         ),
-        ["mcp", "workspace", "listSkills"] => dispatch("mcp.call", &json!({ "server": "omni-workspace", "tool": "list_skills", "params": {} })),
+        ["mcp", "workspace", "listSkills"] => dispatch("mcp.call", &json!({ "server": "ronic-os", "tool": "list_skills", "params": {} })),
         ["mcp", "workspace", "loadSkill"] => {
-            dispatch("mcp.call", &json!({ "server": "omni-workspace", "tool": "load_skill", "params": { "slug": arg_string(args, 0) } }))
+            dispatch("mcp.call", &json!({ "server": "ronic-os", "tool": "load_skill", "params": { "slug": arg_string(args, 0) } }))
         }
-        ["mcp", "workspace", "listPlugins"] => dispatch("mcp.call", &json!({ "server": "omni-workspace", "tool": "list_plugins", "params": {} })),
+        ["mcp", "workspace", "listPlugins"] => dispatch("mcp.call", &json!({ "server": "ronic-os", "tool": "list_plugins", "params": {} })),
         ["mcp", ident, tool] => {
             let server = servers
                 .iter()
@@ -960,8 +960,8 @@ mod tests {
     fn sample_script_returns_counts() {
         let value = run(
             r#"
-            const skills = await omni.skills.listIndex();
-            const facts = await omni.mem0.search("workspace");
+            const skills = await ronic.skills.listIndex();
+            const facts = await ronic.mem0.search("workspace");
             return { skillCount: skills.length, factCount: facts.length, first: skills[0] || null };
             "#,
         )
@@ -980,8 +980,8 @@ mod tests {
     }
 
     #[test]
-    fn unknown_omni_path_fails() {
-        let error = run("return await omni.shell.exec('dir')").unwrap_err();
+    fn unknown_ronic_path_fails() {
+        let error = run("return await ronic.shell.exec('dir')").unwrap_err();
         assert!(error.contains("not an Ronic Code Mode binding"), "{error}");
     }
 }

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-mini-fs-delete"
+description = "Enables the mini_fs_delete command without any pre-configured scope."
+commands.allow = ["mini_fs_delete"]
+
+[[permission]]
+identifier = "deny-mini-fs-delete"
+description = "Denies the mini_fs_delete command without any pre-configured scope."
+commands.deny = ["mini_fs_delete"]

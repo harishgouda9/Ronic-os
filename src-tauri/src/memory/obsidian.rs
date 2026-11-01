@@ -111,7 +111,7 @@ fn ensure_safe_parent(root: &Path, parent: &Path) -> Result<()> {
 fn atomic_write(dest: &Path, body: &[u8]) -> Result<()> {
     let parent = dest.parent().ok_or_else(|| err("memory file path must stay inside the vault"))?;
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH).map(|time| time.as_nanos()).unwrap_or(0);
-    let temp = parent.join(format!(".omni-{}-{nonce}.tmp", std::process::id()));
+    let temp = parent.join(format!(".ronic-{}-{nonce}.tmp", std::process::id()));
     let result = (|| -> std::io::Result<()> {
         let mut file = OpenOptions::new().write(true).create_new(true).open(&temp)?;
         file.write_all(body)?;
@@ -132,7 +132,7 @@ mod tests {
 
     #[test]
     fn companion_write_rejects_escape() {
-        let root = std::env::temp_dir().join(format!("omni-vault-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("ronic-vault-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let vault = root.join("vault");
         std::fs::create_dir_all(&vault).unwrap();

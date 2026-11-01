@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-mini-shell-layout"
+description = "Enables the mini_shell_layout command without any pre-configured scope."
+commands.allow = ["mini_shell_layout"]
+
+[[permission]]
+identifier = "deny-mini-shell-layout"
+description = "Denies the mini_shell_layout command without any pre-configured scope."
+commands.deny = ["mini_shell_layout"]

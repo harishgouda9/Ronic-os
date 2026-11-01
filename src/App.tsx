@@ -1,19 +1,19 @@
 import { useEffect } from "react";
 import { Screen } from "./screens/Screen";
-import { useOmni } from "./store";
+import { useRonic } from "./store";
 import { Shell } from "./ui/Shell";
 
 export function App() {
-  const boot = useOmni((s) => s.boot);
-  const snap = useOmni((s) => s.snap);
-  const loading = useOmni((s) => s.loading);
-  const error = useOmni((s) => s.error);
-  const recover = useOmni((s) => s.recover);
-  const setPalette = useOmni((s) => s.setPalette);
-  const setDebug = useOmni((s) => s.setDebug);
-  const setBug = useOmni((s) => s.setBug);
-  const toast = useOmni((s) => s.toast);
-  const setToast = useOmni((s) => s.setToast);
+  const boot = useRonic((s) => s.boot);
+  const snap = useRonic((s) => s.snap);
+  const loading = useRonic((s) => s.loading);
+  const error = useRonic((s) => s.error);
+  const recover = useRonic((s) => s.recover);
+  const setPalette = useRonic((s) => s.setPalette);
+  const setDebug = useRonic((s) => s.setDebug);
+  const setBug = useRonic((s) => s.setBug);
+  const toast = useRonic((s) => s.toast);
+  const setToast = useRonic((s) => s.setToast);
 
   useEffect(() => {
     void boot();
@@ -31,16 +31,16 @@ export function App() {
       const key = event.key.toLowerCase();
       if (meta && key === "k") {
         event.preventDefault();
-        setPalette(!useOmni.getState().palette);
+        setPalette(!useRonic.getState().palette);
       } else if (meta && event.shiftKey && key === "d") {
         event.preventDefault();
-        setDebug(!useOmni.getState().debug);
+        setDebug(!useRonic.getState().debug);
       } else if (meta && event.shiftKey && key === "r") {
         event.preventDefault();
         void recover();
       } else if (meta && (event.key === "`" || event.code === "Backquote")) {
         event.preventDefault();
-        useOmni.getState().toggleTerminal();
+        useRonic.getState().toggleTerminal();
       } else if (event.key === "Escape") {
         setPalette(false);
         setDebug(false);
@@ -63,11 +63,14 @@ export function App() {
 
   if (loading) {
     return (
-      <div className="app">
-        <div className="center-card">
-          <img className="logo-lockup" src="/brand/logo.png" alt="Ronic OS" />
-          <h1 className="title">Ronic OS</h1>
-          <p className="muted">Opening the local workspace.</p>
+      <div className="app boot" role="status" aria-live="polite">
+        <div className="boot-card">
+          <img className="boot-logo" src="/brand/logo.png" alt="" draggable={false} />
+          <h1 className="boot-title">Ronic OS</h1>
+          <p className="boot-sub">Opening the local workspace…</p>
+          <div className="boot-bar" aria-hidden="true">
+            <i />
+          </div>
         </div>
       </div>
     );

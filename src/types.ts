@@ -53,6 +53,7 @@ export type BotProfile = {
   allowFileWrite: boolean;
   requireApprovalExternal: boolean;
   requireApprovalWallet: boolean;
+  approvalMode: "auto" | "ask" | "manual";
   stallTimeoutMs: number;
   workspaceFiles: string[];
   takeover: boolean;
@@ -73,6 +74,37 @@ export type BotGroup = {
   memberBotIds: string[];
   sharedWorkspaceDir: string;
   routineSchedule: string;
+  createdAt: number;
+};
+
+export type DelegationContract = {
+  id: string;
+  issuerBotId: string;
+  assigneeBotId: string;
+  groupId: string;
+  scopeLabel: string;
+  subGoal: string;
+  complexityScore: number;
+  routedEndpoint: string;
+  costTier: string;
+  scopes: string[];
+  verifierRule: string;
+  requiresHuman: boolean;
+  status: string;
+  commitment: string;
+  frictionReason: string;
+  createdAt: number;
+  updatedAt: number;
+};
+
+export type DelegationReport = {
+  id: string;
+  contractId: string;
+  fromBotId: string;
+  toBotId: string;
+  reportType: string;
+  summary: string;
+  commitment: string;
   createdAt: number;
 };
 
@@ -321,6 +353,24 @@ export type Balance = {
   detail: string;
 };
 
+/** A wallet whose balance was read from a chain or the user's provider. Optional on older snapshots. */
+export type WatchedWallet = {
+  id: string;
+  chain: string;
+  label: string;
+  address: string;
+  connectionType: string;
+  status: string;
+  balanceNative: string;
+  balanceUsd: number;
+  dailyLimitUsd: number;
+  isDefault: boolean;
+  addedAt: number;
+  keyMask?: string;
+  explorerUrl?: string;
+  verifiedAt?: number;
+};
+
 export type WalletTx = {
   id: string;
   botProfileId: string | null;
@@ -417,6 +467,9 @@ export type ShadowBackup = {
   name: string;
   bytes: number;
   mtime: number;
+  /** False for entries that do not carry their original path (skill .bak,
+   * ci-drift reports, mcp-acp backups) — the restore action cannot target them. */
+  restorable?: boolean;
 };
 
 export type ProcessRow = {
@@ -475,6 +528,9 @@ export type Settings = {
   autoFailover: boolean;
   autoActUnderUsd: number;
   updateChannel: "stable" | "nightly";
+  updateMode: "auto" | "manual";
+  updateNoticeVersion: string;
+  updateFeedUrl: string;
   version: string;
   availableVersion: string;
   plan: string;
@@ -518,6 +574,9 @@ export type Snapshot = {
   threads: ChatThread[];
   steps: Step[];
   botGroups: BotGroup[];
+  chiefBotId?: string;
+  delegationContracts?: DelegationContract[];
+  delegationReports?: DelegationReport[];
   gatewayAudits: GatewayAudit[];
   providers: Provider[];
   apps: LinkedApp[];
@@ -534,6 +593,8 @@ export type Snapshot = {
   workflows: Workflow[];
   policy: Policy;
   balances: Balance[];
+  connectedWallets?: WatchedWallet[];
+  walletPinSet?: boolean;
   transactions: WalletTx[];
   positions: Position[];
   quantOrders: QuantOrder[];
@@ -581,7 +642,7 @@ export const RAIL: { id: ScreenId; label: string; group: "main" | "tail" }[] = [
   { id: "workflows", label: "Workflows", group: "main" },
   { id: "market", label: "Marketplace", group: "main" },
   { id: "wallet", label: "Wallet & trading", group: "main" },
-  { id: "extensions", label: "Self-modify", group: "tail" },
+  { id: "extensions", label: "Profile", group: "tail" },
   { id: "repair", label: "Self-repair", group: "tail" },
   { id: "billing", label: "Plan & setup", group: "tail" },
   { id: "settings", label: "Settings", group: "tail" },

@@ -1,4 +1,4 @@
-# Ronic OS (Omni Workspace)
+# Ronic OS 
 
 A local-first agent workstation for Windows. One desktop shell where coding
 CLIs, web agents, MCP servers, bot profiles, memory, skills, workflows, and a

@@ -520,7 +520,7 @@ fn project_file(conn: &Connection, id: &str, content: &str, file_path: &str, eng
 fn relative_path(id: &str, file_path: &str) -> String {
     let trimmed = file_path.trim();
     if trimmed.is_empty() || trimmed.contains("://") {
-        format!("omni/{}.md", safe_id(id))
+        format!("ronic/{}.md", safe_id(id))
     } else {
         trimmed.replace('\\', "/")
     }
@@ -603,7 +603,7 @@ mod tests {
     use crate::db;
 
     fn temp_conn() -> (std::path::PathBuf, Connection) {
-        let dir = std::env::temp_dir().join(nid("omnimem"));
+        let dir = std::env::temp_dir().join(nid("ronicmem"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let conn = db::open(&dir.join("state.db")).unwrap();

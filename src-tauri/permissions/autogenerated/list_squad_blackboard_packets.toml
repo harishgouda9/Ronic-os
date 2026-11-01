@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-squad-blackboard-packets"
+description = "Enables the list_squad_blackboard_packets command without any pre-configured scope."
+commands.allow = ["list_squad_blackboard_packets"]
+
+[[permission]]
+identifier = "deny-list-squad-blackboard-packets"
+description = "Denies the list_squad_blackboard_packets command without any pre-configured scope."
+commands.deny = ["list_squad_blackboard_packets"]

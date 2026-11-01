@@ -129,7 +129,34 @@ pub fn user_home() -> PathBuf {
 }
 
 pub fn product_home() -> PathBuf {
-    user_home().join(".omniworkspace")
+    let home = user_home().join(".ronicos");
+    migrate_legacy_product_home(&home);
+    home
+}
+
+/// One-time migration from the pre-rename data directory (`~/.omniworkspace`).
+/// If the new home has no state.db but the legacy directory does, move the
+/// legacy directory into place so existing users keep bots, threads, wallet
+/// state, and the vault across the rename.
+fn migrate_legacy_product_home(new_home: &Path) {
+    let legacy = user_home().join(".omniworkspace");
+    if new_home.join("state.db").exists() || !legacy.join("state.db").exists() {
+        return;
+    }
+    if new_home.exists() {
+        // New dir exists but has no database (partial init): merge by moving
+        // only missing entries instead of replacing the whole directory.
+        if let Ok(entries) = std::fs::read_dir(&legacy) {
+            for entry in entries.flatten() {
+                let dest = new_home.join(entry.file_name());
+                if !dest.exists() {
+                    let _ = std::fs::rename(entry.path(), &dest);
+                }
+            }
+        }
+    } else if std::fs::rename(&legacy, new_home).is_ok() {
+        return;
+    }
 }
 
 pub fn ipc_push(ipc: &Mutex<VecDeque<String>>, line: &str) {
@@ -242,20 +269,36 @@ pub fn broadcast_to_terminal(app: &tauri::AppHandle, text: &str) {
     };
 
     if registered_sids.is_empty() {
-        for sid in &["omni_global", "coding_workspace", "workspace_main", "chat_workspace"] {
+        for sid in &["ronic_global", "coding_workspace", "workspace_main", "chat_workspace"] {
             let _ = app.emit(&format!("pty-output-{sid}"), &bytes);
         }
     } else {
         for sid in &registered_sids {
             let _ = app.emit(&format!("pty-output-{sid}"), &bytes);
         }
-        for sid in &["omni_global", "coding_workspace", "workspace_main", "chat_workspace"] {
+        for sid in &["ronic_global", "coding_workspace", "workspace_main", "chat_workspace"] {
             if !registered_sids.contains(&sid.to_string()) {
                 let _ = app.emit(&format!("pty-output-{sid}"), &bytes);
             }
         }
     }
     let _ = app.emit("agent-terminal-active", ());
+}
+
+fn script_command(program: &str, args: &[&str]) -> Command {
+    #[cfg(windows)]
+    {
+        let lower = program.to_ascii_lowercase();
+        if lower.ends_with(".cmd") || lower.ends_with(".bat") {
+            let mut cmd = Command::new("cmd.exe");
+            cmd.arg("/d").arg("/v:off").arg("/c").arg(program);
+            cmd.args(args);
+            return cmd;
+        }
+    }
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    cmd
 }
 
 pub fn run_capture_stream<F>(
@@ -268,9 +311,10 @@ pub fn run_capture_stream<F>(
 where
     F: FnMut(&str),
 {
-    let mut cmd = Command::new(program);
-    cmd.args(args)
-        .stdin(Stdio::null())
+    // CreateProcess cannot start a .cmd or .bat. cmd.exe can, and /v:off keeps
+    // delayed expansion from rewriting the arguments.
+    let mut cmd = script_command(program, args);
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some(dir) = cwd {
@@ -410,6 +454,9 @@ pub fn windows_bin_candidates(file_stem: &str) -> Vec<PathBuf> {
         push(&mut paths, appdata.clone(), &["npm", &name]);
         push(&mut paths, profile.clone(), &[".local", "bin", &name]);
         push(&mut paths, profile.clone(), &[".cargo", "bin", &name]);
+        push(&mut paths, profile.clone(), &[".gemini", "bin", &name]);
+        push(&mut paths, profile.clone(), &[".grok", "bin", &name]);
+        push(&mut paths, local.clone(), &["hermes", "bin", &name]);
         push(&mut paths, local.clone(), &["Programs", file_stem, &name]);
     }
     paths
@@ -462,7 +509,23 @@ pub fn wsl_which(names: &[&str]) -> Vec<(String, String)> {
 
 #[cfg(test)]
 mod harness_url {
-    use super::{confined_join, interpreter_eval_flag, normalize_harness_url, prefix_utf8, safe_id_component, truncate_utf8};
+    use super::{confined_join, interpreter_eval_flag, normalize_harness_url, prefix_utf8, safe_id_component, shadow_name, shadow_target, truncate_utf8};
+
+    #[test]
+    fn shadow_name_and_target_roundtrip_and_reject_unencoded() {
+        let name = shadow_name("extensions/skills/scraper.js", 1_700_000_000);
+        assert_eq!(shadow_target(&name).as_deref(), Some("extensions/skills/scraper.js"));
+        // Backslashes are normalised before encoding.
+        let name2 = shadow_name("extensions\\skills\\a.json", 5);
+        assert_eq!(shadow_target(&name2).as_deref(), Some("extensions/skills/a.json"));
+        // Older, unencoded backups (json-heal.checkpoint_x.bak) carry no target.
+        assert_eq!(shadow_target("json-heal.checkpoint_1a2b3c.bak"), None);
+        assert_eq!(shadow_target("notabackup.txt"), None);
+        // An encoded `..` can never escape the workspace: confined_join rejects it.
+        let root = std::env::temp_dir();
+        assert!(confined_join(&root, "extensions/../evil").is_err());
+        assert!(confined_join(&root, "extensions/skills/a.json").is_ok());
+    }
 
     #[test]
     fn dead_grok_host_becomes_grok_com() {
@@ -521,6 +584,35 @@ mod harness_url {
 
 pub fn exists_file(path: &str) -> bool {
     !path.is_empty() && Path::new(path).is_file()
+}
+
+/// Encode a workspace-relative path as a `.shadow-git` backup name. `/` and
+/// `\` become `__`, so `extensions/skills/scraper.js` becomes
+/// `extensions__skills__scraper.js.<stamp>.bak`. The restore parses the same
+/// encoding, so a backup always maps back to exactly one in-workspace target.
+pub fn shadow_name(rel_path: &str, stamp: i64) -> String {
+    let encoded = rel_path
+        .replace('\\', "/")
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("__");
+    format!("{encoded}.{stamp}.bak")
+}
+
+/// Inverse of [`shadow_name`]: recover the workspace-relative target path from
+/// a backup name. Returns `None` for names that do not carry the encoded path
+/// (older, unencoded backups stay listed but cannot be auto-restored).
+pub fn shadow_target(name: &str) -> Option<String> {
+    let stem = name.strip_suffix(".bak")?;
+    let (encoded, stamp) = stem.rsplit_once('.')?;
+    if stamp.is_empty() || !stamp.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    if encoded.is_empty() {
+        return None;
+    }
+    Some(encoded.split("__").collect::<Vec<_>>().join("/"))
 }
 
 pub fn read_to_string_limited(path: &Path, max: usize) -> Option<String> {

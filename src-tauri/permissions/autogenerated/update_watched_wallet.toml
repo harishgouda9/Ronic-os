@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-update-watched-wallet"
+description = "Enables the update_watched_wallet command without any pre-configured scope."
+commands.allow = ["update_watched_wallet"]
+
+[[permission]]
+identifier = "deny-update-watched-wallet"
+description = "Denies the update_watched_wallet command without any pre-configured scope."
+commands.deny = ["update_watched_wallet"]

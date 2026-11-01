@@ -21,7 +21,7 @@ function nid(prefix: string) {
 }
 
 function redecorate(state: Snapshot) {
-  state.registry = rebuildRegistry(state.plugins, state.mcpServers);
+  state.registry = rebuildRegistry(state.plugins, state.mcpServers, state.activeProfileId);
   const known = knownToolNames(state.registry);
   state.skills = state.skills.map((skill) => ({
     ...skill,
@@ -271,11 +271,20 @@ export function saveMcp(state: Snapshot, draft: Partial<McpServer> & { tools?: M
   server.url = String(draft.url ?? server.url);
   server.declaredTools = draft.declaredTools ?? draft.tools ?? server.declaredTools;
   if (!existing) state.mcpServers.unshift(server);
+  enableMcpDefaults(state, server);
   if (secret) rememberSecret(`mcp:${server.id}`, secret);
   redecorate(state);
   return secret
-    ? "MCP server saved. The key stays in this session. Trust it on Capabilities before a bot can use it."
-    : "MCP server saved. It is not connected.";
+    ? "MCP server saved. The key stays in this session. Profile switches default to Active. Turn one off on Capabilities if you want."
+    : "MCP server saved. It is not connected until a credential check succeeds. Profile switches default to Active.";
+}
+
+function enableMcpDefaults(state: Snapshot, server: McpServer) {
+  for (const profile of state.profiles) {
+    if (!server.enables.some((flag) => flag.profileId === profile.id)) {
+      server.enables.push({ profileId: profile.id, enabled: true });
+    }
+  }
 }
 
 export function toggleMcp(state: Snapshot, id: string, profileId: string, enabled: boolean) {
@@ -292,7 +301,9 @@ export function trustMcp(state: Snapshot, id: string) {
   const server = state.mcpServers.find((item) => item.id === id);
   if (!server) return "MCP server not found.";
   server.trust = "trusted";
-  return "MCP server trusted. The enable switch is still off.";
+  enableMcpDefaults(state, server);
+  redecorate(state);
+  return "MCP server trusted. Profile switches default to Active. Turn one off on Capabilities if you want.";
 }
 
 export function removeMcp(state: Snapshot, id: string) {
@@ -403,18 +414,19 @@ export function installMcp(state: Snapshot, name: string) {
   return `MCP server "${name}" not found in included catalog. Use the Marketplace screen to add MCP servers.`;
 }
 
-export function connectMcp(state: Snapshot, name: string) {
+export function connectMcp(state: Snapshot, name: string, secret = "") {
   const server = state.mcpServers.find((s) => s.name.toLowerCase() === name.toLowerCase() || s.id === name);
   if (!server) return `MCP server "${name}" not found. Install it first with /install mcp <name>.`;
-  if (server.trust !== "trusted") return "Trust this MCP server before connecting it.";
-  const profileId = state.activeProfileId || state.profiles[0]?.id || "";
-  if (!profileId) return "Create a bot profile before connecting an MCP server.";
-  const row = server.enables.find((flag) => flag.profileId === profileId);
-  if (row) {
-    row.enabled = true;
-    return `MCP server "${server.name}" connected to the current profile.`;
-  } else {
-    server.enables.push({ profileId, enabled: true });
-    return `MCP server "${server.name}" connected to the current profile.`;
+  const endpoint = server.url.trim();
+  const remote = endpoint.startsWith("http://") || endpoint.startsWith("https://") || server.transport === "sse";
+  if (remote && !secret.trim()) {
+    return "An empty form is not a connection. Add a credential and run the provider check.";
   }
+  server.trust = "trusted";
+  enableMcpDefaults(state, server);
+  if (secret.trim()) rememberSecret(`mcp:${server.id}`, secret.trim());
+  redecorate(state);
+  return secret.trim()
+    ? `MCP server "${server.name}" is trusted. Profile switches default to Active. The credential stays in this session. The browser preview did not call the provider.`
+    : `MCP server "${server.name}" is trusted. Profile switches default to Active. No credential was stored.`;
 }

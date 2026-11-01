@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-self-heal-drill"
+description = "Enables the self_heal_drill command without any pre-configured scope."
+commands.allow = ["self_heal_drill"]
+
+[[permission]]
+identifier = "deny-self-heal-drill"
+description = "Denies the self_heal_drill command without any pre-configured scope."
+commands.deny = ["self_heal_drill"]

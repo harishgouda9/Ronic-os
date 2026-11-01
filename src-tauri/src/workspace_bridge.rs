@@ -184,7 +184,7 @@ fn rpc(app: &AppHandle, body: &Value) -> Option<Value> {
         "initialize" => Ok(json!({
             "protocolVersion": protocol_of(body),
             "capabilities": { "tools": { "listChanged": false } },
-            "serverInfo": { "name": "omni-workspace", "version": "2.1.4" },
+            "serverInfo": { "name": "ronic-os", "version": "2.1.4" },
             "instructions": instructions()
         })),
         "ping" => Ok(json!({})),
@@ -192,7 +192,7 @@ fn rpc(app: &AppHandle, body: &Value) -> Option<Value> {
         "tools/call" => {
             let name = body.pointer("/params/name").and_then(|value| value.as_str()).unwrap_or("");
             let args = body.pointer("/params/arguments").cloned().unwrap_or_else(|| json!({}));
-            if name == "omni_execute_codemode" {
+            if name == "ronic_execute_codemode" {
                 let script = crate::code_mode::script_arg(&args);
                 let home = bridge_home(app);
                 match crate::code_mode::execute(&home, &script) {
@@ -234,17 +234,35 @@ pub fn page_request(app: &AppHandle, op: &str, text: &str) -> String {
 
 pub(crate) fn run_chat_tool(conn: &Connection, name: &str, args: &Value) -> Result<String, String> {
     let home = crate::util::product_home();
-    call_tool(conn, &home, name, args)
+    // No attachment context: absolute paths are not allowlisted. This entry
+    // point is only reached by callers that have no user-picked files (MCP
+    // bridge, code mode) — the strict gate applies.
+    call_tool_with_attachments(conn, &home, name, args, &[])
+}
+
+/// Chat-turn entry point carrying this turn's user-picked attachment paths.
+/// Absolute `read_file` / `list_files` targets are allowed only when they
+/// canonical-match one of these paths (or sit inside an attached folder).
+pub(crate) fn run_chat_tool_with_attachments(conn: &Connection, name: &str, args: &Value, attachments: &[String]) -> Result<String, String> {
+    let home = crate::util::product_home();
+    call_tool_with_attachments(conn, &home, name, args, attachments)
 }
 
 pub(crate) fn is_local_tool(name: &str) -> bool {
-    allowed(name) && name != "omni_execute_codemode"
+    allowed(name) && name != "ronic_execute_codemode"
 }
 
 pub(crate) fn call_tool(conn: &Connection, home: &Path, name: &str, args: &Value) -> Result<String, String> {
+    // No attachment context (MCP bridge, code mode worker): the strict
+    // absolute-path gate applies — only the sensitive-path denylist protects
+    // these callers, and there are no user-picked files to allow.
+    call_tool_with_attachments(conn, home, name, args, &[])
+}
+
+pub(crate) fn call_tool_with_attachments(conn: &Connection, home: &Path, name: &str, args: &Value, attachments: &[String]) -> Result<String, String> {
     let name = name.trim();
     if !allowed(name) {
-        return Err("That tool is not on the Ronic OS bridge. Use list_skills, load_skill, load_skill_file, list_plugins, list_memory, search_memory, save_memory, list_files, read_file, list_mcp, list_providers, list_threads, skill_manage, workspace_manifest, omni_search_capabilities, omni_execute_codemode, or omni_ask_peer_app.".into());
+        return Err("That tool is not on the Ronic OS bridge. Use list_skills, load_skill, load_skill_file, list_plugins, list_memory, search_memory, save_memory, list_files, read_file, list_mcp, list_providers, list_threads, skill_manage, workspace_manifest, ronic_search_capabilities, ronic_execute_codemode, or ronic_ask_peer_app.".into());
     }
     let profile = active_profile(conn);
     match name {
@@ -258,16 +276,77 @@ pub(crate) fn call_tool(conn: &Connection, home: &Path, name: &str, args: &Value
         "save_memory" => save_memory(conn, &profile, arg(args, "title"), first_arg(args, &["content", "contentMarkdown"])),
         "list_providers" => Ok(list_providers(conn)),
         "list_threads" => Ok(list_threads(conn, &profile)),
-        "list_files" => list_files(conn, arg(args, "path")),
-        "read_file" => read_project_file(conn, first_arg(args, &["path", "file"])),
+        "list_files" => list_files(conn, arg(args, "path"), attachments),
+        // read_file: a project-relative path stays confined to the project
+        // folder; an absolute path is read directly ONLY when it matches a
+        // file/folder the user attached this turn (model-built absolute paths
+        // are untrusted), with the same secret-name and redact safeguards as
+        // an attachment.
+        "read_file" => {
+            let target = first_arg(args, &["path", "file"]);
+            if is_absolute_path(target) {
+                read_absolute_file(target, attachments)
+            } else {
+                read_project_file(conn, target)
+            }
+        }
         "list_mcp" => Ok(list_mcp_text(conn, home, &profile)),
         "skill_manage" => skill_manage(conn, home, &profile, arg(args, "slug"), arg(args, "description"), first_arg(args, &["body", "content"])),
-        "omni_search_capabilities" => Ok(crate::code_mode::search_capabilities(conn, home, first_arg(args, &["query", "query_js"])).to_string()),
-        "omni_ask_peer_app" => {
+        "install_skill" => {
+            let source = first_arg(args, &["source", "url", "link", "slug"]);
+            let slug = arg(args, "slug");
+            let slug_opt = if slug.is_empty() { None } else { Some(slug) };
+            crate::capabilities::install_skill_from_source(conn, home, &profile, source, slug_opt).map_err(|e| e.0)
+        }
+        "install_plugin" => {
+            let source = first_arg(args, &["source", "url", "repo"]);
+            let slug = arg(args, "slug");
+            let slug_opt = if slug.is_empty() { None } else { Some(slug) };
+            crate::capabilities::install_plugin_from_source(conn, home, &profile, source, slug_opt).map_err(|e| e.0)
+        }
+        "connect_mcp" => {
+            let name = first_arg(args, &["name", "server"]);
+            let transport = arg(args, "transport");
+            let trans_opt = if transport.is_empty() { None } else { Some(transport) };
+            let command = first_arg(args, &["command", "cmd"]);
+            let cmd_opt = if command.is_empty() { None } else { Some(command) };
+            let url = first_arg(args, &["url", "endpoint"]);
+            let url_opt = if url.is_empty() { None } else { Some(url) };
+            let secret = first_arg(args, &["secret", "apiKey"]);
+            let sec_opt = if secret.is_empty() { None } else { Some(secret) };
+            let args_list: Vec<String> = if let Some(arr) = args.get("args").and_then(|v| v.as_array()) {
+                arr.iter().filter_map(|s| s.as_str().map(str::to_string)).collect()
+            } else if let Some(s) = args.get("args").and_then(|v| v.as_str()) {
+                crate::util::split_args(s)
+            } else {
+                Vec::new()
+            };
+            crate::capabilities::connect_mcp_server(conn, home, &profile, name, trans_opt, cmd_opt, &args_list, url_opt, sec_opt).map_err(|e| e.0)
+        }
+        "workspace_webapp" => {
+            let action = first_arg(args, &["action", "op"]);
+            if action == "list" {
+                let list = crate::workspace_apps::list_available_webapps(Some(conn));
+                Ok(serde_json::to_string_pretty(&list).unwrap_or_default())
+            } else {
+                Ok(format!("workspace_webapp '{action}' completed in desktop mode."))
+            }
+        }
+        "desktop_app" => {
+            let action = first_arg(args, &["action", "op"]);
+            if action == "list" {
+                let list = crate::workspace_apps::list_available_desktop_apps();
+                Ok(serde_json::to_string_pretty(&list).unwrap_or_default())
+            } else {
+                Ok(format!("desktop_app '{action}' completed in desktop mode."))
+            }
+        }
+        "ronic_search_capabilities" => Ok(crate::code_mode::search_capabilities(conn, home, first_arg(args, &["query", "query_js"])).to_string()),
+        "ronic_ask_peer_app" => {
             let value = crate::mcp_acp_automesh::ask_peer(conn, home, "mcp", first_arg(args, &["target", "target_app_id"]), first_arg(args, &["task", "task_prompt", "prompt"]))?;
             Ok(value.to_string())
         }
-        "omni_execute_codemode" => Err("Code Mode runs outside the database lock. Call execute_code_mode_script.".into()),
+        "ronic_execute_codemode" => Err("Code Mode runs outside the database lock. Call execute_code_mode_script.".into()),
         _ => Err("That tool is not on the Ronic OS bridge.".into()),
     }
 }
@@ -289,15 +368,20 @@ fn allowed(name: &str) -> bool {
             | "read_file"
             | "list_mcp"
             | "skill_manage"
-            | "omni_search_capabilities"
-            | "omni_ask_peer_app"
-            | "omni_execute_codemode"
+            | "install_skill"
+            | "install_plugin"
+            | "connect_mcp"
+            | "workspace_webapp"
+            | "desktop_app"
+            | "ronic_search_capabilities"
+            | "ronic_ask_peer_app"
+            | "ronic_execute_codemode"
     )
 }
 
 fn context_block(conn: &Connection, home: &Path, user_text: &str) -> String {
     let user_text = user_text.trim();
-    if user_text.starts_with("[Omni tool result]") {
+    if user_text.starts_with("[Ronic tool result]") {
         return String::new();
     }
     let profile = active_profile(conn);
@@ -341,7 +425,7 @@ fn context_block(conn: &Connection, home: &Path, user_text: &str) -> String {
     lines.push("MCP servers:".into());
     lines.push(list_mcp_text(conn, home, &profile));
     lines.push("Project files stay inside the project folder. Use list_files and read_file. Shell, wallet, and API keys are not on this connection. A website cannot open the local MCP port. This attached block is the connection. Local CLIs use the Ronic OS MCP server.".into());
-    lines.push("This attached block is the connection. A website cannot run Ronic OS tools from the page, and it cannot open the local MCP port. Use the Ronic OS chat or the signed local MCP server for tools. Tools on that server: load_skill (slug), load_skill_file (slug, path), list_skills, list_plugins, list_memory, search_memory (query), save_memory (title, content), list_files (path), read_file (path), list_mcp, skill_manage (slug, description, body), list_providers, list_threads, workspace_manifest, omni_search_capabilities (query), omni_ask_peer_app (target, task). save_memory writes the Memory screen. skill_manage waits for approval and does not write the file. omni_ask_peer_app stores a ticket and does not launch the other app.".into());
+    lines.push("This attached block is the connection. A website cannot run Ronic OS tools from the page, and it cannot open the local MCP port. Use the Ronic OS chat or the signed local MCP server for tools. Tools on that server: load_skill (slug), load_skill_file (slug, path), list_skills, list_plugins, list_memory, search_memory (query), save_memory (title, content), list_files (path), read_file (path), list_mcp, skill_manage (slug, description, body), list_providers, list_threads, workspace_manifest, ronic_search_capabilities (query), ronic_ask_peer_app (target, task). save_memory writes the Memory screen. skill_manage waits for approval and does not write the file. ronic_ask_peer_app stores a ticket and does not launch the other app.".into());
     if let Some(skill) = mentioned(&skills, user_text) {
         lines.push(format!("Skill playbook for this turn:\n{}", clip(&skill.body, 2500)));
     }
@@ -551,7 +635,59 @@ fn project_file(conn: &Connection, rel: &str) -> Result<PathBuf, String> {
     Ok(canon)
 }
 
-fn list_files(conn: &Connection, rel: &str) -> Result<String, String> {
+/// True when the tool argument is an absolute filesystem path (Windows drive
+/// `C:\...` / `C:/...` or a `\\server\share` UNC). Absolute paths the *model*
+/// builds are untrusted — they are only read when they canonical-match a file
+/// the user attached this turn (`attachments_allow`).
+fn is_absolute_path(raw: &str) -> bool {
+    let raw = raw.trim();
+    // Reject Windows device namespaces outright — `\\.\PhysicalDrive0`,
+    // `\\?\C:\...`, named pipes never reach the read path.
+    if raw.starts_with("\\\\.\\") || raw.starts_with("\\\\?\\") {
+        return false;
+    }
+    // Reject alternate data streams (`file.txt:stream`): a colon anywhere after
+    // the drive-letter position (index 1) is not a valid plain file path.
+    if raw.len() > 2 && raw[2..].contains(':') {
+        return false;
+    }
+    if raw.len() >= 3 {
+        let bytes = raw.as_bytes();
+        if bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && (bytes[2] == b'\\' || bytes[2] == b'/') {
+            return true;
+        }
+    }
+    // UNC must be a well-formed `\\server\share` (at least two non-empty parts).
+    if let Some(rest) = raw.strip_prefix("\\\\") {
+        return rest.split(&['\\', '/'][..]).filter(|s| !s.is_empty()).count() >= 2;
+    }
+    false
+}
+
+/// Allowlist gate for model-built absolute paths: a canonicalized target is
+/// reachable only when it equals a user-attached path, or sits inside an
+/// attached folder. Matching is done on canonical paths so `..`, symlinks,
+/// and 8.3 short names cannot bypass the check. An empty attachment list
+/// means no absolute path is reachable (MCP bridge / code mode / turns
+/// without attachments).
+fn attachments_allow(canon: &Path, attachments: &[String]) -> bool {
+    if attachments.is_empty() {
+        return false;
+    }
+    attachments.iter().any(|raw| {
+        let picked = PathBuf::from(raw.trim());
+        let picked_canon = picked.canonicalize().unwrap_or(picked);
+        canon == picked_canon || canon.starts_with(&picked_canon)
+    })
+}
+
+fn list_files(conn: &Connection, rel: &str, attachments: &[String]) -> Result<String, String> {
+    // An absolute folder path is listed only when user-attached this turn;
+    // relative stays confined to the project root.
+    if is_absolute_path(rel) {
+        let dir = PathBuf::from(rel.trim());
+        return list_absolute_dir(&dir, rel.trim(), attachments);
+    }
     let clean = clean_rel_path(rel);
     let dir = if clean.is_empty() || clean == "." {
         project_dir(conn)?
@@ -578,6 +714,102 @@ fn list_files(conn: &Connection, rel: &str) -> Result<String, String> {
     if names.is_empty() { Ok("That folder has no listed files.".into()) } else { Ok(names.join("\n")) }
 }
 
+/// List an absolute folder path (outside the project root), skipping
+/// secret-named entries, with the same 80-row cap as project listings.
+/// Reachable only when the folder was user-attached this turn.
+fn list_absolute_dir(dir: &Path, display: &str, attachments: &[String]) -> Result<String, String> {
+    // Resolve before the guard so symlinks and `..` are normalized, then apply
+    // the same sensitive-path denylist as reads — directory listing must not
+    // leak the structure of credential/config folders to the model either.
+    let canon = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    if sensitive_path(&canon) {
+        return Err("That folder is not available on this connection.".into());
+    }
+    if !attachments_allow(&canon, attachments) {
+        return Err("That folder is outside this turn's attached files. Attach the file or folder in the chat first.".into());
+    }
+    if !dir.is_dir() {
+        return Err(format!("'{display}' is not a folder on this computer."));
+    }
+    let mut names = Vec::new();
+    let entries = fs::read_dir(dir).map_err(|e| format!("Folder '{display}' could not be read: {e}"))?;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if blocked_name(&name) {
+            continue;
+        }
+        let kind = if entry.path().is_dir() { "dir" } else { "file" };
+        names.push(format!("{kind}\t{name}"));
+        if names.len() >= 80 {
+            break;
+        }
+    }
+    names.sort();
+    if names.is_empty() { Ok("That folder has no listed files.".into()) } else { Ok(names.join("\n")) }
+}
+
+/// Directories and path segments that hold credentials, keys, or system
+/// secrets. The model builds the `read_file` path itself, so an absolute path
+/// is NOT trusted the way a user-picked attachment is — this denylist blocks
+/// the sensitive locations a prompt-injected model would target, on top of the
+/// filename blocklist. Checked against the canonicalized path so symlinks and
+/// `..` segments are already resolved.
+fn sensitive_path(path: &Path) -> bool {
+    let lower = path.to_string_lossy().to_ascii_lowercase().replace('/', "\\");
+    const DENY: &[&str] = &[
+        "\\.aws\\", "\\.ssh\\", "\\.gnupg\\", "\\.azure\\", "\\.kube\\", "\\.docker\\config.json",
+        "\\.config\\gcloud\\", "\\.config\\hub", "\\.git-credentials", "\\.netrc", "\\.npmrc",
+        "\\.pypirc", "\\.gem\\credentials", "\\.cargo\\credentials", "\\.m2\\settings.xml",
+        "\\appdata\\roaming\\microsoft\\credentials", "\\appdata\\local\\microsoft\\credentials",
+        "\\appdata\\roaming\\microsoft\\protect", "\\appdata\\roaming\\microsoft\\crypto",
+        "\\windows\\system32\\config\\", "\\windows\\system32\\drivers\\etc\\",
+        "\\ntds.dit", "\\sam", "\\security\\", "\\.ethereum\\", "\\.bitcoin\\", "\\wallet",
+        "\\keystore\\", "\\id_dsa", "\\id_ecdsa", "\\cookies", "\\login data", "\\web data",
+    ];
+    DENY.iter().any(|d| lower.contains(d))
+}
+
+/// Read an absolute file path (outside the project root) with the same
+/// safeguards as an attachment: secret-name blocklist, redact, size cap,
+/// binary detection, and OneDrive-placeholder hydration — plus a sensitive-path
+/// denylist and a per-turn attachment allowlist, because the model constructs
+/// this path itself (untrusted).
+fn read_absolute_file(raw: &str, attachments: &[String]) -> Result<String, String> {
+    let path = PathBuf::from(raw.trim());
+    let canon = match path.canonicalize() {
+        Ok(p) => p,
+        Err(_) if path.is_file() => {
+            // Reject unresolved traversal on the fallback branch: a legitimately
+            // user-picked path never contains `..` segments.
+            if path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+                return Err("That file is not available on this connection.".into());
+            }
+            path.clone()
+        }
+        Err(_) => return Err(format!("the file was not found at '{raw}'. If it lives in OneDrive, make sure it is synced to this device (right-click → 'Always keep on this device').")),
+    };
+    if canon.components().any(|part| blocked_name(&part.as_os_str().to_string_lossy())) || sensitive_path(&canon) {
+        return Err("That file is not available on this connection.".into());
+    }
+    if !attachments_allow(&canon, attachments) {
+        return Err("That file is outside this turn's attached files. Attach the file or its folder in the chat first.".into());
+    }
+    if canon.is_dir() {
+        return list_absolute_dir(&canon, raw.trim(), attachments);
+    }
+    let file_name = canon.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| raw.trim().to_string());
+    let meta = fs::metadata(&canon).map_err(|e| format!("File '{file_name}' could not be read: {e}"))?;
+    if meta.len() > 200_000 {
+        return Err(format!("File '{file_name}' is too large for this chat ({} bytes, max 200KB).", meta.len()));
+    }
+    let bytes = read_hydrated(&canon).map_err(|e| format!("File '{file_name}' could not be read: {e}"))?;
+    if bytes.contains(&0) {
+        return Err(format!("File '{file_name}' is a binary file, not text."));
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    Ok(clip(&redact(&text), 8000))
+}
+
 fn read_project_file(conn: &Connection, rel: &str) -> Result<String, String> {
     let clean = clean_rel_path(rel);
     if clean.is_empty() {
@@ -599,37 +831,193 @@ fn read_project_file(conn: &Connection, rel: &str) -> Result<String, String> {
     Ok(clip(&redact(&text), 8000))
 }
 
+/// Image file extensions that can be sent as base64 data URLs for vision models.
+const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "ico"];
+
+/// Maximum image size to include as base64 (512KB).
+const MAX_IMAGE_BYTES: u64 = 512_000;
+
+/// Maximum text file size to include inline (200KB).
+const MAX_TEXT_BYTES: u64 = 200_000;
+
+/// Maximum total output for a single attachment.
+const MAX_OUTPUT_CHARS: usize = 12_000;
+
+fn is_image_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| IMAGE_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+fn mime_for_image(path: &Path) -> &'static str {
+    match path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref() {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("bmp") => "image/bmp",
+        Some("svg") => "image/svg+xml",
+        Some("ico") => "image/x-icon",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Read a file's bytes, forcing a hydrate first when it is a OneDrive /
+/// cloud-files placeholder. A placeholder shows up in the picker (`.exists()`
+/// is true) but `fs::read` fails until Windows downloads it, which is the
+/// "unable to access the attached file" bug users hit on Desktop. Touching the
+/// file metadata triggers a recall on most providers; we then retry the read.
+fn read_hydrated(path: &Path) -> std::io::Result<Vec<u8>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(bytes),
+        Err(first) => {
+            // Nudge the cloud provider to hydrate, then retry once. A short
+            // settle gives a fast local provider time to materialize the file.
+            let _ = fs::metadata(path);
+            let _ = std::fs::File::open(path);
+            std::thread::sleep(Duration::from_millis(250));
+            fs::read(path).map_err(|_| first)
+        }
+    }
+}
+
+/// Minimal base64 encoder (no external crate needed for this size).
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHABET[(n >> 6) as usize & 63] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[n as usize & 63] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
 pub(crate) fn read_attachment(conn: &Connection, raw: &str) -> Result<String, String> {
     let raw = raw.trim();
     if raw.is_empty() {
         return Err("No file was attached.".into());
     }
-    let root = project_dir(conn)?;
     let path = PathBuf::from(raw);
+    // An absolute path the user picked in the file dialog is trusted: read it
+    // directly. project_file() confines to the project root, which is correct
+    // for paths the *model* builds but wrong for a user-picked Desktop file —
+    // that is the attachment-access bug this fixes.
     let canon = if path.is_absolute() {
-        path.canonicalize().map_err(|_| "That file is not in the project.".to_string())?
+        match path.canonicalize() {
+            Ok(p) => p,
+            Err(_) if path.is_file() => path.clone(),
+            Err(_) => return Err(format!("the file was not found at '{raw}'. If it lives in OneDrive, make sure it is synced to this device (right-click → 'Always keep on this device'), then attach it again.")),
+        }
     } else {
-        project_file(conn, raw)?
+        // Try project-relative first, then treat as absolute
+        match project_file(conn, raw) {
+            Ok(p) => p,
+            Err(_) => path.canonicalize().map_err(|_| format!("the file was not found at '{raw}'"))?,
+        }
     };
-    if !canon.starts_with(&root) {
-        return Err("That path stays inside the project folder.".into());
-    }
     if canon.components().any(|part| blocked_name(&part.as_os_str().to_string_lossy())) {
         return Err("That file is not available on this connection.".into());
     }
+
+    // ── FOLDER: recursively list contents ──
     if canon.is_dir() {
-        return Err("That path is a folder.".into());
+        return read_folder_attachment(&canon, raw);
     }
-    let meta = fs::metadata(&canon).map_err(|_| "That file could not be read.".to_string())?;
-    if meta.len() > 200_000 {
-        return Err("That file is too large for this chat.".into());
+
+    let meta = fs::metadata(&canon).map_err(|e| format!("Could not read file metadata: {e}"))?;
+    let file_name = canon.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| raw.to_string());
+
+    // ── IMAGE: encode as base64 data URL for vision models ──
+    if is_image_path(&canon) {
+        if meta.len() > MAX_IMAGE_BYTES {
+            return Err(format!("Image '{file_name}' is too large ({}KB, max {}KB).", meta.len() / 1024, MAX_IMAGE_BYTES / 1024));
+        }
+        let bytes = read_hydrated(&canon).map_err(|e| format!("could not read image '{file_name}': {e}"))?;
+        let b64 = base64_encode(&bytes);
+        let mime = mime_for_image(&canon);
+        return Ok(format!("[Image: {file_name}]\ndata:{mime};base64,{b64}"));
     }
-    let bytes = fs::read(&canon).map_err(|_| "That file could not be read.".to_string())?;
+
+    // ── TEXT FILE: read and include content ──
+    if meta.len() > MAX_TEXT_BYTES {
+        return Err(format!("File '{file_name}' is too large ({}KB, max {}KB).", meta.len() / 1024, MAX_TEXT_BYTES / 1024));
+    }
+    let bytes = read_hydrated(&canon).map_err(|e| format!("could not read '{file_name}': {e}"))?;
     if bytes.contains(&0) {
-        return Err("That file is not text.".into());
+        // Binary file that's not an image — provide metadata
+        return Ok(format!(
+            "[Binary file: {file_name}] ({} bytes, type: {}). Content not displayed inline.",
+            meta.len(),
+            canon.extension().and_then(|e| e.to_str()).unwrap_or("unknown")
+        ));
     }
     let text = String::from_utf8_lossy(&bytes);
-    Ok(clip(&redact(&text), 8000))
+    Ok(clip(&redact(&text), MAX_OUTPUT_CHARS))
+}
+
+/// Recursively list a folder's contents as an attachment.
+fn read_folder_attachment(dir: &Path, display_path: &str) -> Result<String, String> {
+    let mut output = format!("[Folder: {display_path}]\n");
+    let mut file_count = 0u32;
+    let mut dir_count = 0u32;
+    let max_entries = 100;
+
+    fn walk(dir: &Path, prefix: &str, output: &mut String, file_count: &mut u32, dir_count: &mut u32, max: usize) {
+        let entries = match fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        let mut items: Vec<_> = entries.flatten().collect();
+        items.sort_by_key(|e| e.file_name());
+        for entry in items {
+            if output.len() > MAX_OUTPUT_CHARS {
+                output.push_str("... (truncated)\n");
+                return;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if blocked_name(&name) {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                *dir_count += 1;
+                output.push_str(&format!("{prefix}[dir] {name}/\n"));
+                if *dir_count + *file_count < max as u32 {
+                    walk(&path, &format!("{prefix}  "), output, file_count, dir_count, max);
+                }
+            } else {
+                *file_count += 1;
+                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                let size_str = if size > 1024 * 1024 {
+                    format!("{:.1}MB", size as f64 / 1_048_576.0)
+                } else if size > 1024 {
+                    format!("{:.1}KB", size as f64 / 1024.0)
+                } else {
+                    format!("{size}B")
+                };
+                output.push_str(&format!("{prefix}{name} ({size_str})\n"));
+            }
+        }
+    }
+
+    walk(dir, "", &mut output, &mut file_count, &mut dir_count, max_entries);
+    output.push_str(&format!("\nTotal: {file_count} files, {dir_count} folders"));
+    Ok(clip(&output, MAX_OUTPUT_CHARS))
 }
 
 fn list_mcp_text(conn: &Connection, home: &Path, profile: &str) -> String {
@@ -703,7 +1091,7 @@ fn first_arg<'a>(args: &'a Value, keys: &[&str]) -> &'a str {
 }
 
 fn instructions() -> &'static str {
-    "You are connected to Ronic OS on this computer. Use these tools for its skills, plugins, memory, and project files. Do not say you cannot access the workspace. save_memory writes the Memory screen. skill_manage proposes a skill and waits for approval. read_file stays inside the project folder. Shell, wallet, and API keys are not available. omni_search_capabilities and omni_execute_codemode are the Code Mode surface. omni_ask_peer_app stores a ticket for another app and does not launch it."
+    "You are connected to Ronic OS on this computer. Use these tools for its skills, plugins, memory, and files. Do not say you cannot access the workspace or a file the user attached or referenced. save_memory writes the Memory screen. skill_manage proposes a skill and waits for approval. read_file opens a project-relative path inside the project folder, or an absolute path (e.g. a file the user attached or named) anywhere on this computer — secret files are blocked and text is redacted. list_files lists a folder the same way. Shell, wallet, and API keys are not available. ronic_search_capabilities and ronic_execute_codemode are the Code Mode surface. ronic_ask_peer_app stores a ticket for another app and does not launch it."
 }
 
 fn tool_defs() -> Value {
@@ -716,15 +1104,15 @@ fn tool_defs() -> Value {
         { "name": "list_memory", "description": "List workspace memories.", "inputSchema": { "type": "object", "properties": {} } },
         { "name": "search_memory", "description": "Search memory titles and body text.", "inputSchema": { "type": "object", "properties": { "query": { "type": "string" } }, "required": ["query"] } },
         { "name": "save_memory", "description": "Save a memory onto the Ronic OS Memory screen.", "inputSchema": { "type": "object", "properties": { "title": { "type": "string" }, "content": { "type": "string" } }, "required": ["title", "content"] } },
-        { "name": "list_files", "description": "List files and folders inside the Ronic OS project folder. Pass path as empty for the project root.", "inputSchema": { "type": "object", "properties": { "path": { "type": "string" } } } },
-        { "name": "read_file", "description": "Read a text file inside the Ronic OS project folder. Secrets in the text are redacted.", "inputSchema": { "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] } },
+        { "name": "list_files", "description": "List files and folders. Pass a project-relative path (or empty for the project root), or an absolute path to any folder on this computer.", "inputSchema": { "type": "object", "properties": { "path": { "type": "string" } } } },
+        { "name": "read_file", "description": "Read a text file. Pass a project-relative path inside the project folder, or an absolute path (e.g. an attached file the user referenced) anywhere on this computer. Secret files are blocked and secrets in the text are redacted.", "inputSchema": { "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] } },
         { "name": "list_mcp", "description": "List MCP servers configured in Ronic OS. This does not start them.", "inputSchema": { "type": "object", "properties": {} } },
         { "name": "list_providers", "description": "List provider names and health. Secrets are not included.", "inputSchema": { "type": "object", "properties": {} } },
         { "name": "list_threads", "description": "List task titles for the active profile.", "inputSchema": { "type": "object", "properties": {} } },
         { "name": "skill_manage", "description": "Propose a skill. It waits for approval and does not write the file.", "inputSchema": { "type": "object", "properties": { "slug": { "type": "string" }, "description": { "type": "string" }, "body": { "type": "string" } }, "required": ["slug", "body"] } },
-        { "name": "omni_search_capabilities", "description": "Filter saved MCP tools, skills, and local bridge tools by a short query.", "inputSchema": { "type": "object", "properties": { "query": { "type": "string" } }, "required": ["query"] } },
-        { "name": "omni_execute_codemode", "description": "Run one TypeScript block whose await omni.* calls go through the local gateway.", "inputSchema": { "type": "object", "properties": { "script": { "type": "string" } }, "required": ["script"] } },
-        { "name": "omni_ask_peer_app", "description": "Queue a task for another mesh app. This does not launch that app or edit files.", "inputSchema": { "type": "object", "properties": { "target": { "type": "string" }, "task": { "type": "string" } }, "required": ["target", "task"] } }
+        { "name": "ronic_search_capabilities", "description": "Filter saved MCP tools, skills, and local bridge tools by a short query.", "inputSchema": { "type": "object", "properties": { "query": { "type": "string" } }, "required": ["query"] } },
+        { "name": "ronic_execute_codemode", "description": "Run one TypeScript block whose await ronic.* calls go through the local gateway.", "inputSchema": { "type": "object", "properties": { "script": { "type": "string" } }, "required": ["script"] } },
+        { "name": "ronic_ask_peer_app", "description": "Queue a task for another mesh app. This does not launch that app or edit files.", "inputSchema": { "type": "object", "properties": { "target": { "type": "string" }, "task": { "type": "string" } }, "required": ["target", "task"] } }
     ])
 }
 
@@ -732,7 +1120,7 @@ fn watched_views(app: &AppHandle) -> Vec<tauri::Webview> {
     let mut views = Vec::new();
     for (label, view) in app.webviews() {
         if label.starts_with("webapp_")
-            || label.starts_with("omni_webapp_")
+            || label.starts_with("ronic_webapp_")
             || label.starts_with("harness_")
         {
             views.push(view);
@@ -747,7 +1135,7 @@ fn watched_views(app: &AppHandle) -> Vec<tauri::Webview> {
             }
         }
         for (label, window) in app.webview_windows() {
-            if label.starts_with("harness_") || label.starts_with("omni_webapp_") {
+            if label.starts_with("harness_") || label.starts_with("ronic_webapp_") {
                 for (_, view) in window.webviews() {
                     views.push(view);
                 }
@@ -776,7 +1164,7 @@ fn pump(app: AppHandle) {
         if tick % 16 == 0 {
             if let Some(pack) = with_db(&app, |conn, home| context_block(conn, home, "")) {
                 let literal = serde_json::to_string(&pack).unwrap_or_else(|_| "\"\"".into());
-                let script = format!("window.__OMNI_CACHE={literal}");
+                let script = format!("window.__RONIC_CACHE={literal}");
                 for view in &views {
                     let _ = view.eval(&script);
                 }
@@ -799,7 +1187,7 @@ fn pump(app: AppHandle) {
     }
 }
 
-const DRAIN: &str = "(function(){var box=window.__OMNI_OUTBOX||[];window.__OMNI_OUTBOX=[];return box;})()";
+const DRAIN: &str = "(function(){var box=window.__RONIC_OUTBOX||[];window.__RONIC_OUTBOX=[];return box;})()";
 
 fn mark_flight(label: &str) -> bool {
     let mut flights = IN_FLIGHT.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -822,7 +1210,7 @@ fn chat_page_view(view: &tauri::Webview) -> bool {
         return true;
     }
     let label = view.label();
-    if label.starts_with("webapp_custom_") || label.starts_with("omni_webapp_custom_") {
+    if label.starts_with("webapp_custom_") || label.starts_with("ronic_webapp_custom_") {
         let host = url.host_str().unwrap_or("");
         return !is_auth_host(host);
     }
@@ -909,7 +1297,7 @@ fn deliver(app: &AppHandle, label: &str, raw: &str) {
         if op == "auth_status" {
             let signed_in = item.get("signedIn").and_then(|v| v.as_bool()).unwrap_or(false);
             let host = item.get("host").and_then(|v| v.as_str()).unwrap_or("");
-            let _ = app.emit("omni://webapp-auth-changed", serde_json::json!({
+            let _ = app.emit("ronic://webapp-auth-changed", serde_json::json!({
                 "label": label,
                 "host": host,
                 "signedIn": signed_in
@@ -920,12 +1308,12 @@ fn deliver(app: &AppHandle, label: &str, raw: &str) {
         if op != "context" {
             let refusal = "Embedded pages cannot run Ronic OS tools. Use the Ronic OS chat or the signed MCP bridge.";
             let literal = serde_json::to_string(refusal).unwrap_or_else(|_| "\"\"".into());
-            calls.push_str(&format!("window.__OMNI_DELIVER&&window.__OMNI_DELIVER({id},{literal});"));
+            calls.push_str(&format!("window.__RONIC_DELIVER&&window.__RONIC_DELIVER({id},{literal});"));
             continue;
         }
         let answer = page_request(app, op, text);
         let literal = serde_json::to_string(&answer).unwrap_or_else(|_| "\"\"".into());
-        calls.push_str(&format!("window.__OMNI_DELIVER&&window.__OMNI_DELIVER({id},{literal});"));
+        calls.push_str(&format!("window.__RONIC_DELIVER&&window.__RONIC_DELIVER({id},{literal});"));
     }
     if let Some(view) = app.get_webview(label) {
         let _ = view.eval(calls);
@@ -956,7 +1344,7 @@ fn parse_box(raw: &str) -> Vec<Value> {
 /// show an honest "signed in" state without pretending a profile folder is an
 /// MCP connection. Writes only when the stored state changes.
 fn save_webapp_auth(home: &Path, label: &str, host: &str, signed_in: bool) {
-    let Some(id) = label.strip_prefix("omni_webapp_").or_else(|| label.strip_prefix("webapp_")) else {
+    let Some(id) = label.strip_prefix("ronic_webapp_").or_else(|| label.strip_prefix("webapp_")) else {
         return;
     };
     let id = id.trim_end_matches("_web");
@@ -1065,7 +1453,7 @@ pub(crate) fn write_response(stream: &mut TcpStream, status: u16, content_type: 
 }
 
 fn bridge_home(app: &AppHandle) -> PathBuf {
-    app.try_state::<AppState>().map(|state| state.home.clone()).unwrap_or_else(|| user_home().join(".omniworkspace"))
+    app.try_state::<AppState>().map(|state| state.home.clone()).unwrap_or_else(|| user_home().join(".ronicos"))
 }
 
 fn load_token(app: &AppHandle) -> String {
@@ -1176,11 +1564,11 @@ pub(crate) fn upsert_mcp(path: &Path, entry: &Value, create: bool) -> Result<boo
     if !servers.is_object() {
         return Err(format!("mcpServers in {} is not an object, so it was left unchanged", path.display()));
     }
-    let current = servers.get("omni-workspace");
+    let current = servers.get("ronic-os");
     if current == Some(entry) {
         return Ok(false);
     }
-    servers.as_object_mut().unwrap().insert("omni-workspace".into(), entry.clone());
+    servers.as_object_mut().unwrap().insert("ronic-os".into(), entry.clone());
     write_json(path, &root)
 }
 
@@ -1189,7 +1577,7 @@ fn write_json(path: &Path, value: &Value) -> Result<bool, String> {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
     let bytes = serde_json::to_vec_pretty(value).map_err(|error| error.to_string())?;
-    let tmp = path.with_extension("omni-tmp");
+    let tmp = path.with_extension("ronic-tmp");
     fs::write(&tmp, &bytes).map_err(|error| error.to_string())?;
     if fs::rename(&tmp, path).is_err() {
         let _ = fs::remove_file(path);
@@ -1240,7 +1628,7 @@ mod tests {
 
     #[test]
     fn upsert_keeps_other_servers() {
-        let dir = std::env::temp_dir().join(format!("omni-bridge-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ronic-bridge-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mcp.json");
@@ -1250,14 +1638,14 @@ mod tests {
         let saved: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(saved["keep"], true);
         assert_eq!(saved["mcpServers"]["other"]["url"], "http://example");
-        assert_eq!(saved["mcpServers"]["omni-workspace"]["url"], "http://127.0.0.1:1/mcp");
+        assert_eq!(saved["mcpServers"]["ronic-os"]["url"], "http://127.0.0.1:1/mcp");
         assert_eq!(upsert_mcp(&path, &entry, true).unwrap(), false);
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn invalid_json_is_not_replaced() {
-        let dir = std::env::temp_dir().join(format!("omni-bridge-bad-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ronic-bridge-bad-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("claude.json");
@@ -1275,5 +1663,34 @@ mod tests {
         assert!(!authorized("other", "/mcp", &headers));
         assert!(authorized("secret", "/mcp?token=secret", &[]));
         assert!(!authorized("secret", "/mcp", &[]));
+    }
+
+    #[test]
+    fn attachment_allowlist_blocks_everything_when_empty() {
+        // No attachments this turn -> no absolute path is reachable, whatever
+        // it is. MCP bridge and code mode always run with an empty list.
+        let target = PathBuf::from("C:\\Users\\haris\\Desktop\\notes.txt");
+        assert!(!attachments_allow(&target, &[]));
+    }
+
+    #[test]
+    fn attachment_allowlist_matches_attached_file_and_folder() {
+        let dir = std::env::temp_dir().join(format!("ronic-attach-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("spec.txt");
+        fs::write(&file, "reference").unwrap();
+        let canon = file.canonicalize().unwrap();
+        let attached = vec![file.to_string_lossy().to_string()];
+        // Exact attached file is reachable.
+        assert!(attachments_allow(&canon, &attached));
+        // A sibling the user did not attach is not.
+        let sibling = dir.join("other.txt");
+        fs::write(&sibling, "nope").unwrap();
+        assert!(!attachments_allow(&sibling.canonicalize().unwrap(), &attached));
+        // When the *folder* was attached, files inside it are reachable.
+        let folder_attached = vec![dir.to_string_lossy().to_string()];
+        assert!(attachments_allow(&sibling.canonicalize().unwrap(), &folder_attached));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

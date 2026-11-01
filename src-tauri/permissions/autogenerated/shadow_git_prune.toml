@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-shadow-git-prune"
+description = "Enables the shadow_git_prune command without any pre-configured scope."
+commands.allow = ["shadow_git_prune"]
+
+[[permission]]
+identifier = "deny-shadow-git-prune"
+description = "Denies the shadow_git_prune command without any pre-configured scope."
+commands.deny = ["shadow_git_prune"]

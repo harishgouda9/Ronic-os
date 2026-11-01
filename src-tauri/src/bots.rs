@@ -14,12 +14,15 @@ pub struct BotFlags {
     pub soul: String,
     pub role: String,
     pub primary: String,
+    pub engine_kind: String,
+    pub api_model: String,
     pub allow_code: bool,
     pub allow_computer: bool,
     pub allow_browser: bool,
     pub allow_file: bool,
     pub require_external: bool,
     pub require_wallet: bool,
+    pub approval_mode: String,
     pub stall_ms: i64,
     pub takeover: bool,
 }
@@ -75,7 +78,7 @@ fn fill_screen(conn: &Connection, profile: &mut BotProfile) {
 
 pub fn flags(conn: &Connection, id: &str) -> Result<BotFlags> {
     let row = conn.query_row(
-        "SELECT handle, soul_markdown, primary_account_id, allow_code_exec, allow_computer_use, allow_browser_use, allow_file_write, require_approval_external, require_approval_wallet, stall_timeout_ms, role FROM bot_profiles WHERE id=?1",
+        "SELECT handle, soul_markdown, primary_account_id, allow_code_exec, allow_computer_use, allow_browser_use, allow_file_write, require_approval_external, require_approval_wallet, stall_timeout_ms, role, engine_kind, api_model, approval_mode FROM bot_profiles WHERE id=?1",
         params![id],
         |row| {
             Ok((
@@ -90,6 +93,9 @@ pub fn flags(conn: &Connection, id: &str) -> Result<BotFlags> {
                 row.get::<_, i64>(8)?,
                 row.get::<_, i64>(9)?,
                 row.get::<_, String>(10)?,
+                row.get::<_, String>(11)?,
+                row.get::<_, String>(12)?,
+                row.get::<_, String>(13)?,
             ))
         },
     ).map_err(|_| err("profile not found"))?;
@@ -98,12 +104,15 @@ pub fn flags(conn: &Connection, id: &str) -> Result<BotFlags> {
         handle: row.0,
         soul: row.1,
         primary: row.2,
+        engine_kind: row.11,
+        api_model: row.12,
         allow_code: row.3 != 0,
         allow_computer: row.4 != 0,
         allow_browser: row.5 != 0,
         allow_file: row.6 != 0,
         require_external: row.7 != 0,
         require_wallet: row.8 != 0,
+        approval_mode: if row.13.is_empty() { "ask".to_string() } else { row.13 },
         stall_ms: if row.9 <= 0 { 45_000 } else { row.9 },
         takeover: kv_get(conn, &takeover_key(id))?.as_deref() == Some("1"),
         role: row.10,
@@ -626,7 +635,12 @@ mod tests {
     use crate::db;
 
     fn temp_db() -> (std::path::PathBuf, Connection) {
-        let home = std::env::temp_dir().join(format!("omni-bots-{}-{}", std::process::id(), now_ms()));
+        // Two tests can start inside the same millisecond; the sequence number
+        // keeps their temp homes (and state.db files) from colliding.
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let unique = SEQ.fetch_add(1, Ordering::SeqCst);
+        let home = std::env::temp_dir().join(format!("ronic-bots-{}-{}-{}", std::process::id(), now_ms(), unique));
         let _ = fs::remove_dir_all(&home);
         fs::create_dir_all(&home).unwrap();
         let conn = db::open(&home.join("state.db")).unwrap();
@@ -640,6 +654,24 @@ mod tests {
             "INSERT INTO bot_profiles (id, handle, display_name, avatar, soul_markdown, primary_account_id, long_context_account_id, fallback_account_id, created_at) VALUES (?1,?2,?2,'NW','soul','prov_ollama','prov_gemini','prov_openrouter',1)",
             params![id, handle],
         ).unwrap();
+    }
+
+    #[test]
+    fn cloud_bot_engine_columns_round_trip() {
+        let (_home, conn) = temp_db();
+        bot(&conn, "bot_x", "@grokbot");
+        conn.execute(
+            "UPDATE bot_profiles SET engine_kind = 'openai_api', api_base = 'https://api.x.ai/v1', api_model = 'grok-4', primary_account_id = 'botprov_grokbot', run_status = 'ready', status_line = 'Live endpoint · grok-4' WHERE id = 'bot_x'",
+            [],
+        ).unwrap();
+        let flags = flags(&conn, "bot_x").unwrap();
+        assert_eq!(flags.engine_kind, "openai_api");
+        assert_eq!(flags.api_model, "grok-4");
+        assert_eq!(flags.primary, "botprov_grokbot");
+        let (kind, base, model): (String, String, String) = conn
+            .query_row("SELECT engine_kind, api_base, api_model FROM bot_profiles WHERE id = 'bot_x'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap();
+        assert_eq!((kind.as_str(), base.as_str(), model.as_str()), ("openai_api", "https://api.x.ai/v1", "grok-4"));
     }
 
     #[test]

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-add-sandbox-funds"
+description = "Enables the add_sandbox_funds command without any pre-configured scope."
+commands.allow = ["add_sandbox_funds"]
+
+[[permission]]
+identifier = "deny-add-sandbox-funds"
+description = "Denies the add_sandbox_funds command without any pre-configured scope."
+commands.deny = ["add_sandbox_funds"]

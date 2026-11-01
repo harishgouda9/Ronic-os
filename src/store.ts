@@ -13,6 +13,15 @@ const KNOWN_SCREENS: readonly ScreenId[] = [
   "capabilities",
 ];
 
+type QueuedMessage = {
+  id: string;
+  text: string;
+  files: string[];
+  queuedAt: number;
+};
+
+export type ApprovalMode = "auto" | "ask" | "manual";
+
 type State = {
   snap: Snapshot | null;
   screen: ScreenId;
@@ -26,6 +35,9 @@ type State = {
   recovering: boolean;
   pending: string | null;
   generation: number;
+  messageQueue: QueuedMessage[];
+  approvalMode: ApprovalMode;
+  setApprovalMode: (mode: ApprovalMode) => void;
   boot: () => Promise<void>;
   go: (screen: ScreenId) => void;
   run: (cmd: string, args?: Record<string, unknown>) => Promise<CommandResult | null>;
@@ -37,9 +49,13 @@ type State = {
   terminal: boolean;
   setTerminal: (open: boolean) => void;
   toggleTerminal: () => void;
+  queueMessage: (text: string, files: string[]) => void;
+  dequeueMessage: () => QueuedMessage | null;
+  removeFromQueue: (id: string) => void;
+  clearQueue: () => void;
 };
 
-export const useOmni = create<State>((set, get) => ({
+export const useRonic = create<State>((set, get) => ({
   snap: null,
   screen: "onboarding",
   loading: true,
@@ -55,6 +71,32 @@ export const useOmni = create<State>((set, get) => ({
   recovering: false,
   pending: null,
   generation: 0,
+  messageQueue: [],
+  approvalMode: (typeof window !== "undefined" && (localStorage.getItem("ronic.approvalMode") as ApprovalMode)) || "auto",
+  setApprovalMode: (mode) => {
+    try {
+      localStorage.setItem("ronic.approvalMode", mode);
+    } catch {}
+    set({ approvalMode: mode });
+  },
+  queueMessage: (text, files) => {
+    const msg: QueuedMessage = {
+      id: `queued_${Date.now()}_${Math.random().toString(16).slice(2)}`,
+      text,
+      files,
+      queuedAt: Date.now(),
+    };
+    set((state) => ({ messageQueue: [...state.messageQueue, msg] }));
+  },
+  dequeueMessage: () => {
+    const queue = get().messageQueue;
+    if (queue.length === 0) return null;
+    const [first, ...rest] = queue;
+    set({ messageQueue: rest });
+    return first;
+  },
+  removeFromQueue: (id) => set((state) => ({ messageQueue: state.messageQueue.filter((m) => m.id !== id) })),
+  clearQueue: () => set({ messageQueue: [] }),
   boot: () => {
     generation += 1;
     const ticket = generation;
@@ -63,7 +105,7 @@ export const useOmni = create<State>((set, get) => ({
       try {
         const res = await call("bootstrap");
         if (ticket !== generation) return false;
-        const saved = sessionStorage.getItem("omni.screen") as ScreenId | null;
+        const saved = sessionStorage.getItem("ronic.screen") as ScreenId | null;
         const known = new Set<string>(KNOWN_SCREENS);
         const stored = saved && known.has(saved) ? saved : null;
         const screen = res.snapshot.onboardingComplete ? stored || "chat" : "onboarding";
@@ -80,10 +122,11 @@ export const useOmni = create<State>((set, get) => ({
       }
     }).then((ready) => {
       if (ready && ticket === generation) scanMachine();
+      startSnapshotPolling();
     });
   },
   go: (screen) => {
-    sessionStorage.setItem("omni.screen", screen);
+    sessionStorage.setItem("ronic.screen", screen);
     set({ screen, palette: false });
   },
   run: async (cmd, args) => {
@@ -165,21 +208,67 @@ function scanMachine() {
   const ticket = generation;
   void enqueue(async () => {
     if (ticket !== generation) return;
-    const baseline = useOmni.getState().snap;
+    const baseline = useRonic.getState().snap;
     if (!baseline) return;
     try {
       const scanned = await call("scan_environment");
       if (ticket !== generation) return;
-      const current = useOmni.getState().snap;
+      const current = useRonic.getState().snap;
       if (current !== baseline) {
         const fresh = await call("refresh_workspace");
         if (ticket !== generation) return;
-        useOmni.setState({ snap: fresh.snapshot, toast: scanned.toast });
+        useRonic.setState({ snap: fresh.snapshot, toast: scanned.toast });
         return;
       }
-      useOmni.setState({ snap: scanned.snapshot, toast: scanned.toast });
+      useRonic.setState({ snap: scanned.snapshot, toast: scanned.toast });
     } catch {
       /* a missed scan leaves the last snapshot in place */
     }
   });
+}
+
+// Live snapshot poll: the sentinel fleet rescans every 30s in the background
+// and run states move without user input, so the UI refreshes on a slow tick
+// instead of only when a button is pressed. While a model turn is in flight
+// (pending is set) the poll keeps running so the live "bot is working on X"
+// indicator updates in real time — the kernel is read-only between commands,
+// so snapshot_poll cannot race the model call. A missed poll is a no-op.
+let pollTimer: ReturnType<typeof setInterval> | null = null;
+const POLL_MS = 4000;
+const POLL_BUSY_MS = 1500;
+
+export function startSnapshotPolling() {
+  if (pollTimer || !isTauri()) return;
+  const tick = () => {
+    const { snap, busy, recovering, loading, pending } = useRonic.getState();
+    const modelTurnInFlight = pending === "send_message" || pending === "run_routine" || pending === "resolve_gateway";
+    const nextDelay = modelTurnInFlight ? POLL_BUSY_MS : POLL_MS;
+    pollTimer = setTimeout(tick, nextDelay);
+    void (async () => {
+      if (!snap || !snap.vaultUnlocked || recovering || loading) return;
+      // During a model turn the snapshot poll stays live so turnActivity
+      // updates stream through; otherwise a busy app skips to avoid racing
+      // mutating commands.
+      if (!modelTurnInFlight && (busy || depth > 0)) return;
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+      try {
+        const res = await call("snapshot_poll");
+        if (!modelTurnInFlight && depth > 0) return;
+        const latestPending = useRonic.getState().pending;
+        const stillBusy = latestPending === "send_message" || latestPending === "run_routine" || latestPending === "resolve_gateway";
+        if (!stillBusy && useRonic.getState().busy) return;
+        // Merge by stable key, not length: always take the server's persisted
+        // step list (so finished turns drop their turn_activity markers) and
+        // only re-attach the client's own optimistic bubbles on top.
+        const prevSnap = useRonic.getState().snap;
+        const nextSnap = prevSnap
+          ? { ...res.snapshot, steps: [...res.snapshot.steps, ...prevSnap.steps.filter((s) => s.id.startsWith("optimistic_"))] }
+          : res.snapshot;
+        useRonic.setState({ snap: nextSnap });
+      } catch {
+        /* a missed poll leaves the last snapshot in place */
+      }
+    })();
+  };
+  pollTimer = setTimeout(tick, POLL_MS);
 }

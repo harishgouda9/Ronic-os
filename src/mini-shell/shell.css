@@ -1,0 +1,1154 @@
+/* Ronic Mini Computer shell — the per-bot desktop inside ronic_mini_comp_*.
+   Everything is scoped under .msh-root so the same components + stylesheet can
+   render inside the mini computer's own window AND embedded in the chat dock.
+   Light is the default theme; .msh-dark flips the palette. */
+
+.msh-root {
+  --msh-bg: #f2f3f9;
+  --msh-bg-2: #e9ebf5;
+  --msh-surface: #ffffff;
+  --msh-surface-2: #f6f6fd;
+  --msh-border: #dcdcee;
+  --msh-ink: #1b1c30;
+  --msh-muted: #676b88;
+  --msh-brand: #7c3aed;
+  --msh-brand-soft: rgba(124, 58, 237, 0.12);
+  --msh-green: #0d9d6b;
+  --msh-red: #d64c4c;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  color: var(--msh-ink);
+  font: 13px/1.45 "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  background:
+    radial-gradient(1200px 500px at 85% -10%, rgba(124, 58, 237, 0.10), transparent 60%),
+    radial-gradient(900px 420px at -10% 110%, rgba(13, 157, 107, 0.06), transparent 55%),
+    var(--msh-bg);
+}
+
+.msh-root.msh-dark {
+  --msh-bg: #0b0b12;
+  --msh-bg-2: #101019;
+  --msh-surface: #14141f;
+  --msh-surface-2: #1a1a28;
+  --msh-border: #262637;
+  --msh-ink: #ececf4;
+  --msh-muted: #8e8ea8;
+  --msh-brand: #8b5cf6;
+  --msh-brand-soft: rgba(139, 92, 246, 0.16);
+  --msh-green: #10b981;
+  --msh-red: #f87171;
+  background:
+    radial-gradient(1200px 500px at 85% -10%, rgba(139, 92, 246, 0.14), transparent 60%),
+    radial-gradient(900px 420px at -10% 110%, rgba(16, 185, 129, 0.07), transparent 55%),
+    var(--msh-bg);
+}
+
+/* The standalone mini computer window (html.msh-window is set by the shell
+   app on mount; the embedded chat-dock panel never touches html/body). */
+html.msh-window,
+html.msh-window body,
+html.msh-window #root {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+}
+
+html.msh-window body {
+  background: #f2f3f9;
+}
+
+html.msh-window[data-msh-theme="dark"] body {
+  background: #0b0b12;
+}
+
+.msh-center {
+  align-items: center;
+  justify-content: center;
+}
+
+.msh-stage {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+}
+
+.msh-appview {
+  position: absolute;
+  inset: 0;
+  visibility: hidden;
+}
+.msh-appview.on {
+  visibility: visible;
+}
+
+.msh-boot-hint {
+  color: var(--msh-muted);
+  font-size: 13px;
+}
+
+/* ---------- desktop ---------- */
+
+.msh-desktop {
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  overflow-y: auto;
+}
+
+.msh-welcome-card {
+  width: min(560px, 92%);
+  background: linear-gradient(180deg, var(--msh-brand-soft), var(--msh-surface));
+  border: 1px solid var(--msh-border);
+  border-radius: 16px;
+  padding: 26px 28px 22px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.45);
+}
+
+.msh-welcome-kicker {
+  margin: 0;
+  color: var(--msh-brand);
+  font-weight: 600;
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.msh-welcome-card h1 {
+  margin: 6px 0 8px;
+  font-size: 22px;
+  letter-spacing: -0.01em;
+}
+
+.msh-welcome-sub {
+  margin: 0 0 18px;
+  color: var(--msh-muted);
+  font-size: 12.5px;
+}
+
+.msh-shortcuts {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+  margin-bottom: 18px;
+}
+
+.msh-tile {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 14px 10px;
+  background: var(--msh-surface);
+  border: 1px solid var(--msh-border);
+  border-radius: 14px;
+  color: var(--msh-ink);
+  cursor: pointer;
+  text-align: center;
+  transition: all 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04);
+}
+.msh-tile:hover {
+  border-color: var(--msh-brand);
+  transform: translateY(-2px);
+  box-shadow: 0 8px 20px rgba(124, 58, 237, 0.14);
+}
+.msh-tile-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  border-radius: 10px;
+  transition: transform 0.18s ease;
+}
+.msh-tile:hover .msh-tile-icon {
+  transform: scale(1.08);
+}
+.msh-tile-label {
+  font-weight: 600;
+  font-size: 12px;
+  letter-spacing: -0.01em;
+  color: var(--msh-ink);
+}
+
+.msh-facts {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.msh-facts > div {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  min-width: 0;
+}
+.msh-facts dt {
+  color: var(--msh-muted);
+  font-size: 11px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+}
+.msh-facts dd {
+  margin: 0;
+  font-size: 11px;
+  color: var(--msh-ink);
+  font-family: "Cascadia Mono", Consolas, monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---------- taskbar ---------- */
+
+.msh-taskbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  height: 44px;
+  padding: 0 12px;
+  background: var(--msh-surface);
+  border-top: 1px solid var(--msh-border);
+  backdrop-filter: blur(10px);
+  white-space: nowrap;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.msh-taskbar-bot {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-weight: 600;
+  font-size: 12px;
+  min-width: 0;
+}
+
+.msh-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--msh-green);
+  box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.18);
+}
+
+.msh-taskbar-apps {
+  display: flex;
+  gap: 4px;
+  flex: 1;
+  justify-content: center;
+}
+
+.msh-taskbar-app {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--msh-muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+.msh-taskbar-app:hover {
+  color: var(--msh-ink);
+  background: var(--msh-surface);
+}
+.msh-taskbar-app.on {
+  color: var(--msh-ink);
+  background: var(--msh-brand-soft);
+  border-color: rgba(139, 92, 246, 0.4);
+}
+
+.msh-tabcount {
+  background: var(--msh-brand);
+  color: #fff;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 0 6px;
+  line-height: 15px;
+}
+
+.msh-taskbar-pill {
+  color: var(--msh-muted);
+  font-size: 10.5px;
+  font-family: "Cascadia Mono", Consolas, monospace;
+}
+
+/* ---------- chrome app ---------- */
+
+.msh-chrome {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.msh-tabstrip {
+  display: flex;
+  align-items: flex-end;
+  gap: 4px;
+  padding: 8px 10px 0;
+  background: var(--msh-bg-2);
+  min-height: 40px;
+}
+.msh-root.msh-dark .msh-tabstrip {
+  background: var(--msh-bg-2);
+}
+
+.msh-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 210px;
+  padding: 7px 10px;
+  border: 1px solid transparent;
+  border-bottom: 0;
+  border-radius: 9px 9px 0 0;
+  background: transparent;
+  color: var(--msh-muted);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.msh-tab:hover {
+  background: var(--msh-surface);
+}
+.msh-tab.on {
+  background: var(--msh-surface-2);
+  border-color: var(--msh-border);
+  color: var(--msh-ink);
+}
+
+.msh-tab-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.msh-tab-close {
+  border: 0;
+  background: transparent;
+  color: var(--msh-muted);
+  border-radius: 5px;
+  padding: 2px;
+  cursor: pointer;
+  display: inline-flex;
+}
+.msh-tab-close:hover {
+  background: rgba(248, 113, 113, 0.16);
+  color: var(--msh-red);
+}
+
+.msh-tab-new {
+  border: 0;
+  background: transparent;
+  color: var(--msh-muted);
+  padding: 6px 8px;
+  margin-bottom: 3px;
+  border-radius: 7px;
+  cursor: pointer;
+  display: inline-flex;
+}
+.msh-tab-new:hover {
+  background: var(--msh-surface);
+  color: var(--msh-ink);
+}
+
+.msh-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 10px;
+  background: var(--msh-surface-2);
+  border-bottom: 1px solid var(--msh-border);
+}
+
+.msh-tool {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--msh-muted);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.msh-tool:hover:not(:disabled) {
+  color: var(--msh-ink);
+  background: var(--msh-bg-2);
+}
+.msh-tool:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.msh-tool.ok {
+  color: var(--msh-green);
+}
+.msh-tool.danger:hover {
+  color: var(--msh-red);
+  background: rgba(248, 113, 113, 0.12);
+}
+
+.msh-address {
+  flex: 1;
+  min-width: 0;
+  height: 28px;
+  border-radius: 999px;
+  border: 1px solid var(--msh-border);
+  background: var(--msh-bg);
+  color: var(--msh-ink);
+  padding: 0 14px;
+  font-size: 12px;
+  outline: none;
+}
+.msh-address:focus {
+  border-color: var(--msh-brand);
+  box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.18);
+}
+
+.msh-profile-chip {
+  flex-shrink: 0;
+  font-size: 10.5px;
+  color: var(--msh-muted);
+  border: 1px solid var(--msh-border);
+  border-radius: 999px;
+  padding: 3px 9px;
+}
+
+/* The region the real browser webview covers — Rust positions it here. */
+.msh-page-area {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  background: var(--msh-bg);
+}
+
+.msh-page-empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  color: var(--msh-muted);
+}
+.msh-page-empty p {
+  margin: 0;
+  font-weight: 600;
+  color: var(--msh-ink);
+}
+.msh-page-empty span {
+  font-size: 11.5px;
+}
+
+/* ---------- files app ---------- */
+
+.msh-files {
+  height: 100%;
+  display: grid;
+  grid-template-columns: 218px 1fr;
+}
+
+.msh-files-side {
+  border-right: 1px solid var(--msh-border);
+  background: var(--msh-surface-2);
+  padding: 14px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.msh-side-label {
+  margin: 0 0 4px;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--msh-muted);
+}
+
+.msh-side-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--msh-ink);
+  font-size: 12.5px;
+  cursor: pointer;
+  text-align: left;
+}
+.msh-side-item:hover {
+  background: var(--msh-surface);
+}
+.msh-side-item.on {
+  background: var(--msh-brand-soft);
+  color: var(--msh-ink);
+}
+
+.msh-side-path {
+  margin: 10px 2px 0;
+  font-size: 9.5px;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  color: var(--msh-muted);
+  word-break: break-all;
+}
+
+.msh-side-note {
+  margin: auto 2px 0;
+  font-size: 10.5px;
+  color: var(--msh-muted);
+}
+
+.msh-files-main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+.msh-files-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--msh-border);
+}
+
+.msh-crumbs {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  overflow: hidden;
+  flex: 1;
+  min-width: 0;
+}
+
+.msh-crumb {
+  border: 0;
+  background: transparent;
+  color: var(--msh-muted);
+  font-size: 12px;
+  padding: 3px 7px;
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.msh-crumb:hover {
+  color: var(--msh-ink);
+  background: var(--msh-surface);
+}
+.msh-crumb::after {
+  content: "›";
+  margin-left: 7px;
+  color: var(--msh-border);
+}
+.msh-crumb:last-child::after {
+  content: none;
+}
+
+.msh-inline-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--msh-border);
+}
+.msh-inline-row.grow {
+  flex: 1;
+}
+.msh-inline-row input {
+  flex: 1;
+  min-width: 0;
+  height: 26px;
+  border-radius: 7px;
+  border: 1px solid var(--msh-border);
+  background: var(--msh-bg);
+  color: var(--msh-ink);
+  padding: 0 10px;
+  font-size: 12px;
+  outline: none;
+}
+.msh-inline-row input:focus {
+  border-color: var(--msh-brand);
+}
+
+.msh-files-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  overflow: hidden;
+}
+
+.msh-list {
+  flex: 1.4;
+  min-width: 0;
+  margin: 0;
+  padding: 6px;
+  list-style: none;
+  overflow: auto;
+}
+
+.msh-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  border-radius: 8px;
+  padding: 2px 4px;
+}
+.msh-row:hover {
+  background: var(--msh-surface);
+}
+.msh-row.on {
+  background: var(--msh-brand-soft);
+}
+
+.msh-row-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  border: 0;
+  background: transparent;
+  color: var(--msh-ink);
+  padding: 6px 8px;
+  font-size: 12.5px;
+  cursor: pointer;
+  text-align: left;
+}
+.msh-row-main svg {
+  color: var(--msh-brand);
+  flex-shrink: 0;
+}
+
+.msh-row-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.msh-row-meta {
+  margin-left: auto;
+  color: var(--msh-muted);
+  font-size: 10.5px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.msh-row-act {
+  border: 0;
+  background: transparent;
+  color: var(--msh-muted);
+  font-size: 11px;
+  padding: 4px 7px;
+  border-radius: 6px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+.msh-row-act:hover {
+  color: var(--msh-ink);
+  background: var(--msh-bg-2);
+}
+.msh-row-act.danger:hover {
+  color: var(--msh-red);
+  background: rgba(248, 113, 113, 0.12);
+}
+
+.msh-empty {
+  color: var(--msh-muted);
+  font-size: 12px;
+  padding: 14px 10px;
+  list-style: none;
+}
+
+.msh-detail {
+  width: 308px;
+  flex-shrink: 0;
+  border-left: 1px solid var(--msh-border);
+  background: var(--msh-surface);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.msh-detail-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 10px 6px;
+}
+
+.msh-detail-name {
+  flex: 1;
+  min-width: 0;
+  font-weight: 600;
+  font-size: 12.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.msh-detail-meta {
+  margin: 0 10px 8px;
+  color: var(--msh-muted);
+  font-size: 10.5px;
+  font-family: "Cascadia Mono", Consolas, monospace;
+}
+
+.msh-editor {
+  flex: 1;
+  min-height: 0;
+  margin: 0 10px 8px;
+  border-radius: 9px;
+  border: 1px solid var(--msh-border);
+  background: var(--msh-bg);
+  color: var(--msh-ink);
+  font: 11.5px/1.5 "Cascadia Mono", Consolas, monospace;
+  padding: 10px;
+  resize: none;
+  outline: none;
+}
+.msh-editor:focus {
+  border-color: var(--msh-brand);
+}
+
+.msh-save-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 10px 12px;
+  padding: 7px 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(139, 92, 246, 0.45);
+  background: var(--msh-brand-soft);
+  color: var(--msh-ink);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  text-decoration: none;
+  width: fit-content;
+}
+.msh-save-btn:hover:not(:disabled) {
+  background: rgba(139, 92, 246, 0.28);
+}
+.msh-save-btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.msh-image {
+  max-width: calc(100% - 20px);
+  max-height: 46%;
+  margin: 0 10px 10px;
+  border-radius: 9px;
+  border: 1px solid var(--msh-border);
+}
+
+/* ---------- media tools (mediabunny) ---------- */
+
+.msh-media {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 0 0 4px;
+  overflow: auto;
+}
+
+.msh-media-thumb {
+  width: calc(100% - 20px);
+  margin: 0 10px;
+  border-radius: 9px;
+  border: 1px solid var(--msh-border);
+}
+
+.msh-media-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 10px;
+}
+.msh-media-row label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--msh-muted);
+  font-size: 11px;
+}
+.msh-media-row input {
+  width: 58px;
+  height: 24px;
+  border-radius: 6px;
+  border: 1px solid var(--msh-border);
+  background: var(--msh-bg);
+  color: var(--msh-ink);
+  padding: 0 7px;
+  font-size: 11px;
+  outline: none;
+}
+.msh-media-row input:focus {
+  border-color: var(--msh-brand);
+}
+
+.msh-media-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin: 0 10px;
+}
+
+.msh-media-progress {
+  margin: 0 10px;
+  color: var(--msh-brand);
+  font-size: 11.5px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.msh-media-result {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 4px;
+}
+.msh-media-video {
+  width: calc(100% - 20px);
+  margin: 0 10px;
+  border-radius: 9px;
+  border: 1px solid var(--msh-border);
+  background: #000;
+}
+
+.msh-error {
+  margin: 0 10px 10px;
+  color: var(--msh-red);
+  font-size: 11.5px;
+}
+
+/* ---------- terminal ---------- */
+
+.msh-terminal {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.msh-terminal-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--msh-border);
+  background: var(--msh-surface-2);
+}
+
+.msh-terminal-title {
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 10.5px;
+  color: var(--msh-ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.msh-terminal-note {
+  flex: 1;
+  min-width: 0;
+  color: var(--msh-muted);
+  font-size: 10.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.msh-terminal-host {
+  flex: 1;
+  min-height: 0;
+  padding: 6px 8px;
+}
+.msh-terminal-host .xterm {
+  height: 100%;
+}
+
+/* keep the xterm canvas laid out while hidden so switching apps is instant */
+.offscreen-park {
+  position: absolute;
+  left: -9999px;
+  top: 0;
+  width: 100%;
+  height: 100%;
+}
+
+/* ---------- shared ---------- */
+
+.msh-spin {
+  animation: msh-rotate 0.9s linear infinite;
+}
+@keyframes msh-rotate {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.msh-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 56px;
+  transform: translateX(-50%);
+  z-index: 40;
+  background: var(--msh-surface);
+  color: var(--msh-red);
+  border: 1px solid var(--msh-red);
+  padding: 8px 14px;
+  border-radius: 10px;
+  font-size: 12px;
+  max-width: 80%;
+  cursor: pointer;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
+}
+
+
+/* ---------- embedded panel (chat dock) ---------- */
+
+.msh-panel-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--msh-border);
+  background: var(--msh-surface-2);
+}
+
+.msh-panel-title {
+  flex: 1;
+  min-width: 0;
+  font-weight: 600;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.msh-panel-foot {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 8px;
+  border-top: 1px solid var(--msh-border);
+  background: var(--msh-surface);
+}
+
+.msh-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--msh-border);
+  background: transparent;
+  color: var(--msh-muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+.msh-chip:hover {
+  color: var(--msh-ink);
+  background: var(--msh-surface-2);
+}
+.msh-chip.on {
+  color: var(--msh-ink);
+  background: var(--msh-brand-soft);
+  border-color: rgba(124, 58, 237, 0.45);
+}
+
+/* compact files: no sidebar, detail overlays the list */
+.msh-compact .msh-files {
+  grid-template-columns: 1fr;
+}
+.msh-compact .msh-files-side {
+  display: none;
+}
+.msh-compact .msh-files-body {
+  position: relative;
+}
+.msh-compact .msh-detail {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  width: auto;
+  border-left: 0;
+  background: var(--msh-surface);
+}
+.msh-compact .msh-desktop {
+  padding: 12px 10px;
+  align-items: flex-start;
+  overflow-y: auto;
+}
+.msh-compact .msh-welcome-card {
+  padding: 16px 14px 12px;
+  width: 100%;
+}
+.msh-compact .msh-shortcuts {
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.msh-compact .msh-tile {
+  padding: 10px 4px 8px;
+  gap: 4px;
+  border-radius: 10px;
+}
+.msh-compact .msh-tile-icon {
+  width: 36px;
+  height: 36px;
+}
+.msh-compact .msh-tile-label {
+  font-size: 11px;
+}
+.msh-compact .msh-taskbar {
+  gap: 6px;
+  padding: 0 8px;
+  height: 38px;
+}
+.msh-compact .msh-taskbar-pill {
+  display: none;
+}
+.msh-compact .msh-taskbar-bot {
+  max-width: 70px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+}
+.msh-compact .msh-taskbar-app {
+  padding: 4px 6px;
+  font-size: 11px;
+  gap: 4px;
+}
+.msh-compact .theme-btn {
+  padding: 4px 6px;
+  font-size: 11px;
+}
+.msh-compact .msh-facts {
+  display: none;
+}
+.msh-compact .msh-profile-chip {
+  display: none;
+}
+.msh-compact .msh-toolbar {
+  gap: 3px;
+  padding-left: 6px;
+  padding-right: 6px;
+}
+.msh-compact .msh-address {
+  padding-left: 9px;
+  padding-right: 9px;
+  font-size: 11px;
+}
+
+/* ---------- chrome dropdowns (bookmarks / history) ---------- */
+
+.msh-drop-wrap {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.msh-drop {
+  position: absolute;
+  right: 0;
+  top: 30px;
+  z-index: 30;
+  width: 250px;
+  max-height: 300px;
+  overflow: auto;
+  background: var(--msh-surface);
+  border: 1px solid var(--msh-border);
+  border-radius: 10px;
+  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.22);
+  padding: 4px;
+}
+
+.msh-drop-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 5px 8px;
+  color: var(--msh-muted);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.msh-drop-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: var(--msh-ink);
+  text-align: left;
+  padding: 6px 8px;
+  border-radius: 7px;
+  cursor: pointer;
+  font-size: 11.5px;
+}
+.msh-drop-row:hover {
+  background: var(--msh-brand-soft);
+}
+.msh-drop-row .msh-drop-url {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.msh-drop-x {
+  border: 0;
+  background: transparent;
+  color: var(--msh-muted);
+  border-radius: 5px;
+  padding: 2px;
+  display: inline-flex;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.msh-drop-x:hover {
+  color: var(--msh-red);
+  background: rgba(248, 113, 113, 0.12);
+}
+.msh-drop-empty {
+  color: var(--msh-muted);
+  font-size: 11px;
+  padding: 8px 10px;
+}
+
+.msh-tool.starred {
+  color: var(--msh-brand);
+}
+
+.msh-tool.theme-btn {
+  width: auto;
+  padding: 0 8px;
+  gap: 5px;
+  font-size: 11px;
+}

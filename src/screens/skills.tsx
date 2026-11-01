@@ -18,21 +18,22 @@ import {
 } from "lucide-react";
 import {
   enabledFor,
+  mcpEnabledFor,
   estimateTokens,
   inIndex,
   proposedDiff,
   skillTemplate,
 } from "../kernel/skillIndex";
 import type { McpServer, PluginPackage, Skill } from "../types";
-import { useOmni } from "../store";
+import { useRonic } from "../store";
 import { Pill } from "../ui/bits";
 import { AppLogo } from "../ui/appLogos";
 import { pickPaths } from "../api";
 
 export function Skills() {
-  const snap = useOmni((s) => s.snap)!;
-  const run = useOmni((s) => s.run);
-  const busy = useOmni((s) => s.busy);
+  const snap = useRonic((s) => s.snap)!;
+  const run = useRonic((s) => s.run);
+  const busy = useRonic((s) => s.busy);
 
   // Studio Sub-tabs: Skills | Plugins | MCP Servers | Author & Add
   const [activeTab, setActiveTab] = useState<"skills" | "plugins" | "mcp" | "author">("skills");
@@ -172,68 +173,71 @@ export function Skills() {
   };
 
   return (
-    <div className="screen select-none space-y-5" style={{ maxWidth: 1440, margin: "0 auto", paddingBottom: 48 }}>
-      {/* =====================================================================
-          1. HEADER BAR & GLOBAL ACTIONS
-         ===================================================================== */}
-      <div className="flex flex-wrap items-start justify-between gap-4">
-        <div className="space-y-1 max-w-2xl">
-          <div className="flex items-center gap-2.5">
-            <h1 className="text-xl font-bold tracking-tight text-[#0F172A]">Skills & Capabilities</h1>
-            <span className="px-2 py-0.5 text-[11px] font-semibold bg-slate-100 text-slate-700 border border-slate-200 rounded-full">
-              {snap.skills.length} skills
-            </span>
-            <span className="px-2 py-0.5 text-[11px] font-semibold bg-slate-100 text-slate-700 border border-slate-200 rounded-full">
-              {snap.plugins.length} plugins
-            </span>
-            <span className="px-2 py-0.5 text-[11px] font-semibold bg-slate-100 text-slate-700 border border-slate-200 rounded-full">
-              {snap.mcpServers.length} MCP servers
-            </span>
+    <div className="flex-1 h-full bg-[#eceef2] p-3 sm:p-5 lg:p-6 overflow-y-auto select-none flex flex-col">
+      <div className="w-full max-w-[1560px] flex-1 min-h-[660px] bg-white rounded-3xl shadow-[0_12px_40px_-8px_rgba(0,0,0,0.06),0_2px_8px_-1px_rgba(0,0,0,0.03)] border border-slate-200/70 flex flex-col mx-auto overflow-hidden transition-all duration-300">
+        {/* Top Header inside Floating White Card */}
+        <div className="p-5 sm:p-7 pb-4 space-y-4 border-b border-slate-100 bg-white">
+          <div className="flex flex-wrap items-start justify-between gap-4">
+            <div className="space-y-1 max-w-2xl">
+              <div className="flex items-center gap-2.5">
+                <h1 className="text-xl font-bold tracking-tight text-[#0F172A]">Skills &amp; Capabilities</h1>
+                <span className="px-2 py-0.5 text-[11px] font-semibold bg-slate-100 text-slate-700 border border-slate-200 rounded-full">
+                  {snap.skills.length} skills
+                </span>
+                <span className="px-2 py-0.5 text-[11px] font-semibold bg-slate-100 text-slate-700 border border-slate-200 rounded-full">
+                  {snap.plugins.length} plugins
+                </span>
+                <span className="px-2 py-0.5 text-[11px] font-semibold bg-slate-100 text-slate-700 border border-slate-200 rounded-full">
+                  {snap.mcpServers.length} MCP servers
+                </span>
+              </div>
+              <p className="text-xs text-[#64748B]">
+                Unified agent intelligence studio: Playbook skills, MCP tool servers, and extensible plugins with scoped permissions.
+              </p>
+            </div>
+
+            <div className="flex items-center gap-2 flex-wrap">
+              <button
+                disabled={busy}
+                onClick={() => void run("scan_project_plugins")}
+                className="px-3 py-1.5 text-xs font-semibold bg-white border border-[#E5E5E5] rounded-[6px] hover:border-slate-400 transition flex items-center gap-1.5 cursor-pointer shadow-2xs"
+              >
+                <RefreshCw size={13} /> Scan project
+              </button>
+              <button
+                onClick={() => {
+                  setAuthorKind("skill");
+                  setActiveTab("author");
+                }}
+                className="px-3 py-1.5 text-xs font-semibold bg-white border border-[#E5E5E5] rounded-[6px] hover:border-slate-400 transition flex items-center gap-1.5 cursor-pointer shadow-2xs"
+              >
+                <Plus size={13} /> New skill
+              </button>
+              <button
+                onClick={() => {
+                  setAuthorKind("mcp");
+                  setActiveTab("author");
+                }}
+                className="px-3 py-1.5 text-xs font-semibold bg-white border border-[#E5E5E5] rounded-[6px] hover:border-slate-400 transition flex items-center gap-1.5 cursor-pointer shadow-2xs"
+              >
+                <Server size={13} /> Add MCP
+              </button>
+              <button
+                onClick={() => {
+                  setAuthorKind("plugin");
+                  setActiveTab("author");
+                }}
+                className="px-3.5 py-1.5 text-xs font-semibold bg-zinc-800 hover:bg-zinc-700 text-white rounded-[6px] transition flex items-center gap-1.5 shadow-xs border border-zinc-700/50 cursor-pointer active:scale-95"
+              >
+                <Puzzle size={13} className="text-white" stroke="#ffffff" />
+                <span>New plugin</span>
+              </button>
+            </div>
           </div>
-          <p className="text-xs text-[#64748B]">
-            Unified agent intelligence studio: Playbook skills, MCP tool servers, and extensible plugins with scoped permissions.
-          </p>
         </div>
 
-        <div className="flex items-center gap-2 flex-wrap">
-          <button
-            disabled={busy}
-            onClick={() => void run("scan_project_plugins")}
-            className="px-3 py-1.5 text-xs font-semibold bg-white border border-[#E5E5E5] rounded-[6px] hover:border-slate-400 transition flex items-center gap-1.5"
-          >
-            <RefreshCw size={13} /> Scan project
-          </button>
-          <button
-            onClick={() => {
-              setAuthorKind("skill");
-              setActiveTab("author");
-            }}
-            className="px-3 py-1.5 text-xs font-semibold bg-white border border-[#E5E5E5] rounded-[6px] hover:border-slate-400 transition flex items-center gap-1.5"
-          >
-            <Plus size={13} /> New skill
-          </button>
-          <button
-            onClick={() => {
-              setAuthorKind("mcp");
-              setActiveTab("author");
-            }}
-            className="px-3 py-1.5 text-xs font-semibold bg-white border border-[#E5E5E5] rounded-[6px] hover:border-slate-400 transition flex items-center gap-1.5"
-          >
-            <Server size={13} /> Add MCP
-          </button>
-          <button
-            onClick={() => {
-              setAuthorKind("plugin");
-              setActiveTab("author");
-            }}
-            className="px-3.5 py-1.5 text-xs font-semibold bg-slate-700 hover:bg-slate-800 text-white rounded-[6px] transition flex items-center gap-1.5 shadow-xs"
-            style={{ color: "#ffffff" }}
-          >
-            <Puzzle size={13} className="text-white" stroke="#ffffff" />
-            <span className="text-white" style={{ color: "#ffffff" }}>New plugin</span>
-          </button>
-        </div>
-      </div>
+        {/* Scrollable Content inside Floating White Card */}
+        <div className="flex-1 overflow-y-auto p-5 sm:p-7 space-y-6">
 
       {/* =====================================================================
           2. SCOPE SELECTOR & MAIN NAVIGATION TABS
@@ -427,13 +431,16 @@ export function Skills() {
                         {/* Profile Active Switch */}
                         <button
                           type="button"
-                          onClick={() =>
+                          disabled={busy || !profile?.id}
+                          title={profile?.id ? undefined : "Create a bot before turning a skill on"}
+                          onClick={() => {
+                            if (!profile?.id) return;
                             void run("toggle_skill", {
                               id: skill.id,
-                              profileId: profile?.id ?? "",
+                              profileId: profile.id,
                               enabled: !isOn,
-                            })
-                          }
+                            });
+                          }}
                           className={`px-2 py-0.5 text-[11px] font-semibold rounded-[4px] transition border ${
                             isOn
                               ? "bg-emerald-50 text-emerald-700 border-emerald-300"
@@ -545,7 +552,7 @@ export function Skills() {
               </button>
             </div>
             <span className="text-xs text-slate-500">
-              Folder: <code>.omniworkspace/plugins</code>
+              Folder: <code>.ronicos/plugins</code>
             </span>
           </div>
 
@@ -711,7 +718,7 @@ export function Skills() {
                   </tr>
                 ) : (
                   snap.mcpServers.map((server) => {
-                    const on = enabledFor(server.enables, profile?.id ?? "");
+                    const on = mcpEnabledFor(server.enables, profile?.id ?? "");
                     return (
                       <tr key={server.id} className="hover:bg-slate-50/60 transition">
                         <td className="py-3 px-4">
@@ -889,7 +896,7 @@ export function Skills() {
               <button
                 type="button"
                 onClick={handleCreateNewSkill}
-                className="px-4 py-2 text-xs font-semibold bg-slate-700 hover:bg-slate-800 text-white rounded-[6px] transition flex items-center gap-1.5 shadow-2xs"
+                className="px-4 py-2 text-xs font-semibold bg-zinc-800 hover:bg-zinc-700 text-white border border-zinc-700/50 shadow-xs rounded-[6px] transition flex items-center gap-1.5 shadow-2xs"
                 style={{ color: "#ffffff" }}
               >
                 <Check size={13} className="text-white" stroke="#ffffff" />
@@ -995,7 +1002,7 @@ export function Skills() {
                   setMcpTool("");
                   setActiveTab("mcp");
                 }}
-                className="px-4 py-2 text-xs font-semibold bg-slate-700 hover:bg-slate-800 text-white rounded-[6px] transition flex items-center gap-1.5 shadow-2xs"
+                className="px-4 py-2 text-xs font-semibold bg-zinc-800 hover:bg-zinc-700 text-white border border-zinc-700/50 shadow-xs rounded-[6px] transition flex items-center gap-1.5 shadow-2xs"
                 style={{ color: "#ffffff" }}
               >
                 <Check size={13} className="text-white" stroke="#ffffff" />
@@ -1107,7 +1114,7 @@ export function Skills() {
                   setPlugTool("");
                   setActiveTab("plugins");
                 }}
-                className="px-4 py-2 text-xs font-semibold bg-slate-700 hover:bg-slate-800 text-white rounded-[6px] transition flex items-center gap-1.5 shadow-2xs"
+                className="px-4 py-2 text-xs font-semibold bg-zinc-800 hover:bg-zinc-700 text-white border border-zinc-700/50 shadow-xs rounded-[6px] transition flex items-center gap-1.5 shadow-2xs"
                 style={{ color: "#ffffff" }}
               >
                 <Check size={13} className="text-white" stroke="#ffffff" />
@@ -1239,24 +1246,30 @@ export function Skills() {
               <div className="flex items-center gap-2">
                 <button
                   type="button"
+                  disabled={busy || !profile?.id}
+                  title={profile?.id ? undefined : "Create a bot before turning a skill on"}
                   onClick={() => {
-                    const currentOn = enabledFor(viewingSkill.enables, profile?.id ?? "");
+                    const profileId = profile?.id;
+                    if (!profileId) return;
+                    const currentOn = enabledFor(viewingSkill.enables, profileId);
                     void run("toggle_skill", {
                       id: viewingSkill.id,
-                      profileId: profile?.id ?? "",
+                      profileId,
                       enabled: !currentOn,
+                    }).then((saved) => {
+                      if (!saved) return;
+                      setViewingSkill((prev) =>
+                        prev
+                          ? {
+                              ...prev,
+                              enables: [
+                                ...prev.enables.filter((f) => f.profileId !== profileId),
+                                { profileId, enabled: !currentOn },
+                              ],
+                            }
+                          : null
+                      );
                     });
-                    setViewingSkill((prev) =>
-                      prev
-                        ? {
-                            ...prev,
-                            enables: [
-                              ...prev.enables.filter((f) => f.profileId !== profile?.id),
-                              { profileId: profile?.id ?? "", enabled: !currentOn },
-                            ],
-                          }
-                        : null
-                    );
                   }}
                   className={`px-3 py-1.5 text-xs font-semibold rounded-[5px] border transition ${
                     enabledFor(viewingSkill.enables, profile?.id ?? "")
@@ -1283,7 +1296,7 @@ export function Skills() {
                 <button
                   type="button"
                   onClick={() => setViewingSkill(null)}
-                  className="px-4 py-1.5 text-xs font-semibold bg-slate-700 hover:bg-slate-800 text-white rounded-[6px] transition"
+                  className="px-4 py-1.5 text-xs font-semibold bg-zinc-800 hover:bg-zinc-700 text-white border border-zinc-700/50 shadow-xs rounded-[6px] transition"
                   style={{ color: "#ffffff" }}
                 >
                   <span className="text-white" style={{ color: "#ffffff" }}>Close</span>
@@ -1354,7 +1367,7 @@ export function Skills() {
                   type="button"
                   disabled={busy}
                   onClick={() => handleSaveSkill(editingSkill, editBody)}
-                  className="px-4 py-1.5 text-xs font-semibold bg-slate-700 hover:bg-slate-800 text-white rounded-[6px] transition flex items-center gap-1.5"
+                  className="px-4 py-1.5 text-xs font-semibold bg-zinc-800 hover:bg-zinc-700 text-white border border-zinc-700/50 shadow-xs rounded-[6px] transition flex items-center gap-1.5"
                   style={{ color: "#ffffff" }}
                 >
                   <Check size={13} className="text-white" stroke="#ffffff" />
@@ -1413,7 +1426,7 @@ export function Skills() {
                   await run("trust_plugin", { id: pendingTrustPlugin.id });
                   setTrustPluginId("");
                 }}
-                className="px-4 py-1.5 text-xs font-semibold bg-slate-700 hover:bg-slate-800 text-white rounded-[6px] transition"
+                className="px-4 py-1.5 text-xs font-semibold bg-zinc-800 hover:bg-zinc-700 text-white border border-zinc-700/50 shadow-xs rounded-[6px] transition"
                 style={{ color: "#ffffff" }}
               >
                 <span className="text-white" style={{ color: "#ffffff" }}>Confirm Trust</span>
@@ -1422,6 +1435,8 @@ export function Skills() {
           </div>
         </div>
       )}
+        </div>
+      </div>
     </div>
   );
 }

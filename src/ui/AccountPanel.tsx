@@ -1,5 +1,5 @@
 import { useEffect, useState, useSyncExternalStore } from "react";
-import { useOmni } from "../store";
+import { useRonic } from "../store";
 import {
   cloudConfig,
   cloudSession,
@@ -51,8 +51,8 @@ function tierLabel(tier: string, badge: number | null): string {
 
 export function AccountPanel() {
   const session = useSyncExternalStore(subscribeCloud, cloudSession, () => null);
-  const snap = useOmni((s) => s.snap);
-  const run = useOmni((s) => s.run);
+  const snap = useRonic((s) => s.snap);
+  const run = useRonic((s) => s.run);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [name, setName] = useState("");

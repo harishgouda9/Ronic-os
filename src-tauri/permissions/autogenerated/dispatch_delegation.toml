@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-dispatch-delegation"
+description = "Enables the dispatch_delegation command without any pre-configured scope."
+commands.allow = ["dispatch_delegation"]
+
+[[permission]]
+identifier = "deny-dispatch-delegation"
+description = "Denies the dispatch_delegation command without any pre-configured scope."
+commands.deny = ["dispatch_delegation"]

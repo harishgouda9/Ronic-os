@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-execute-som-or-uia-action"
+description = "Enables the execute_som_or_uia_action command without any pre-configured scope."
+commands.allow = ["execute_som_or_uia_action"]
+
+[[permission]]
+identifier = "deny-execute-som-or-uia-action"
+description = "Denies the execute_som_or_uia_action command without any pre-configured scope."
+commands.deny = ["execute_som_or_uia_action"]

@@ -33,7 +33,7 @@ pub fn spawn(port_slot: Arc<AtomicU16>, ipc: Arc<Mutex<VecDeque<String>>>) {
             let req = String::from_utf8_lossy(&buf[..n]);
             let path = req.split_whitespace().nth(1).unwrap_or("/");
             let body = if path.starts_with("/v1/models") || path.starts_with("/models") {
-                r#"{"object":"list","data":[{"id":"omni-local","object":"model","owned_by":"omniworkspace"}]}"#.to_string()
+                r#"{"object":"list","data":[{"id":"ronic-local","object":"model","owned_by":"ronicos"}]}"#.to_string()
             } else if path.starts_with("/v1/chat/completions") || path.starts_with("/chat/completions") {
                 r#"{"id":"chatcmpl_local","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"Ronic OS loopback is up. Send tasks from the workspace composer so the policy gate and memory apply."},"finish_reason":"stop"}]}"#.to_string()
             } else {

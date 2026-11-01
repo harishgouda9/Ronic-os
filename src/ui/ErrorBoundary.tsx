@@ -32,7 +32,7 @@ export class ErrorBoundary extends Component<Props, State> {
               className="btn ghost"
               onClick={() => {
                 try {
-                  sessionStorage.removeItem("omni.screen");
+                  sessionStorage.removeItem("ronic.screen");
                 } catch {
                   /* fall back to chat regardless */
                 }

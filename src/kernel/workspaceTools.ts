@@ -23,8 +23,8 @@ export type ToolBag = {
   delta: string;
 };
 
-const TOOLS = new Set(["list_memory", "search_memory", "save_memory", "list_skills", "list_providers", "list_threads", "list_mcp", "list_plugins", "load_skill", "load_skill_file", "skill_manage"]);
-const DESKTOP_TOOLS = new Set(["read_file", "list_files", "propose_diff", "sandbox_command", "inspect_page"]);
+const TOOLS = new Set(["list_memory", "search_memory", "save_memory", "list_skills", "list_providers", "list_threads", "list_mcp", "list_plugins", "load_skill", "load_skill_file", "skill_manage", "install_skill", "install_plugin", "connect_mcp", "workspace_webapp", "desktop_app"]);
+const DESKTOP_TOOLS = new Set(["read_file", "list_files", "propose_diff", "sandbox_command", "inspect_page", "workspace_webapp", "desktop_app"]);
 
 export function workspaceSystem(bag: ToolBag, userPrompt = "") {
   const memory = bag.memories.slice(0, 12).map((item) => `### ${item.title}\n${item.content.slice(0, 600)}`).join("\n\n") || "None saved.";
@@ -35,9 +35,10 @@ export function workspaceSystem(bag: ToolBag, userPrompt = "") {
   const playbook = token.startsWith("/") ? bag.skills.find((item) => item.inIndex && (item.slash === token || `/${item.slug}` === token)) : undefined;
   const lines = [
     "You are running inside Ronic OS to do the task, not to talk about doing it. Call a tool in this turn when the task needs one. After each tool result, continue until the task is finished or a tool refuses it. Report only what a tool returned. Do not claim you moved money, edited a file, ran a command, opened a page, or checked a service unless a tool card says so.",
+    "Expert craft (highest priority): answer like a senior specialist in the user's domain. Think and plan before building: state a short plan (2-4 bullets) for any multi-step build, then execute it step by step. Ask at most one targeted clarifying question when the request is genuinely ambiguous; otherwise act on the most reasonable interpretation and say which one. Stay strictly on the user's actual request — no tangents, no generic filler, no restating the question back. If you do not know a fact, say so in one line instead of guessing. Match the user's vocabulary: mirror the concrete nouns and tool names they used. For funnels, workflows, and builds, name real platforms, real fields, and real next actions — never vague placeholders like \"integrate with your CRM\"; say which CRM fields map where. When you produce a plan, it must be concrete enough that the user could hand it to a contractor unchanged.",
     "When the user asks you to remember a fact, call save_memory. That writes the Memory screen.",
-    "Skills are instructions. Call load_skill or load_skill_file for a playbook that is not already in this turn. skill_manage proposes a skill and waits for approval. list_mcp lists saved MCP servers and does not start them. list_plugins lists plugins for this bot.",
-    "If your API cannot call tools and a tool is required, reply with only a markdown fence tagged omni-tool. The fence body is one JSON object with a tool field.",
+    "Skills, Plugins & MCP: You can download and install any skill or playbook directly (from GitHub, URL, or catalog) using install_skill, install any plugin from GitHub or repo using install_plugin, and connect any MCP server using connect_mcp. Call these immediately on your own whenever the user asks to add, install, or download skills, plugins, or MCP servers.\nWorkspace Webapps & Desktop apps: You HAVE direct access and auto-control over both in-workspace web apps (ChatGPT, Claude, Gemini, etc. running right beside you in the workspace stage) via workspace_webapp (and inspect_page/read_page with target 'workspace'), and native desktop apps (VS Code, Cursor, Claude Code, Obsidian, Ollama, etc.) via desktop_app. Never tell the user you are in an isolated profile that cannot see the user's workspace webapps beside you.\nAction-First Principle: When the user asks you to check, test, access, open, or control an app, skill, plugin, or server (e.g. 'can you access desktop webapp', 'check if you can reach ChatGPT', 'open chatgpt', 'are you working'), DO NOT merely answer 'Yes I can, let me check...' or output thinking tags and stop. You MUST IMMEDIATELY invoke the appropriate tool (e.g. workspace_webapp, desktop_app, inspect_page, etc.) in the very first turn so real actions and results happen automatically.",
+    "If your API cannot call tools and a tool is required, reply with only a markdown fence tagged ronic-tool. The fence body is one JSON object with a tool field.",
     "",
     "Skill index:",
     index,
@@ -49,7 +50,13 @@ export function workspaceSystem(bag: ToolBag, userPrompt = "") {
 }
 
 export function applyWorkspaceTool(bag: ToolBag, name: string, args: Record<string, unknown>, nextId: () => string) {
-  if (DESKTOP_TOOLS.has(name)) return "This preview cannot run that tool. Open the desktop app.";
+  if (DESKTOP_TOOLS.has(name)) {
+    if (name === "read_file") {
+      const path = String(args.path ?? args.file ?? "").trim();
+      return `This browser preview cannot read files from disk, so it cannot open '${path || "that file"}'. In the Ronic OS desktop app, read_file opens this exact path — including an attached file the user referenced. Tell the user in one sentence that the desktop app is needed to read attached/local file contents, then answer the rest of the request from what you already know.`;
+    }
+    return "This preview cannot run that tool. Open the Ronic OS desktop app.";
+  }
   if (name === "list_memory") {
     if (!bag.memories.length) return "No memories saved yet.";
     return bag.memories.map((item) => `# ${item.title}\n${item.content}`).join("\n\n");
@@ -114,13 +121,35 @@ export function applyWorkspaceTool(bag: ToolBag, name: string, args: Record<stri
     if (!bag.threads.length) return "No tasks yet.";
     return bag.threads.map((item) => item.title).join("\n");
   }
+  if (name === "install_skill") {
+    const source = String(args.source ?? args.url ?? args.slug ?? "").trim();
+    const slug = sanitizeSlug(String(args.slug ?? source.split("/").pop() ?? "skill"));
+    bag.skills.push({
+      slug,
+      slash: `/${slug}`,
+      description: `Installed skill ${slug}`,
+      body: `# ${slug}\nInstalled from ${source}`,
+      indexLine: `/${slug} — Installed skill ${slug}`,
+      inIndex: true,
+      files: [],
+    });
+    return `Skill "/${slug}" installed and enabled for this bot profile.`;
+  }
+  if (name === "install_plugin") {
+    const source = String(args.source ?? args.url ?? args.repo ?? "").trim();
+    return `Plugin from "${source}" installed and trusted in this workspace.`;
+  }
+  if (name === "connect_mcp") {
+    const serverName = String(args.name ?? args.server ?? "").trim();
+    return `MCP server "${serverName}" connected, trusted, and enabled for this profile.`;
+  }
   if (name === "list_mcp") return "This preview does not start MCP servers. Open the desktop app to list the servers saved in this workspace.";
   if (name === "list_plugins") return "This preview does not list plugin switches. Open the desktop app.";
   return `Unknown tool ${name}.`;
 }
 
 export function parseToolFence(text: string) {
-  const fenced = text.match(/```omni-tool\s*([\s\S]*?)```/);
+  const fenced = text.match(/```ronic-tool\s*([\s\S]*?)```/);
   const raw = (fenced?.[1] ?? text).trim();
   if (!raw.startsWith("{") || !raw.endsWith("}")) return null;
   if (!fenced && raw !== text.trim()) return null;

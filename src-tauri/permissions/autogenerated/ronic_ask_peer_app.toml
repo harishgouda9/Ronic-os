@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-ronic-ask-peer-app"
+description = "Enables the ronic_ask_peer_app command without any pre-configured scope."
+commands.allow = ["ronic_ask_peer_app"]
+
+[[permission]]
+identifier = "deny-ronic-ask-peer-app"
+description = "Denies the ronic_ask_peer_app command without any pre-configured scope."
+commands.deny = ["ronic_ask_peer_app"]

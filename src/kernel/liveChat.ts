@@ -216,7 +216,7 @@ export function rememberSecret(providerId: string, secret: string) {
   if (!providerId || !value) return;
   secrets.set(providerId, value);
   try {
-    sessionStorage.setItem(`omni.secret.${providerId}`, value);
+    sessionStorage.setItem(`ronic.secret.${providerId}`, value);
   } catch {
     /* private mode can reject storage; the in-memory copy still serves this page */
   }
@@ -226,7 +226,7 @@ export function secretFor(providerId: string) {
   const cached = secrets.get(providerId);
   if (cached) return cached;
   try {
-    const saved = sessionStorage.getItem(`omni.secret.${providerId}`) ?? "";
+    const saved = sessionStorage.getItem(`ronic.secret.${providerId}`) ?? "";
     if (saved) secrets.set(providerId, saved);
     return saved;
   } catch {
@@ -362,7 +362,7 @@ async function openai(model: ChatModel, key: string, messages: ChatMessage[], ef
   const data = await readJson(res);
   if (!res.ok) throw new Error(apiError(model.label, res.status, data));
   const message = data?.choices?.[0]?.message ?? {};
-  const toolCalls = withTools ? toolCallsOf(message.tool_calls) : [];
+  let toolCalls = withTools ? toolCallsOf(message.tool_calls) : [];
   const rawText = textOf(message.content);
   let thinking = String(message.reasoning_content ?? message.reasoning ?? "").trim();
   let text = rawText;
@@ -371,6 +371,13 @@ async function openai(model: ChatModel, key: string, messages: ChatMessage[], ef
     if (match) {
       thinking = match[1].trim();
       text = rawText.replace(/<think>[\s\S]*?(?:<\/think>|$)/, "").trim();
+    }
+  }
+  if (withTools && toolCalls.length === 0) {
+    const extracted = extractTextToolCalls(text);
+    if (extracted.toolCalls.length > 0) {
+      toolCalls = extracted.toolCalls;
+      text = extracted.cleanText;
     }
   }
   if (!text && !toolCalls.length && !thinking) throw new Error(`${model.label} returned an empty reply.`);
@@ -527,8 +534,15 @@ async function ollama(model: ChatModel, messages: ChatMessage[], withTools: bool
   });
   const data = await readJson(res);
   if (!res.ok) throw new Error(`Ollama HTTP ${res.status}. ${data?.error ?? "Start Ollama, then pull a model."}`);
-  const text = textOf(data?.message?.content);
-  const toolCalls = withTools ? toolCallsOf(data?.message?.tool_calls) : [];
+  let text = textOf(data?.message?.content);
+  let toolCalls = withTools ? toolCallsOf(data?.message?.tool_calls) : [];
+  if (withTools && toolCalls.length === 0) {
+    const extracted = extractTextToolCalls(text);
+    if (extracted.toolCalls.length > 0) {
+      toolCalls = extracted.toolCalls;
+      text = extracted.cleanText;
+    }
+  }
   if (!text && !toolCalls.length) throw new Error("Ollama returned an empty reply.");
   return { text, thinking: "", toolCalls, providerId: model.providerId };
 }
@@ -571,6 +585,58 @@ function toAnthropic(messages: ChatMessage[]) {
     out.push({ role: message.role === "assistant" ? "assistant" : "user", content: message.content });
   }
   return { system, messages: out };
+}
+
+function extractTextToolCalls(text: string): { cleanText: string; toolCalls: ToolCall[] } {
+  const toolCalls: ToolCall[] = [];
+  let cleanText = text;
+
+  // 1. Tag parsing for <|tool_call|>name={...}>
+  const tagRegex = /<\|?tool_call\|?>\s*([a-zA-Z0-9_-]+)\s*=\s*(\{[\s\S]*?\})\s*>?/g;
+  let match: RegExpExecArray | null;
+  while ((match = tagRegex.exec(cleanText)) !== null) {
+    try {
+      JSON.parse(match[2]);
+      toolCalls.push({
+        id: `call_txt_${Date.now()}_${Math.random().toString(16).slice(2, 6)}`,
+        name: match[1],
+        arguments: match[2],
+      });
+    } catch {
+      // not valid json
+    }
+  }
+
+  // 2. Fence parsing ```ronic-tool, ```tool, ```json
+  const fenceRegex = /```(?:ronic-tool|tool|json)?\s*(\{[\s\S]*?\})\s*```/g;
+  while ((match = fenceRegex.exec(cleanText)) !== null) {
+    try {
+      const obj = JSON.parse(match[1]);
+      const name = obj.name || obj.tool;
+      if (name && typeof name === "string") {
+        const args = obj.arguments || obj.parameters || obj;
+        toolCalls.push({
+          id: `call_fence_${Date.now()}_${Math.random().toString(16).slice(2, 6)}`,
+          name,
+          arguments: typeof args === "string" ? args : JSON.stringify(args),
+        });
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  // Sanitize text if any tool calls were extracted
+  if (toolCalls.length > 0) {
+    cleanText = cleanText
+      .replace(/<\|?tool_call\|?>\s*[a-zA-Z0-9_-]+\s*=\s*\{[\s\S]*?\}\s*>?/g, "")
+      .replace(/```(?:ronic-tool|tool|json)?\s*\{[\s\S]*?\}\s*```/g, "")
+      .replace(/<\|?tool_call\|?>/gi, "")
+      .replace(/<\|[^>]*\|>/g, "")
+      .trim();
+  }
+
+  return { cleanText, toolCalls };
 }
 
 function toolCallsOf(value: unknown): ToolCall[] {

@@ -1,6 +1,6 @@
 import type { WebApp } from "./liveChat";
 
-const KEY = "omni.customApps.v1";
+const KEY = "ronic.customApps.v1";
 const CAP = 24;
 const ID_RE = /^custom_[A-Za-z0-9_-]{1,40}$/;
 
@@ -106,7 +106,7 @@ export function writeCustomApps(apps: CustomApp[]) {
   }
 }
 
-const HIDDEN_KEY = "omni.hiddenApps.v1";
+const HIDDEN_KEY = "ronic.hiddenApps.v1";
 
 export function readHiddenApps(): string[] {
   try {

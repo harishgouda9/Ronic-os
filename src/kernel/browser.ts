@@ -19,6 +19,8 @@ import { ensurePrebuilt } from "./prebuiltSkills";
 import { inIndex, rebuildRegistry } from "./skillIndex";
 import { MARKETPLACE_CATALOG } from "./marketplaceCatalog";
 import { applyWorkspaceTool, parseToolFence, workspaceSystem, type ToolBag } from "./workspaceTools";
+import { executionCommitment, frictionReason, planDelegation, type PlanBot, type PlanGroup } from "./chiefDelegation";
+import { normalizeUpdateSettings } from "../updates/feed";
 
 function quickQuestion(text: string) {
   const value = text.trim();
@@ -34,7 +36,15 @@ const DEMO_MEMORY_TITLES = new Set([
   "UI Design System Preference",
 ]);
 
-const KEY = "omniworkspace.browser.v6";
+const KEY = "ronicos.browser.v6";
+const LEGACY_KEYS = [
+  "omniworkspace.browser.v1",
+  "omniworkspace.browser.v2",
+  "omniworkspace.browser.v3",
+  "omniworkspace.browser.v4",
+  "omniworkspace.browser.v5",
+  "omniworkspace.browser.v6",
+];
 let skipGate = false;
 let state: Snapshot = load();
 
@@ -60,17 +70,34 @@ function referenceFixture(snap: Snapshot): boolean {
 
 function load(): Snapshot {
   try {
-    localStorage.removeItem("omniworkspace.browser.v1");
-    localStorage.removeItem("omniworkspace.browser.v2");
-    localStorage.removeItem("omniworkspace.browser.v3");
-    localStorage.removeItem("omniworkspace.browser.v4");
-    localStorage.removeItem("omniworkspace.browser.v5");
-    const raw = localStorage.getItem(KEY);
+    localStorage.removeItem("ronicos.browser.v1");
+    localStorage.removeItem("ronicos.browser.v2");
+    localStorage.removeItem("ronicos.browser.v3");
+    localStorage.removeItem("ronicos.browser.v4");
+    localStorage.removeItem("ronicos.browser.v5");
+    let raw = localStorage.getItem(KEY);
+    if (!raw) {
+      // Pre-rename fallback: adopt the newest legacy omniworkspace snapshot so
+      // browser users keep their workspace across the product rename.
+      for (const legacyKey of [...LEGACY_KEYS].reverse()) {
+        const legacyRaw = localStorage.getItem(legacyKey);
+        if (legacyRaw) {
+          raw = legacyRaw;
+          break;
+        }
+      }
+    }
     if (raw) {
       const parsed = JSON.parse(raw) as Snapshot;
-      if (!referenceFixture(parsed)) return repair(parsed);
+      if (!referenceFixture(parsed)) {
+        const repaired = repair(parsed);
+        localStorage.setItem(KEY, JSON.stringify(repaired));
+        for (const legacyKey of LEGACY_KEYS) localStorage.removeItem(legacyKey);
+        return repaired;
+      }
       localStorage.removeItem(KEY);
     }
+    for (const legacyKey of LEGACY_KEYS) localStorage.removeItem(legacyKey);
   } catch {
     localStorage.removeItem(KEY);
   }
@@ -85,7 +112,20 @@ function repair(snap: Snapshot): Snapshot {
   if (!snap.memoryRoute) snap.memoryRoute = fresh.memoryRoute;
   if (!Array.isArray(snap.memoryRoutes) || snap.memoryRoutes.length === 0) snap.memoryRoutes = fresh.memoryRoutes;
   if (!Array.isArray(snap.botGroups)) snap.botGroups = [];
+  if (typeof snap.chiefBotId !== "string") snap.chiefBotId = "";
+  if (!Array.isArray(snap.delegationContracts)) snap.delegationContracts = [];
+  if (!Array.isArray(snap.delegationReports)) snap.delegationReports = [];
   if (!Array.isArray(snap.gatewayAudits)) snap.gatewayAudits = [];
+  if (!Array.isArray(snap.botAllowances)) snap.botAllowances = [];
+  if (!Array.isArray(snap.fleetLogs)) snap.fleetLogs = [];
+  if (!Array.isArray(snap.quantOrders)) snap.quantOrders = [];
+  if (!Array.isArray(snap.connectedWallets)) snap.connectedWallets = [];
+  if (!Array.isArray(snap.sentinels)) snap.sentinels = [];
+  if (!Array.isArray(snap.sentinelEvents)) snap.sentinelEvents = [];
+  if (!Array.isArray(snap.processes)) snap.processes = [];
+  if (!snap.license) snap.license = fresh.license;
+  if (typeof snap.ledgerMode !== "string") snap.ledgerMode = fresh.ledgerMode;
+  if (typeof snap.walletPinSet !== "boolean") snap.walletPinSet = false;
   if (!Array.isArray(snap.profiles) || snap.profiles.length === 0) {
     snap.profiles = fresh.profiles;
     snap.activeProfileId = fresh.activeProfileId;
@@ -105,7 +145,7 @@ function repair(snap: Snapshot): Snapshot {
   if (!Array.isArray(snap.mcpServers)) snap.mcpServers = [];
   if (!Array.isArray(snap.skillProposals)) snap.skillProposals = [];
   if (!Array.isArray(snap.skills) || snap.skills.some((skill) => !skill.origin)) snap.skills = [];
-  if (!Array.isArray(snap.registry) || snap.registry.length === 0) snap.registry = rebuildRegistry(snap.plugins, snap.mcpServers);
+  if (!Array.isArray(snap.registry) || snap.registry.length === 0) snap.registry = rebuildRegistry(snap.plugins, snap.mcpServers, snap.activeProfileId);
   if (typeof snap.skillIndexDelta !== "string") snap.skillIndexDelta = "";
   if (!Array.isArray(snap.providers)) snap.providers = [];
   for (const provider of fresh.providers) {
@@ -126,6 +166,7 @@ function repair(snap: Snapshot): Snapshot {
   }
   ensurePrebuilt(snap);
   adoptMem0(snap);
+  snap.settings = normalizeUpdateSettings({ ...fresh.settings, ...(snap.settings ?? {}) });
   return snap;
 }
 
@@ -165,13 +206,17 @@ function makeProfile(partial: Partial<BotProfile> & Pick<BotProfile, "id" | "han
     activePid: null,
     harnessLaneId: "",
     agUiEndpointUrl: "",
+    engineKind: "",
+    apiBase: "",
+    apiModel: "",
     allowFileWrite: true,
     requireApprovalExternal: true,
     requireApprovalWallet: true,
+    approvalMode: "ask" as const,
     takeover: false,
     ...partial,
     browserPartition: partial.browserPartition || `persist:bot_${partial.id}`,
-    workspaceDir: partial.workspaceDir || `~/.omniworkspace/bots/${partial.id}/workspace`,
+    workspaceDir: partial.workspaceDir || `~/.ronicos/bots/${partial.id}/workspace`,
     statusLine: partial.statusLine || "Ready for tasks",
     stallTimeoutMs: partial.stallTimeoutMs || 45000,
     workspaceFiles: partial.workspaceFiles ?? [],
@@ -179,6 +224,7 @@ function makeProfile(partial: Partial<BotProfile> & Pick<BotProfile, "id" | "han
     screenNodes: partial.screenNodes ?? [],
     screenMs: partial.screenMs ?? 0,
     shellOutput: partial.shellOutput ?? "",
+    walletFrozen: partial.walletFrozen ?? false,
   };
 }
 
@@ -194,6 +240,18 @@ function makeThread(partial: Partial<ChatThread> & Pick<ChatThread, "id" | "botP
     groupId: partial.groupId || "",
     routineSchedule: partial.routineSchedule || "",
   };
+}
+
+function providerHasKey(state: Snapshot, id: string) {
+  return state.providers.some((item) => item.id === id && item.hasSecret);
+}
+
+function hostOf(url: string) {
+  try {
+    return new URL(url).host || url;
+  } catch {
+    return url;
+  }
 }
 
 function externalAction(prompt: string) {
@@ -286,7 +344,7 @@ function policyOf(amount: number, actor: string, slippage?: number): string {
   return "auto_signed_by_rust";
 }
 
-function applyMoney(rail: string, amount: number, effect: string, decision: string): string | null {
+function applyMoney(rail: string, amount: number, effect: string, decision: string, actor = "agent"): string | null {
   if (decision !== "auto_signed_by_rust" && decision !== "approved_by_user") return null;
   const row = state.balances.find((b) => b.rail === rail);
   if (!row) return "That rail is not on this ledger.";
@@ -304,21 +362,28 @@ function applyMoney(rail: string, amount: number, effect: string, decision: stri
     return null;
   }
   if (effect === "credit") return null;
+  const countSpend = actor !== "user";
   if (rail === "razorpay_upi") {
     const cost = amount * 83;
     if (row.nativeValue + 1e-6 < cost) return "sandbox INR balance is too low";
     row.nativeValue -= cost;
     row.amountUsd = row.nativeValue / 83;
     row.nativeAmount = `₹${Math.round(row.nativeValue)}`;
-    state.spentTodayUsd += amount;
+    if (countSpend) state.spentTodayUsd += amount;
     return null;
   }
-  if (rail === "crypto_x402" || rail === "stripe_card") {
-    if (row.nativeValue + 1e-9 < amount) return rail === "stripe_card" ? "sandbox card balance is too low" : "sandbox USDC balance is too low";
+  if (rail === "crypto_x402" || rail === "stripe_card" || rail === "hyperliquid_ws") {
+    if (row.nativeValue + 1e-9 < amount) {
+      return rail === "stripe_card"
+        ? "sandbox card balance is too low"
+        : rail === "hyperliquid_ws"
+          ? "sandbox Hyperliquid margin is too low"
+          : "sandbox USDC balance is too low";
+    }
     row.nativeValue -= amount;
     row.amountUsd = row.nativeValue;
     row.nativeAmount = rail === "stripe_card" ? `$${row.nativeValue.toFixed(2)}` : `${row.nativeValue.toFixed(2)} USDC`;
-    state.spentTodayUsd += amount;
+    if (countSpend) state.spentTodayUsd += amount;
     return null;
   }
   return "That rail cannot move funds on this ledger.";
@@ -356,16 +421,26 @@ function clipText(text: string, limit: number) {
   return `${flat.slice(0, limit)}…`;
 }
 
+/** Clean, user-visible bubble text: the prompt plus compact attachment chips. */
+function browserDisplayText(prompt: string, attachments: string[]) {
+  const text = prompt.trim() || "Read the attached files.";
+  if (!attachments.length) return text;
+  const chips = attachments.map((path) => `📎 \`${path.split(/[\\/]/).pop() || path}\``).join("  ");
+  return `${text}\n\n${chips}`;
+}
+
+/** Model-facing text: the prompt plus the attachment note the model needs. */
 function browserUserText(prompt: string, attachments: string[]) {
   const text = prompt.trim() || "Read the attached files.";
   if (!attachments.length) return text;
   const names = attachments.map((path) => `- ${path.split(/[\\/]/).pop() || path}`).join("\n");
-  return `${text}\n\nAttached files:\n${names}\nThis preview cannot read files on disk. Open the desktop app to include their contents.`;
+  return `${text}\n\nAttached files:\n${names}\n[ATTACHMENT NOTE] This preview cannot read files on disk, so the file contents were not included. Tell the user in one sentence that the desktop app is needed to read attached file contents, then answer the rest of the request.`;
 }
 
 function threadCapsule(steps: Step[]) {
-  const goal = steps.find((step) => step.role === "user")?.contentMarkdown ?? "";
-  const done = steps.filter((step) => step.role === "assistant" || step.role === "tool").slice(-4);
+  const real = steps.filter((step) => step.actionType !== "turn_activity");
+  const goal = real.find((step) => step.role === "user")?.contentMarkdown ?? "";
+  const done = real.filter((step) => step.role === "assistant" || step.role === "tool").slice(-4);
   const actions = done.map((step) => clipText(step.contentMarkdown, 180)).join(" | ");
   return `original_goal: ${clipText(goal, 400)}\ncompleted_actions: ${clipText(actions, 800)}\npending_next_steps: continue from the last accepted card`;
 }
@@ -379,7 +454,7 @@ function foldThread(steps: Step[], system: string, capsule: string): ChatMessage
     tools = [];
   };
   for (const step of steps) {
-    if (step.actionType === "thinking") continue;
+    if (step.actionType === "thinking" || step.actionType === "turn_activity") continue;
     if (step.role === "user") {
       flushTools();
       folded.push({ role: "user", content: step.contentMarkdown });
@@ -402,6 +477,22 @@ function foldThread(steps: Step[], system: string, capsule: string): ChatMessage
   let systemText = system;
   if (dropped && capsule.trim()) systemText += `\n\nEarlier in this thread:\n${capsule.trim()}`;
   return [{ role: "system", content: systemText }, ...folded];
+}
+
+function delegationBots(): PlanBot[] {
+  return state.profiles.map((bot) => ({
+    id: bot.id,
+    handle: bot.handle,
+    role: bot.role,
+    soul: bot.soulMarkdown,
+    allowComputerUse: bot.allowComputerUse,
+    allowBrowserUse: bot.allowBrowserUse,
+    allowCodeExec: bot.allowCodeExec,
+    allowFileWrite: bot.allowFileWrite,
+    primaryAccountId: bot.primaryAccountId,
+    longContextAccountId: bot.longContextAccountId,
+    fallbackAccountId: bot.fallbackAccountId,
+  }));
 }
 
 export async function browserCall(cmd: string, args: Record<string, unknown>): Promise<CommandResult> {
@@ -502,7 +593,14 @@ export async function browserCall(cmd: string, args: Record<string, unknown>): P
           ...partial,
         });
       };
+      // Live-activity marker: one tiny turn_activity step per thread that the
+      // chat pill reads while the model turn is still running.
+      const noteActivity = (detail: string) => {
+        state.steps = state.steps.filter((s) => !(s.actionType === "turn_activity" && s.threadId === thread.id));
+        step({ role: "tool", contentMarkdown: detail, actionType: "turn_activity", executionLatencyMs: 0 });
+      };
       const finishThread = () => {
+        state.steps = state.steps.filter((s) => !(s.actionType === "turn_activity" && s.threadId === thread.id));
         thread.compactedContextCapsule = threadCapsule(state.steps.filter((item) => item.threadId === thread.id));
         thread.updatedAt = Date.now();
         thread.status = "completed";
@@ -511,7 +609,7 @@ export async function browserCall(cmd: string, args: Record<string, unknown>): P
       const addressed = mentionedBot(thread, prompt) ?? owner;
       const replay = skipGate && state.steps.some((item) => item.threadId === thread.id && item.role === "user" && item.contentMarkdown.trim() === composed.trim());
       skipGate = false;
-      if (!replay) step({ role: "user", contentMarkdown: composed, actionType: "message" });
+      if (!replay) step({ role: "user", contentMarkdown: browserDisplayText(prompt, attachments), actionType: "message" });
       if (!addressed) return ok("Pick a bot first.");
       if (!replay) {
         const setup = applySetup(addressed, prompt);
@@ -643,6 +741,7 @@ export async function browserCall(cmd: string, args: Record<string, unknown>): P
         for (let round = 0; round < (quick ? 1 : 16); round += 1) {
           if (result.thinking.trim()) {
             step({ role: "assistant", modelUsed: model.label, contentMarkdown: result.thinking.trim(), actionType: "thinking" });
+            noteActivity("thinking through the next step…");
           }
           if (quick) {
             lastText = result.text.trim();
@@ -691,6 +790,8 @@ export async function browserCall(cmd: string, args: Record<string, unknown>): P
           for (const call of calls) {
             let args: Record<string, unknown> = {};
             try { args = JSON.parse(call.arguments || "{}") as Record<string, unknown>; } catch { args = {}; }
+            const bit = Object.values(args).find((value) => typeof value === "string" && value) as string | undefined;
+            noteActivity(bit ? `${call.name} · ${String(bit).slice(0, 56)}` : call.name);
             const output = applyWorkspaceTool(bag, call.name, args, () => nid("mem"));
             writeBag(bag);
             step({
@@ -713,7 +814,7 @@ export async function browserCall(cmd: string, args: Record<string, unknown>): P
         const spoken = lastText || "The model returned an empty reply.";
         step({
           role: "assistant",
-          modelUsed: `${addressed.handle} · ${model.label}`,
+          modelUsed: addressed.handle,
           contentMarkdown: spoken,
           actionType: "message",
           executionLatencyMs: result.ms,
@@ -741,7 +842,7 @@ export async function browserCall(cmd: string, args: Record<string, unknown>): P
             { role: "user", content: `Continue as ${next.handle}.` },
           ], effort);
           const followText = follow.text.trim() || "Continued the shared thread.";
-          step({ role: "assistant", modelUsed: `${next.handle} · ${model.label}`, contentMarkdown: followText, actionType: "message", executionLatencyMs: follow.ms });
+          step({ role: "assistant", modelUsed: next.handle, contentMarkdown: followText, actionType: "message", executionLatencyMs: follow.ms });
           next.statusLine = clipTarget(followText) || next.statusLine;
           current = next;
         }
@@ -1011,11 +1112,27 @@ export async function browserCall(cmd: string, args: Record<string, unknown>): P
     case "install_skill":
       return ok(installSkillFromMarket(state, String(a.slug ?? "")));
     case "install_plugin":
-      return ok(installPlugin(state, String(a.source ?? "")));
+    case "install_plugin_from_url":
+      return ok(installPlugin(state, String(a.url ?? a.source ?? "")));
     case "install_mcp":
       return ok(installMcp(state, String(a.name ?? "")));
     case "connect_mcp":
-      return ok(connectMcp(state, String(a.name ?? "")));
+    case "connect_mcp_server":
+      return ok(connectMcp(state, String(a.name ?? ""), String(a.secret ?? "")));
+    case "probe_local_tool":
+      throw new Error("Docker and folder checks run in the desktop app. The browser preview does not mark a server connected.");
+    case "connect_watched_wallet":
+    case "refresh_wallet_balance":
+    case "disconnect_watched_wallet":
+    case "update_watched_wallet":
+      throw new Error("Wallet reads run in the desktop app. The browser preview does not invent a balance.");
+    case "assign_bot_spend":
+      throw new Error("Bot budgets are saved in the desktop app against a verified wallet balance.");
+    case "set_wallet_pin":
+    case "check_wallet_pin":
+      throw new Error("Set a wallet PIN in the desktop app. There is no default PIN.");
+    case "add_sandbox_funds":
+      throw new Error("Sandbox faucet is disabled. Connect a wallet and refresh its on-chain balance.");
     case "set_policy":
       state.policy = {
         maxPerTxUsd: a.maxPerTxUsd,
@@ -1030,7 +1147,7 @@ export async function browserCall(cmd: string, args: Record<string, unknown>): P
       if (state.settings.liveRails) return ok("Turn live rails off. This preview will not send a real charge.");
       const r = a.request;
       const decision = policyOf(r.amountUsd, r.actor, r.slippageBps);
-      const blocked = applyMoney(r.rail, r.amountUsd, r.effect, decision);
+      const blocked = applyMoney(r.rail, r.amountUsd, r.effect, decision, String(r.actor ?? "agent"));
       if (blocked) return ok(blocked);
       pushTx({ ...r, policyDecision: decision });
       return ok(decision);
@@ -1042,7 +1159,7 @@ export async function browserCall(cmd: string, args: Record<string, unknown>): P
         tx.policyDecision = "rejected_by_user";
         return ok("rejected_by_user");
       }
-      const blocked = applyMoney(tx.rail, tx.amountUsd, tx.effect === "credit" ? "credit" : "spend", "approved_by_user");
+      const blocked = applyMoney(tx.rail, tx.amountUsd, tx.effect === "credit" ? "credit" : "spend", "approved_by_user", tx.actor || "agent");
       if (blocked) return ok(blocked);
       tx.policyDecision = "approved_by_user";
       tx.txHashOrRef = nid("sandbox");
@@ -1086,10 +1203,24 @@ export async function browserCall(cmd: string, args: Record<string, unknown>): P
       return ok(null);
     case "submit_bug":
       state.bugPreview = redact(`category: ${a.category}\nnotes: ${a.notes}`);
-      return ok("Saved in this browser. The desktop shell writes ~/.omniworkspace/tickets.");
+      return ok("Saved in this browser. The desktop shell writes ~/.ronicos/tickets.");
     case "save_settings":
-      state.settings = a.settings;
+      state.settings = normalizeUpdateSettings({ ...state.settings, ...a.settings });
       return ok("Settings saved.");
+    case "register_local_machine":
+      state.license = { ...state.license, status: "local", planTier: "free", maxDevices: 1, proEntitled: false };
+      return ok("This machine is registered on the free Starter plan (1/1 machines). Works offline — no account needed.");
+    case "unregister_local_machine":
+      state.license = { ...state.license, status: "unsigned_dev", proEntitled: true };
+      return ok("Machine registration cleared.");
+    case "kernel_diagnostics":
+      return ok("Storage diagnostics read the real workspace on disk — open the desktop app.");
+    case "db_maintenance":
+      return ok("WAL checkpoint and VACUUM run against the real state.db in the desktop app.");
+    case "shadow_git_prune":
+      return ok("Shadow-git pruning touches ~/.ronicos/.shadow-git in the desktop app.");
+    case "workspace_backup":
+      return ok("Backups are written under Documents/Ronic OS backups in the desktop app.");
     case "set_vault_passphrase":
       state.hasPassphrase = true;
       state.vaultUnlocked = true;
@@ -1127,29 +1258,119 @@ export async function browserCall(cmd: string, args: Record<string, unknown>): P
     case "pick_paths":
       return ok("The file picker runs in the desktop shell.");
     case "connect_external_bot": {
-      const handle = String(a.draft.handle ?? "").startsWith("@") ? String(a.draft.handle) : `@${String(a.draft.handle ?? "").trim()}`;
+      const rawHandle = String(a.draft.handle ?? "").trim();
+      const handle = rawHandle.startsWith("@") ? rawHandle : `@${rawHandle}`;
       const id = nid("bot");
       const mode = String(a.draft.mode ?? "");
       const command = String(a.draft.commandOrUrl ?? "");
+      const apiMode = mode === "api";
+      const subMode = mode === "subscription";
+      const apiBase = String(a.draft.apiBase ?? "").trim();
+      const apiModel = String(a.draft.apiModel ?? "").trim();
+      const slug = handle.slice(1).toLowerCase() || nid("bot");
+      const providerId = (apiMode || subMode) ? (String(a.draft.providerRef ?? "").trim() || `${subMode ? "botsite" : "botprov"}_${slug}`) : "prov_ollama";
+      if (subMode && !state.providers.some((item) => item.id === providerId)) {
+        state.providers.push({
+          id: providerId,
+          name: String(a.draft.engine ?? handle),
+          providerType: "isolated_webview",
+          binaryOrEndpoint: apiBase,
+          hasSecret: false,
+          quotaWindowHours: 5,
+          quotaUsedPercent: 0,
+          quotaResetsAt: "",
+          fallbackAccountId: null,
+          isActive: true,
+          allowCliDispatch: false,
+          lastHealthCheckMs: null,
+          healthDetail: "The original site. Sign in with your subscription — no API key needed there.",
+        });
+      }
+      if (apiMode) {
+        const existing = state.providers.find((item) => item.id === providerId);
+        const key = String(a.draft.apiKey ?? "").trim();
+        const hasSecret = key.length > 0 || Boolean(existing?.hasSecret);
+        if (existing) {
+          existing.name = String(a.draft.engine ?? existing.name);
+          existing.binaryOrEndpoint = apiBase;
+          if (key) existing.hasSecret = true;
+          existing.healthDetail = hasSecret ? `Bound to ${handle}.` : `Bound to ${handle}. Needs an API key.`;
+        } else {
+          state.providers.push({
+            id: providerId,
+            name: String(a.draft.engine ?? handle),
+            providerType: "byok_api",
+            binaryOrEndpoint: apiBase,
+            hasSecret,
+            quotaWindowHours: 5,
+            quotaUsedPercent: 0,
+            quotaResetsAt: "",
+            fallbackAccountId: null,
+            isActive: true,
+            allowCliDispatch: false,
+            lastHealthCheckMs: null,
+            healthDetail: hasSecret ? `Bound to ${handle}.` : `Bound to ${handle}. Needs an API key.`,
+          });
+        }
+      }
+      const needsKey = apiMode && !providerHasKey(state, providerId);
+      const engineLabel = String(a.draft.engine ?? "External bot");
       state.profiles.push(makeProfile({
         id,
         handle,
         displayName: String(a.draft.displayName ?? handle),
         avatar: "XB",
-        soulMarkdown: "External bot linked in the browser preview.",
+        soulMarkdown: apiMode
+          ? `External bot linked to ${engineLabel} at ${apiBase} as ${apiModel}.`
+          : subMode
+            ? `Original bot bound to ${engineLabel} at ${apiBase} — used with the subscription login.`
+            : "External bot linked in the browser preview.",
         role: String(a.draft.engine ?? "External bot"),
         engine: String(a.draft.engine ?? ""),
-        commandOrUrl: command,
+        commandOrUrl: (apiMode || subMode) ? apiBase : command,
         runStatus: "ready",
+        engineKind: apiMode ? "openai_api" : subMode ? "subscription" : "",
+        apiBase,
+        apiModel,
+        primaryAccountId: providerId,
+        statusLine: needsKey
+          ? "Needs an API key — add it in Apps & providers."
+          : apiMode
+            ? `Live endpoint · ${apiModel}`
+            : subMode
+              ? `Original ${engineLabel} — press Check after signing in`
+              : "Ready for tasks",
         harnessLaneId: mode === "http" ? "ag_ui_url" : "",
         agUiEndpointUrl: mode === "http" ? command : "",
       }));
       state.activeProfileId = id;
-      return ok(`${handle} is linked in this preview. The desktop shell can clone and launch it.`);
+      return ok(needsKey
+        ? `${handle} is linked. Add its API key, then press Check to go live.`
+        : apiMode
+          ? `${handle} is live on ${engineLabel} (${apiModel}).`
+          : subMode
+            ? `${handle} is bound to the original ${engineLabel} at ${apiBase}. Open it from the bot card.`
+            : `${handle} is linked in this preview. The desktop shell can clone and launch it.`);
     }
     case "set_bot_run": {
       const bot = state.profiles.find((item) => item.id === a.id);
       if (bot) {
+        if (bot.engineKind === "subscription" && a.action === "start") {
+          bot.runStatus = "running";
+          bot.statusLine = `Original ${bot.engine || hostOf(bot.apiBase)} — opens with your subscription login.`;
+          return ok(`${bot.handle}'s original site is ready in this preview. Open it from the card.`);
+        }
+        if (bot.engineKind === "openai_api" && a.action === "start") {
+          const hasSecret = providerHasKey(state, bot.primaryAccountId);
+          if (!hasSecret) {
+            bot.runStatus = "stopped";
+            bot.statusLine = `Needs an API key for ${hostOf(bot.apiBase)} — add it in Apps & providers.`;
+            return ok(`${bot.handle} has no API key yet. Store the key, then press Check again.`);
+          }
+          bot.runStatus = "running";
+          bot.statusLine = `Live · ${hostOf(bot.apiBase)} · ${bot.apiModel}`;
+          return ok(`${bot.handle}'s endpoint accepted the saved key in this preview. Chat routes to ${bot.apiModel}.`);
+        }
         bot.runStatus = a.action === "start" ? "running" : "stopped";
         bot.activePid = null;
       }
@@ -1335,7 +1556,7 @@ export async function browserCall(cmd: string, args: Record<string, unknown>): P
     case "memory_vault":
       return { ...ok("Vault search runs in the desktop app."), payload: { hits: [], events: [] } };
     case "workspace_git":
-      return ok("Git status and agent dispatch run in the desktop app.");
+      return { ...ok("Git status and agent dispatch run in the desktop app."), payload: { files: [] } };
     case "install_git_package":
       return ok("Cloning a Git repository runs in the desktop app.");
     case "create_workflow": {
@@ -1358,6 +1579,10 @@ export async function browserCall(cmd: string, args: Record<string, unknown>): P
     case "update_workflow": {
       const wf = state.workflows.find((w) => w.id === a.patch.id);
       if (!wf) return ok("Missing workflow.");
+      if (a.patch.name) wf.name = a.patch.name;
+      if (a.patch.nodes) wf.nodes = a.patch.nodes;
+      if (a.patch.checkpoint) wf.checkpoint = a.patch.checkpoint;
+      if (a.patch.currentStatus) wf.currentStatus = a.patch.currentStatus;
       if (a.patch.yamlSource) wf.yamlSource = a.patch.yamlSource;
       const node = wf.nodes.find((n: WfNode) => n.id === a.patch.nodeId);
       if (node) {
@@ -1365,6 +1590,27 @@ export async function browserCall(cmd: string, args: Record<string, unknown>): P
         if (a.patch.prompt) node.prompt = a.patch.prompt;
       }
       return ok("Workflow updated.");
+    }
+    case "delete_workflow": {
+      const idx = state.workflows.findIndex((w) => w.id === a.id);
+      if (idx !== -1) {
+        state.workflows.splice(idx, 1);
+        return ok("Workflow deleted.");
+      }
+      return ok("Workflow not found.");
+    }
+    case "run_workflow": {
+      const wf = state.workflows.find((w) => w.id === a.id);
+      if (!wf) return ok("Missing workflow.");
+      wf.currentStatus = "completed";
+      wf.nodes.forEach((n) => {
+        n.status = "done";
+        n.latencyMs = Math.floor(Math.random() * 350 + 120);
+        if (!wf.checkpoint[n.id]) {
+          wf.checkpoint[n.id] = `Execution result for step "${n.name}" (${n.kind}): successfully processed with ${n.model || "default agent engine"}.`;
+        }
+      });
+      return ok("Workflow run completed.");
     }
     case "pause_workflow": {
       const wf = state.workflows.find((w) => w.id === a.id);
@@ -1444,7 +1690,7 @@ export async function browserCall(cmd: string, args: Record<string, unknown>): P
         coordinationMode: mode,
         leadBotId: unique[0],
         memberBotIds: unique,
-        sharedWorkspaceDir: `~/.omniworkspace/bots/groups/${id}/workspace`,
+        sharedWorkspaceDir: `~/.ronicos/bots/groups/${id}/workspace`,
         routineSchedule: "",
         createdAt: Date.now(),
       });
@@ -1537,6 +1783,139 @@ export async function browserCall(cmd: string, args: Record<string, unknown>): P
       }
       return ok(note);
     }
+    case "appoint_chief_officer": {
+      const botId = String(a.botId ?? "").trim();
+      if (!botId) {
+        state.chiefBotId = "";
+        return ok("Chief officer cleared.");
+      }
+      if (!state.profiles.some((bot) => bot.id === botId)) return ok("That bot does not exist.");
+      state.chiefBotId = botId;
+      return ok("Chief officer saved.");
+    }
+    case "dispatch_delegation": {
+      const issuerBotId = String(a.issuerBotId ?? "");
+      const groupId = String(a.groupId ?? "");
+      const objective = String(a.objective ?? "");
+      const group = groupId ? state.botGroups.find((item) => item.id === groupId) : undefined;
+      if (groupId && !group) return ok("Group not found.");
+      const planGroup: PlanGroup | null = group
+        ? { id: group.id, handle: group.groupHandle, name: group.title, managerId: group.leadBotId, memberIds: group.memberBotIds }
+        : null;
+      if (!state.delegationContracts) state.delegationContracts = [];
+      if (!state.delegationReports) state.delegationReports = [];
+      const planned = planDelegation(objective, issuerBotId, state.chiefBotId || "", planGroup, delegationBots());
+      if (!planned.ok) return ok(planned.error);
+      const now = Date.now();
+      const issuer = issuerBotId;
+      for (const plan of planned.plans) {
+        const id = nid("ctr");
+        const commitment = executionCommitment(id, plan.subGoal, plan.scopes);
+        state.delegationContracts.unshift({
+          id,
+          issuerBotId: issuer,
+          assigneeBotId: plan.assigneeId,
+          groupId: planGroup?.id ?? "",
+          scopeLabel: planned.scopeLabel,
+          subGoal: plan.subGoal,
+          complexityScore: plan.complexity,
+          routedEndpoint: plan.routedEndpoint,
+          costTier: plan.costTier,
+          scopes: plan.scopes,
+          verifierRule: plan.verifierRule,
+          requiresHuman: plan.requiresHuman,
+          status: plan.status,
+          commitment,
+          frictionReason: plan.frictionReason,
+          createdAt: now,
+          updatedAt: now,
+        });
+        const challenged = plan.status === "friction_challenged";
+        state.delegationReports.unshift({
+          id: nid("rep"),
+          contractId: id,
+          fromBotId: challenged ? plan.assigneeId : issuer,
+          toBotId: challenged ? issuer : plan.assigneeId,
+          reportType: challenged ? "cognitive_friction_challenge" : "delegated",
+          summary: challenged ? plan.frictionReason : `Assigned. Status: in progress. Route: ${plan.costTier} via ${plan.routedEndpoint}.`,
+          commitment,
+          createdAt: now,
+        });
+      }
+      state.delegationContracts = state.delegationContracts.slice(0, 40);
+      state.delegationReports = state.delegationReports.slice(0, 40);
+      return ok(planned.toast);
+    }
+    case "resolve_delegation_friction": {
+      const id = String(a.contractId ?? "");
+      const note = String(a.note ?? "").trim();
+      if ([...note].length < 8) return ok("Add a clarification of at least 8 characters.");
+      if (!state.delegationContracts) state.delegationContracts = [];
+      if (!state.delegationReports) state.delegationReports = [];
+      const contract = state.delegationContracts.find((item) => item.id === id);
+      if (!contract) return ok("Contract not found.");
+      if (contract.status !== "friction_challenged") return ok("That contract is not waiting on a decision.");
+      const now = Date.now();
+      const reason = frictionReason(note);
+      if (reason) {
+        contract.frictionReason = reason;
+        contract.updatedAt = now;
+        state.delegationReports.unshift({ id: nid("rep"), contractId: id, fromBotId: contract.assigneeBotId, toBotId: contract.issuerBotId, reportType: "cognitive_friction_challenge", summary: reason, commitment: contract.commitment, createdAt: now });
+        return ok(`Still waiting on a decision: ${reason}`);
+      }
+      contract.subGoal = `${contract.subGoal} Clarification: ${note}`;
+      contract.status = "in_progress";
+      contract.frictionReason = "";
+      contract.commitment = executionCommitment(contract.id, contract.subGoal, contract.scopes);
+      contract.requiresHuman = ["which ", "prefer", "should we", "looks better"].some((word) => note.toLowerCase().includes(word));
+      contract.updatedAt = now;
+      state.delegationReports.unshift({ id: nid("rep"), contractId: id, fromBotId: contract.issuerBotId, toBotId: contract.assigneeBotId, reportType: "friction_resolved", summary: note, commitment: contract.commitment, createdAt: now });
+      return ok("Clarification saved. The contract is in progress.");
+    }
+    case "attest_delegation_contract": {
+      const id = String(a.contractId ?? "");
+      const note = String(a.note ?? "").trim();
+      if ([...note].length < 8) return ok("Add a note of at least 8 characters.");
+      if (!state.delegationContracts) state.delegationContracts = [];
+      if (!state.delegationReports) state.delegationReports = [];
+      const contract = state.delegationContracts.find((item) => item.id === id);
+      if (!contract) return ok("Contract not found.");
+      if (contract.status !== "in_progress") return ok("Attest a contract only after it is in progress.");
+      const now = Date.now();
+      contract.status = "verified_complete";
+      contract.updatedAt = now;
+      state.delegationReports.unshift({ id: nid("rep"), contractId: id, fromBotId: contract.issuerBotId, toBotId: contract.assigneeBotId, reportType: "owner_attestation", summary: note, commitment: contract.commitment, createdAt: now });
+      return ok("Attested. The contract is marked done by you.");
+    }
+    case "handle_mobile_chief_command":
+      return ok("Phone commands run in the desktop app, and only after that channel is connected.");
+    case "snapshot_poll":
+      return ok(null);
+    case "license_status":
+      return ok(`License ${state.license?.status ?? "unsigned_dev"}.`);
+    case "bot_circuit_toggle": {
+      const bot = state.profiles.find((item) => item.id === String(a.botId ?? ""));
+      if (!bot) return ok("Unknown bot.");
+      if (!Array.isArray(state.botAllowances)) state.botAllowances = [];
+      bot.walletFrozen = !bot.walletFrozen;
+      const row = state.botAllowances.find((item) => item.botId === bot.id);
+      if (row) {
+        row.frozen = bot.walletFrozen;
+        row.dailyLimitUsd = bot.dailyWalletLimitUsd ?? row.dailyLimitUsd;
+      } else {
+        state.botAllowances.push({
+          botId: bot.id,
+          handle: bot.handle,
+          role: bot.role,
+          railsAllowed: "",
+          perTxCap: "",
+          spentTodayUsd: 0,
+          dailyLimitUsd: bot.dailyWalletLimitUsd ?? 0,
+          frozen: bot.walletFrozen,
+        });
+      }
+      return ok(bot.walletFrozen ? `${bot.handle} wallet frozen. Agent spends are rejected.` : `${bot.handle} wallet re-armed.`);
+    }
     case "set_takeover": {
       const bot = state.profiles.find((item) => item.id === a.botId);
       if (!bot) return ok("Bot not found.");
@@ -1545,7 +1924,7 @@ export async function browserCall(cmd: string, args: Record<string, unknown>): P
       return ok(bot.takeover ? "You have control of this bot's computer." : "The bot can work again.");
     }
     default:
-      return ok(null);
+      throw new Error(`${cmd} runs in the desktop app. This preview left the workspace unchanged.`);
   }
 }
 
@@ -1621,7 +2000,7 @@ function seed(): Snapshot {
     updatedAt: Date.now(),
   });
   return {
-    homeDir: "~/.omniworkspace",
+    homeDir: "~/.ronicos",
     onboardingComplete: false,
     vaultUnlocked: true,
     hasPassphrase: false,
@@ -1633,6 +2012,9 @@ function seed(): Snapshot {
     threads: [defaultThread],
     steps: [],
     botGroups: [],
+    chiefBotId: "",
+    delegationContracts: [],
+    delegationReports: [],
     gatewayAudits: [],
     providers: [
       provider("prov_claude", "Claude Code", "cli_subprocess", "", 0, "", "prov_anthropic", "Not installed. Download Claude Code from the chat dock, or use an Anthropic key."),
@@ -1684,10 +2066,18 @@ function seed(): Snapshot {
       { rail: "crypto_x402", label: "Crypto & x402", amountUsd: 0, nativeAmount: "0.00 USDC", nativeValue: 0, detail: "Sandbox ledger. No exchange is connected." },
       { rail: "razorpay_upi", label: "Razorpay India", amountUsd: 0, nativeAmount: "₹0", nativeValue: 0, detail: "Sandbox ledger. No payout account is connected." },
       { rail: "stripe_card", label: "Stripe virtual card", amountUsd: 0, nativeAmount: "No card", nativeValue: 0, detail: "Sandbox ledger. No card is connected." },
+      { rail: "hyperliquid_ws", label: "Hyperliquid L1 margin", amountUsd: 0, nativeAmount: "0.00 USDC", nativeValue: 0, detail: "Sandbox ledger. Quant rail over wss://api.hyperliquid.xyz/ws." },
     ],
     transactions: [],
     positions: [],
+    quantOrders: [],
+    botAllowances: [],
+    ledgerMode: "sandbox",
+    sentinels: [],
+    sentinelEvents: [],
+    tierStatus: [],
     remediation: [],
+    shadowBackups: [],
     processes: [],
     fleetLogs: [],
     extensions: [],
@@ -1712,6 +2102,9 @@ function seed(): Snapshot {
       autoFailover: true,
       autoActUnderUsd: 0.5,
       updateChannel: "stable",
+      updateMode: "auto",
+      updateNoticeVersion: "",
+      updateFeedUrl: "",
       version: "2.1.4",
       availableVersion: "2.1.4",
       plan: "Local",
@@ -1749,6 +2142,7 @@ function seed(): Snapshot {
       walletMicroUsd: 0,
       leaseExpUnix: 0,
       hardwareHash: "",
+      proEntitled: true,
     },
   };
 }

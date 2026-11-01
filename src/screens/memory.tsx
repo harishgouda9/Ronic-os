@@ -25,7 +25,7 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { useOmni } from "../store";
+import { useRonic } from "../store";
 import { pickPaths } from "../api";
 import type { MemoryEngine, MemoryItem } from "../types";
 import { Pill, when } from "../ui/bits";
@@ -79,7 +79,7 @@ interface SearchHit {
   score: number;
 }
 
-const META_STORAGE_KEY = "omni.mem0.meta_v2";
+const META_STORAGE_KEY = "ronic.mem0.meta_v2";
 const DEMO_MEMORY_IDS = new Set(["mem_101", "mem_102", "mem_103", "mem_104"]);
 
 function listFromPayload(payload: unknown, key: string): unknown[] | null {
@@ -116,9 +116,9 @@ function loadStoredMeta(): Record<string, { category?: MemoryCategory; tags?: st
 }
 
 export function Memory() {
-  const snap = useOmni((s) => s.snap)!;
-  const run = useOmni((s) => s.run);
-  const busy = useOmni((s) => s.busy);
+  const snap = useRonic((s) => s.snap)!;
+  const run = useRonic((s) => s.run);
+  const busy = useRonic((s) => s.busy);
 
   // Global Scope & Active Engine
   const [globalScope, setGlobalScope] = useState<string>("Workspace default");
@@ -197,8 +197,8 @@ export function Memory() {
 
   useEffect(() => {
     try {
-      localStorage.removeItem("omni.mem0.graph_v2");
-      localStorage.removeItem("omni.mem0.history_v2");
+      localStorage.removeItem("ronic.mem0.graph_v2");
+      localStorage.removeItem("ronic.mem0.history_v2");
     } catch {}
   }, []);
 
@@ -598,64 +598,67 @@ export function Memory() {
   ];
 
   return (
-    <div className="screen memory-screen select-none space-y-5" style={{ maxWidth: 1440, margin: "0 auto", paddingBottom: 48 }}>
-      {/* =====================================================================
-          1. TOP HEADER BAR
-         ===================================================================== */}
-      <div className="flex flex-wrap items-start justify-between gap-4">
-        <div className="space-y-1 max-w-2xl">
-          <h1 className="text-xl font-bold tracking-tight">Memory</h1>
-          <p className="text-xs text-[#64748B]">
-            Manage the vault selected for this scope. Mem0 stays local to the workspace (<code>state.db</code>);
-            includes Atomic Facts, Mem0g Entity Graph, Smart Extraction, and Mutation History.
-          </p>
-          <p className="text-xs font-mono text-emerald-700 pt-0.5">{statusBanner}</p>
+    <div className="flex-1 h-full bg-[#eceef2] p-3 sm:p-5 lg:p-6 overflow-y-auto select-none flex flex-col">
+      <div className="w-full max-w-[1560px] flex-1 min-h-[660px] bg-white rounded-3xl shadow-[0_12px_40px_-8px_rgba(0,0,0,0.06),0_2px_8px_-1px_rgba(0,0,0,0.03)] border border-slate-200/70 flex flex-col mx-auto overflow-hidden transition-all duration-300">
+        {/* Top Header inside Floating White Card */}
+        <div className="p-5 sm:p-7 pb-4 space-y-4 border-b border-slate-100 bg-white">
+          <div className="flex flex-wrap items-start justify-between gap-4">
+            <div className="space-y-1 max-w-2xl">
+              <h1 className="text-xl font-bold tracking-tight text-slate-900">Memory</h1>
+              <p className="text-xs text-[#64748B]">
+                Manage the vault selected for this scope. Mem0 stays local to the workspace (<code>state.db</code>);
+                includes Atomic Facts, Mem0g Entity Graph, Smart Extraction, and Mutation History.
+              </p>
+              <p className="text-xs font-mono text-emerald-700 pt-0.5">{statusBanner}</p>
+            </div>
+
+            <div className="flex items-center gap-2 flex-wrap">
+              <button
+                disabled={busy}
+                onClick={() => {
+                  void run("scan_memory_engines").then((res) => {
+                    setStatusBanner(res?.toast || "Scan finished.");
+                  });
+                }}
+                className="px-3 py-1.5 text-xs font-semibold bg-white border border-[#E5E5E5] rounded-[6px] hover:border-slate-400 transition cursor-pointer shadow-2xs"
+              >
+                Scan desktop
+              </button>
+              <button
+                disabled={busy}
+                onClick={() => {
+                  void run("refresh_memory_vault", { engineId: activeEngine }).then((res) => {
+                    setStatusBanner(res ? (res.toast || `Refreshed state.db: ${atomicMemories.length} atomic memories & ${graphEdges.length} graph edges.`) : "Could not refresh the vault.");
+                  });
+                }}
+                className="px-3 py-1.5 text-xs font-semibold bg-white border border-[#E5E5E5] rounded-[6px] hover:border-slate-400 transition cursor-pointer shadow-2xs"
+              >
+                Refresh vault
+              </button>
+              <button
+                disabled={busy}
+                onClick={() => {
+                  void run("sync_memories_to_engine", { targetEngineId: "obsidian_khoj" }).then((res) => {
+                    setStatusBanner(res ? (res.toast || `Exported ${atomicMemories.length} Mem0 facts and [[Wikilinks]] graph edges to Obsidian vault.`) : "Could not export to Obsidian.");
+                  });
+                }}
+                className="px-3 py-1.5 text-xs font-semibold bg-white border border-[#E5E5E5] rounded-[6px] hover:border-slate-400 transition cursor-pointer shadow-2xs"
+              >
+                Copy Mem0 to Obsidian
+              </button>
+              <button
+                onClick={handleStartNewNote}
+                className="px-3.5 py-1.5 text-xs font-semibold bg-zinc-800 hover:bg-zinc-700 text-white border border-zinc-700/50 rounded-[6px] transition flex items-center gap-1.5 shadow-xs cursor-pointer active:scale-95"
+              >
+                <Plus size={14} className="text-white" stroke="#ffffff" />
+                <span>New memory</span>
+              </button>
+            </div>
+          </div>
         </div>
 
-        <div className="flex items-center gap-2 flex-wrap">
-          <button
-            disabled={busy}
-            onClick={() => {
-              void run("scan_memory_engines").then((res) => {
-                setStatusBanner(res?.toast || "Scan finished.");
-              });
-            }}
-            className="px-3 py-1.5 text-xs font-semibold bg-white border border-[#E5E5E5] rounded-[6px] hover:border-slate-400 transition"
-          >
-            Scan desktop
-          </button>
-          <button
-            disabled={busy}
-            onClick={() => {
-              void run("refresh_memory_vault", { engineId: activeEngine }).then((res) => {
-                setStatusBanner(res ? (res.toast || `Refreshed state.db: ${atomicMemories.length} atomic memories & ${graphEdges.length} graph edges.`) : "Could not refresh the vault.");
-              });
-            }}
-            className="px-3 py-1.5 text-xs font-semibold bg-white border border-[#E5E5E5] rounded-[6px] hover:border-slate-400 transition"
-          >
-            Refresh vault
-          </button>
-          <button
-            disabled={busy}
-            onClick={() => {
-              void run("sync_memories_to_engine", { targetEngineId: "obsidian_khoj" }).then((res) => {
-                setStatusBanner(res ? (res.toast || `Exported ${atomicMemories.length} Mem0 facts and [[Wikilinks]] graph edges to Obsidian vault.`) : "Could not export to Obsidian.");
-              });
-            }}
-            className="px-3 py-1.5 text-xs font-semibold bg-white border border-[#E5E5E5] rounded-[6px] hover:border-slate-400 transition"
-          >
-            Copy Mem0 to Obsidian
-          </button>
-          <button
-            onClick={handleStartNewNote}
-            className="px-3.5 py-1.5 text-xs font-semibold bg-slate-700 hover:bg-slate-800 text-white rounded-[6px] transition flex items-center gap-1.5 shadow-xs"
-            style={{ color: "#ffffff" }}
-          >
-            <Plus size={14} className="text-white" stroke="#ffffff" />
-            <span className="text-white" style={{ color: "#ffffff" }}>New memory</span>
-          </button>
-        </div>
-      </div>
+        {/* Scrollable Content inside Floating White Card */}
+        <div className="flex-1 overflow-y-auto p-5 sm:p-7 space-y-6">
 
       {/* =====================================================================
           2. SCOPE SELECTOR & 5 ENGINE CARDS
@@ -1047,7 +1050,7 @@ export function Memory() {
                 <button
                   disabled={busy || !editFact.trim()}
                   onClick={handleSaveOrUpdateMemory}
-                  className="px-4 py-2 text-xs font-semibold bg-slate-700 hover:bg-slate-800 text-white rounded-[6px] transition flex items-center gap-1.5 shadow-xs"
+                  className="px-4 py-2 text-xs font-semibold bg-zinc-800 hover:bg-zinc-700 text-white border border-zinc-700/50 shadow-xs rounded-[6px] transition flex items-center gap-1.5 shadow-xs"
                   style={{ color: "#ffffff" }}
                 >
                   <Check size={14} className="text-white" stroke="#ffffff" />
@@ -1182,7 +1185,7 @@ export function Memory() {
                     setNewEdgeTarget("");
                   }}
                   disabled={!selectedMemory}
-                  className="w-full py-1.5 font-semibold bg-slate-700 hover:bg-slate-800 text-white rounded-[6px] transition text-xs shadow-xs disabled:opacity-40"
+                  className="w-full py-1.5 font-semibold bg-zinc-800 hover:bg-zinc-700 text-white border border-zinc-700/50 shadow-xs rounded-[6px] transition text-xs shadow-xs disabled:opacity-40"
                   style={{ color: "#ffffff" }}
                 >
                   <span className="text-white" style={{ color: "#ffffff" }}>Save wikilink</span>
@@ -1213,7 +1216,7 @@ export function Memory() {
             />
             <button
               onClick={handleSmartExtractFromText}
-              className="px-4 py-2 text-xs font-semibold bg-slate-700 hover:bg-slate-800 text-white rounded-[6px] transition flex items-center gap-1.5 shadow-xs"
+              className="px-4 py-2 text-xs font-semibold bg-zinc-800 hover:bg-zinc-700 text-white border border-zinc-700/50 shadow-xs rounded-[6px] transition flex items-center gap-1.5 shadow-xs"
               style={{ color: "#ffffff" }}
             >
               <Sparkles size={14} className="text-white" stroke="#ffffff" />
@@ -1433,7 +1436,7 @@ export function Memory() {
                         setStatusBanner(`✓ Connected Obsidian vault at: "${path}". Synced notes & [[wikilinks]].`);
                         setInstallingEngine(null);
                       }}
-                      className="px-4 py-1.5 text-xs font-semibold bg-slate-700 hover:bg-slate-800 text-white rounded-[6px] transition disabled:opacity-50 flex items-center gap-1.5"
+                      className="px-4 py-1.5 text-xs font-semibold bg-zinc-800 hover:bg-zinc-700 text-white border border-zinc-700/50 shadow-xs rounded-[6px] transition disabled:opacity-50 flex items-center gap-1.5"
                       style={{ color: "#ffffff" }}
                     >
                       <Check size={13} className="text-white" stroke="#ffffff" />
@@ -1579,7 +1582,7 @@ export function Memory() {
                           }
                           setInstallingEngine(null);
                         }}
-                        className="px-4 py-1.5 text-xs font-semibold bg-slate-700 hover:bg-slate-800 text-white rounded-[6px] transition flex items-center gap-1.5"
+                        className="px-4 py-1.5 text-xs font-semibold bg-zinc-800 hover:bg-zinc-700 text-white border border-zinc-700/50 shadow-xs rounded-[6px] transition flex items-center gap-1.5"
                         style={{ color: "#ffffff" }}
                       >
                         <Check size={13} className="text-white" stroke="#ffffff" />
@@ -1593,6 +1596,8 @@ export function Memory() {
           </div>
         </div>
       )}
+        </div>
+      </div>
     </div>
   );
 }

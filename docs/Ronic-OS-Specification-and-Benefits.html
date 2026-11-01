@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ronic OS — Product Specification &amp; Benefits Report</title>
+<style>
+  :root {
+    --ink: #0e1116;
+    --paper: #ffffff;
+    --accent: #d92626;
+    --accent-soft: #fdecec;
+    --core-bg: #fff7ed;
+    --core-border: #f59e0b;
+    --muted: #5b6470;
+    --line: #e3e7ec;
+    --h1: #0b1220;
+    --chip: #eef2f6;
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  body {
+    font-family: "Segoe UI", "Inter", -apple-system, BlinkMacSystemFont, sans-serif;
+    color: var(--ink);
+    background: var(--paper);
+    margin: 0;
+    line-height: 1.55;
+    font-size: 13.5px;
+  }
+  .page {
+    max-width: 860px;
+    margin: 0 auto;
+    padding: 48px 52px 64px;
+  }
+  /* ---- Cover header ---- */
+  .cover {
+    border-bottom: 4px solid var(--h1);
+    padding-bottom: 22px;
+    margin-bottom: 30px;
+  }
+  .brand {
+    display: flex; align-items: center; gap: 14px;
+  }
+  .brand-mark {
+    width: 46px; height: 46px; border-radius: 10px;
+    background: linear-gradient(135deg, #0b1220, #24314b);
+    color: #fff; display: flex; align-items: center; justify-content: center;
+    font-weight: 800; font-size: 20px; letter-spacing: 0.5px;
+  }
+  .brand-name { font-size: 26px; font-weight: 800; letter-spacing: -0.4px; }
+  .cover h1 {
+    font-size: 30px; margin: 14px 0 6px; color: var(--h1);
+    letter-spacing: -0.6px; line-height: 1.15;
+  }
+  .cover .sub { color: var(--muted); font-size: 14px; }
+  .meta {
+    margin-top: 12px; font-size: 12px; color: var(--muted);
+    display: flex; gap: 18px; flex-wrap: wrap;
+  }
+  .meta span b { color: var(--ink); font-weight: 600; }
+
+  /* ---- Headings ---- */
+  h2 {
+    font-size: 20px; color: var(--h1); letter-spacing: -0.3px;
+    margin: 34px 0 10px; padding-bottom: 6px;
+    border-bottom: 2px solid var(--line);
+  }
+  h2 .star { color: var(--accent); }
+  h3 {
+    font-size: 15.5px; color: var(--h1);
+    margin: 22px 0 6px;
+  }
+
+  /* ---- Core highlight cards ---- */
+  .core-note {
+    background: var(--chip); border: 1px solid var(--line);
+    border-radius: 8px; padding: 10px 14px; font-size: 13px;
+    color: var(--muted); margin-bottom: 14px;
+  }
+  .core-card {
+    background: var(--core-bg);
+    border: 1.5px solid var(--core-border);
+    border-left: 6px solid var(--core-border);
+    border-radius: 10px;
+    padding: 14px 18px 12px;
+    margin: 14px 0;
+    page-break-inside: avoid;
+  }
+  .core-card h3 {
+    margin: 0 0 6px; font-size: 16px; color: var(--h1);
+    display: flex; align-items: center; gap: 8px;
+  }
+  .core-badge {
+    display: inline-block; background: var(--accent); color: #fff;
+    font-size: 10px; font-weight: 700; letter-spacing: 0.6px;
+    padding: 2px 8px; border-radius: 999px; text-transform: uppercase;
+  }
+  .core-card p { margin: 6px 0 0; }
+
+  /* ---- Function sections ---- */
+  .func { margin: 10px 0; page-break-inside: avoid; }
+  .func h3 {
+    background: var(--chip);
+    padding: 6px 12px; border-radius: 7px;
+    border-left: 4px solid #24314b;
+  }
+  ul { margin: 6px 0 10px; padding-left: 20px; }
+  li { margin: 3px 0; }
+  li b, p b { color: var(--h1); }
+
+  /* ---- Benefits ---- */
+  .benefit {
+    border: 1px solid var(--line);
+    border-left: 5px solid var(--accent);
+    border-radius: 8px;
+    padding: 10px 16px 8px;
+    margin: 10px 0;
+    page-break-inside: avoid;
+  }
+  .benefit h3 { margin: 0 0 4px; font-size: 14.5px; }
+  .benefit p { margin: 4px 0 4px; }
+
+  /* ---- Table ---- */
+  table {
+    width: 100%; border-collapse: collapse; margin: 12px 0;
+    font-size: 12.5px;
+  }
+  th, td {
+    text-align: left; padding: 7px 10px;
+    border-bottom: 1px solid var(--line);
+  }
+  th {
+    background: var(--chip); font-weight: 700; color: var(--h1);
+    border-bottom: 2px solid #c9d2dc;
+  }
+  tr { page-break-inside: avoid; }
+  td:first-child { font-weight: 600; white-space: nowrap; }
+
+  .callout {
+    background: #f3f7ff; border: 1px solid #c7d9f7;
+    border-radius: 8px; padding: 10px 14px; margin: 12px 0;
+    font-size: 12.5px;
+  }
+  .footer {
+    margin-top: 40px; padding-top: 14px;
+    border-top: 1px solid var(--line);
+    color: var(--muted); font-size: 11.5px;
+    display: flex; justify-content: space-between;
+  }
+  code {
+    background: var(--chip); padding: 1px 5px; border-radius: 4px;
+    font-family: "JetBrains Mono", Consolas, monospace; font-size: 12px;
+  }
+  @media print {
+    .page { padding: 30px 34px; max-width: none; }
+    h2 { page-break-after: avoid; }
+  }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <!-- ============================ COVER ============================ -->
+  <div class="cover">
+    <div class="brand">
+      <div class="brand-mark">R</div>
+      <div class="brand-name">Ronic OS</div>
+    </div>
+    <h1>Product Specification &amp; Benefits Report</h1>
+    <div class="sub">A local-first agent workstation for Windows — one desktop shell where coding CLIs, web agents, MCP servers, bot profiles, memory, skills, workflows, and a sandbox wallet share a single workspace, with no server-side dependency for the core loop.</div>
+    <div class="meta">
+      <span><b>Version analyzed:</b> ronicos 2.1.4</span>
+      <span><b>Report date:</b> 2026-10-30</span>
+      <span><b>Basis:</b> Full codebase analysis (Rust ~23k LOC, React/TS, cloud control plane)</span>
+    </div>
+  </div>
+
+  <!-- ============================ CORE FUNCTIONS ============================ -->
+  <h2><span class="star">★</span> Core Functions <span style="font-size:12px;color:var(--muted);font-weight:500;">(flagship capabilities — highlighted)</span></h2>
+  <div class="core-note">These five capabilities define Ronic OS and deliver the most value to the user. They are verified against the actual codebase implementation.</div>
+
+  <div class="core-card">
+    <h3><span class="core-badge">Core 1</span> Unified Local-First Agent Workstation</h3>
+    <p><b>One desktop shell for every AI tool you use.</b> Ronic OS consolidates coding CLIs, web agents, MCP servers, bot profiles, memory, skills, workflows, and a sandbox wallet into a single Windows desktop application — <b>with no server-side dependency for the core loop</b>. Chats, bots, files, and state all live locally under <code>~/.omniworkspace</code> (SQLite + encrypted vault). The cloud is only used for licensing, billing, and optional burst compute.</p>
+  </div>
+
+  <div class="core-card">
+    <h3><span class="core-badge">Core 2</span> Multi-Bot Squads + 3-Pillar Computer-Use Engine</h3>
+    <p><b>Run 2–4 AI bots simultaneously, each in its own isolated mini-window.</b> Each bot gets its own WebView2 profile, virtual cursor HUD, and one of three driver pillars: (1) per-bot floating PiP mini-computer windows with synthetic DOM driving confined to that window, (2) <b>native Windows UIAutomation</b> control-tree driving with background InvokePattern/ValuePattern and WM_LBUTTONDOWN posting — the user's real cursor is never touched, and (3) <b>Set-of-Marks vision grounding</b> — 960×540 window capture fused with UIA rectangles, numbered badges stamped in Rust, exact mark_id → pixel center registry. A shared <b>Squad Blackboard bus</b> (<code>tokio::sync::broadcast</code>, capacity 256 + SQLite persistence) lets a producer bot stream structured packets directly into consumer bots — <b>no OS clipboard, no cross-contamination, sub-millisecond coordination</b>. A process-wide <b>emergency halt flag</b> can stop all computer use instantly. Squads are a <b>Pro-licensed</b> feature.</p>
+  </div>
+
+  <div class="core-card">
+    <h3><span class="core-badge">Core 3</span> Encrypted Local Vault + Offline License Verification</h3>
+    <p><b>Military-grade local security with zero-knowledge architecture.</b> All API keys and secrets live in <code>secrets.vault</code> encrypted with <b>AES-256-GCM</b>; the key is derived from your passphrase with <b>Argon2id</b>. <code>lock_vault</code> drops the key from memory. Licensing uses <b>Ed25519-signed 7-day offline leases</b> verified locally in &lt;0.1ms against a compiled-in public key — editing the database achieves nothing because the signature covers user_id, tier, hardware_hash, and expiry.</p>
+  </div>
+
+  <div class="core-card">
+    <h3><span class="core-badge">Core 4</span> Visual Workflow Engine with Human Approval Gates</h3>
+    <p><b>Build multi-step bot automations with checkpoints you control.</b> Workflows persist in SQLite + YAML, support up to 8 nodes (LLM reasoning, approval gates, wallet execution, browser automation), and run on schedules (daily, every 15m/1h, cron). <b>Any step containing "approve" automatically becomes a human approval gate</b> — the workflow pauses until you review and resume. Per-node checkpoint JSON enables pause/resume from any point, with a drag-and-drop node-graph editor.</p>
+  </div>
+
+  <div class="core-card">
+    <h3><span class="core-badge">Core 5</span> Policy-Gated Multi-Rail Wallet &amp; Quant Terminal</h3>
+    <p><b>A deterministic guardrail the AI can never bypass.</b> The built-in wallet enforces hard limits — max per-transaction USD, daily spending cap, human-approval-above threshold, max slippage (basis points), and a <b>kill switch</b> that blocks all agent/trade actions instantly. Every spend passes <code>policy::evaluate</code> in Rust and settles as auto_signed / pending_approval (fail-closed review queue) / rejected_by_policy / blocked_killswitch — the model has no override path. Four rails are wired (x402 USDC micropayments, Razorpay UPI, Stripe virtual agent cards, Hyperliquid WS quant rail with 5 bps builder rebate), plus per-bot daily limits, operator circuit breakers, and a sandbox faucet. <code>live_signer</code> mode signs everything but external network rails stay physically locked in this build.</p>
+  </div>
+
+  <!-- ============================ OTHER FUNCTIONS ============================ -->
+  <h2>Other Functions <span style="font-size:12px;color:var(--muted);font-weight:500;">(complete feature inventory, A–N)</span></h2>
+
+  <div class="func">
+    <h3>A. Bots, Profiles, Group Chats &amp; Co-Worker Protocol</h3>
+    <ul>
+      <li><b>Bot profiles:</b> create, duplicate, and manage local AI bot profiles with custom personas, per-bot flags/permissions, and per-harness account mapping (primary/long-context/fallback).</li>
+      <li><b>Group chats &amp; squads (chat level):</b> multi-bot group conversations with @-mention resolution, selectable coordination modes, and round-robin dispatch (Pro-gated squads).</li>
+      <li><b>Co-worker protocol:</b> outcome-first system prompt, action-signature dedup (3rd identical failing call blocked), tiered pivot ladder on failures, definition-of-done contracts compiled from the user prompt, and EXPERIENCE.md lesson persistence.</li>
+      <li><b>Model routing &amp; failover:</b> five provider types — local Ollama, CLI subprocess (incl. WSL), BYOK API, official OAuth (ChatGPT plan via PKCE), isolated webview — with live health probes.</li>
+      <li><b>Routines:</b> schedule any thread (daily HH:MM, every 15m/1h, cron).</li>
+      <li><b>Teach tasks &amp; takeover:</b> convert conversations into reusable taught tasks; per-bot human takeover toggle.</li>
+      <li><b>Attachments:</b> files threaded through dispatch → answer_bot → run_turn → execute_tool with an <b>absolute-path allowlist</b> and <b>sensitive-path denylist</b>.</li>
+    </ul>
+  </div>
+
+  <div class="func">
+    <h3>B. Apps, Providers &amp; Tool Detection</h3>
+    <ul>
+      <li><b>Environment scan:</b> auto-detect installed CLIs, IDEs, and web agents (found/missing/started report).</li>
+      <li><b>One-click linking:</b> link detected tools into the workspace.</li>
+      <li><b>Provider management:</b> add/update/test AI providers; API keys stored in the encrypted vault.</li>
+      <li><b>Sign in with ChatGPT:</b> official PKCE OAuth — dynamic client registration, S256 challenge, local 127.0.0.1 callback, ID-token iss/aud/nonce validation, refresh-token rotation; the chatgpt.tokens.use.direct plan scope lets bots reply from the user's ChatGPT plan without an API key. Refresh tokens stored in the OS keychain (Windows Credential Manager).</li>
+      <li><b>Custom apps:</b> override executable paths; add arbitrary local apps; start/stop/restart tool daemons (fleet actions).</li>
+      <li><b>Harness detection:</b> scan all AI harnesses, open dedicated harness windows, run prompts directly against binaries or URLs.</li>
+    </ul>
+  </div>
+
+  <div class="func">
+    <h3>C. Memory Vault (Mem0-Style, Local)</h3>
+    <ul>
+      <li><b>Built-in Mem0-style vault:</b> SQLite memory with 256-dim signed hash-embeddings and cosine ranking, [[wikilink]] graph-edge extraction, and an event journal.</li>
+      <li><b>Multi-engine routing:</b> scan engines and route memory by scope (global or per-bot); mount/unmount a companion engine; sync across engines. <b>Freemium gate:</b> Mem0 + Obsidian free; Zep/Cognee/Letta and graph/code engines are Pro.</li>
+      <li><b>Obsidian two-way sync:</b> import/refresh/delete with 5,000-note / 20MB caps — not just export.</li>
+      <li><b>Vault actions:</b> search and journal via a dedicated command group.</li>
+    </ul>
+  </div>
+
+  <div class="func">
+    <h3>D. Skills, Plugins, MCP Mesh &amp; Code Mode</h3>
+    <ul>
+      <li><b>18 prebuilt skills ship in the box:</b> computer-use, agent-browser, code-review, find-skills, grill-me, improve-codebase-architecture, vercel-react-best-practices (~90 rule files), remotion-to-hyperframes, hyperframes-cli, composio, MinerU (PDF/DOCX/PPTX → Markdown/LaTeX), and 7 NVIDIA skills (cuDF, CUDA-Q, cuOpt ×2, NeMo Retriever ×2, Nemotron policy) — each with a governance skill-card.</li>
+      <li><b>Skill lifecycle:</b> save, toggle per-profile, remove, load, and propose skills from chat with approve/reject resolution.</li>
+      <li><b>Plugin system:</b> save, toggle per-agent or per-desktop, trust, remove (plugin.yaml manifests); scan project-local plugins.</li>
+      <li><b>MCP servers:</b> save, toggle, trust, remove, connect directly; marketplace installs (Notion, Linear, Sentry, Slack, GitHub, Supabase, filesystem, memory, Playwright, Razorpay MCPs) register the real server.</li>
+      <li><b>Universal MCP/ACP mesh:</b> MCP alias server (port 8765) + ACP JSON-RPC inbox (port 8766) for peer-app tasks; config auto-merging into known clients (ChatGPT/Claude/Gemini/Grok web, Cursor, VS Code, Claude Desktop/Code, Codex, Gemini CLI, Aider, OpenCode, Grokbot, Hermes); per-app share flags; ask_peer ticketing.</li>
+      <li><b>Code Mode (Cloudflare-style):</b> compiles the live MCP/ACP surface into a compact ronic.d.ts (with token estimates), then interprets the model's TypeScript block <b>in-process</b> — user JS never runs in Node/Bun; a marker denylist blocks process, fetch, eval, imports, and Node builtins.</li>
+      <li><b>Local MCP bridge:</b> bearer-token HTTP MCP server on <b>127.0.0.1:47331</b> exposing memory/skills/plugins/files tools to embedded webviews and CLI harnesses; auto-registers into Claude Code, Cursor, VS Code, Claude Desktop configs; holds the attachment allowlist + sensitive-path denylist.</li>
+      <li><b>Opt-in cloudflared tunnel:</b> auto-downloaded cloudflared fronts the token-gated MCP alias server with one public URL embedding the bridge token (401 without it); last_mcp_call proves a web harness actually connected.</li>
+      <li><b>Install from URL / git:</b> install skills, plugins, and git packages (clone a GitHub repo and register its SKILL.md files).</li>
+    </ul>
+  </div>
+
+  <div class="func">
+    <h3>E. Marketplace</h3>
+    <ul>
+      <li><b>Catalog browsing</b> of skills, plugins, and tools with a review→listed→removed lifecycle.</li>
+      <li><b>MCP-backed installs:</b> installing an MCP item registers the real server.</li>
+      <li><b>Cloud store backend:</b> Supabase listings/packs/purchases; pack bodies gated to seller-or-paid-buyer.</li>
+    </ul>
+  </div>
+
+  <div class="func">
+    <h3>F. Computer, Browser &amp; Site Windows</h3>
+    <ul>
+      <li><b>3-pillar computer-use subsystem</b> (~2,650 LOC) — PiP mini-computer windows, native UIAutomation control-tree driving, and Set-of-Marks vision grounding (see Core 2) — plus a process-wide <b>emergency halt</b> every driver checks.</li>
+      <li><b>Mini computer shell:</b> per-bot shell IPC — boot/layout, app/tab switching (Files/Chrome/Terminal), sandboxed per-bot file explorer and history; the calling webview's label identifies the bot so cross-bot access is impossible.</li>
+      <li><b>URL inspector:</b> SSRF-guarded fetch (blocks private hosts) extracting up to 40 interactive DOM nodes; <b>allowlisted sandbox commands</b> for safe shell execution.</li>
+      <li><b>Site windows &amp; sign-in choreography:</b> Edge-impersonating UA + client hints via WebView2 CDP; Google/Apple OAuth handed off to real Chrome/Edge on the site's own EBWebView profile; popup windows and blank-page recovery.</li>
+      <li><b>Bot screen windows:</b> per-bot private browser child-webviews with isolated profiles, workspace-confined shell cwd, and DOM snapshot read-back (up to 40 controls).</li>
+      <li><b>Page browser &amp; workspace webapps:</b> embedded browser with navigation/place/hide controls; positioned webapps; launch desktop apps by id/kind/path.</li>
+    </ul>
+  </div>
+
+  <div class="func">
+    <h3>G. Coding Agents, IDE &amp; Terminal</h3>
+    <ul>
+      <li><b>Coding workspace</b> with a real embedded PTY terminal (xterm.js + portable-pty, PowerShell/bash) — per-session readers stream output; shared between user terminal tabs and bot mini-computer terminals.</li>
+      <li><b>Git panel:</b> live status/stage/restore with porcelain parsing, secret-path masking in diffs, and one-click dispatch to installed CLI agents (claude/aider/codex/gemini/opencode) or opening Cursor/VS Code.</li>
+      <li><b>IDE agent selection</b> (choose which harness drives the IDE) and kernel ops (DB diagnostics/maintenance, shadow-git pruning, workspace backups).</li>
+    </ul>
+  </div>
+
+  <div class="func">
+    <h3>H. Bot Fleet, Live Messaging Gateways &amp; Mission Control</h3>
+    <ul>
+      <li><b>Fleet dashboard:</b> control kernel/bot daemons (status with RAM/PID), routines, fleet log; start/stop/restart daemon processes; ghost-runner toggle; per-bot circuit breaker.</li>
+      <li><b>Live messaging gateways</b> (~1,600 LOC): real integrations with <b>Telegram</b> (Bot API long-polling), <b>Discord</b> (Gateway WebSocket), <b>Slack</b> (Socket Mode), and <b>WhatsApp</b> (QR-pairing WebSocket). Credentials validated against live platform APIs; tokens stored server-side only, never sent to the frontend.</li>
+      <li><b>Strict remote firewall:</b> PID-conflict reclaim kills orphaned gateway processes; remote commands honored only when the channel is connected+enabled and the sender matches the allowlisted owner ID; routes @bot mentions and /screen, /approve slash commands.</li>
+      <li><b>Bi-directional push:</b> interactive push alerts to your phone (wallet approval gates, sentinel incidents) with inline buttons; callbacks honored only from the allowlisted owner.</li>
+    </ul>
+  </div>
+
+  <div class="func">
+    <h3>I. Workflows (Extended)</h3>
+    <ul>
+      <li><b>Visual node-graph editor</b> (xyflow) with node kinds: LLM reasoning, human approval gate, wallet execution, browser automation, bot action, conditional/branch.</li>
+      <li><b>Execution semantics:</b> approval-gate and wallet-execution nodes pause the run as paused_editable; Resume approves the gate and continues. One-run-at-a-time mutex, per-step checkpoints, wf-progress Tauri events, steps execute through the real bot engine.</li>
+      <li><b>Checkpoints:</b> per-node checkpoint output previews and resume-from-checkpoint merging.</li>
+      <li><b>YAML mirror:</b> every workflow mirrored to <code>~/.ronicos/workflows/&lt;id&gt;.workflow.yaml</code>.</li>
+      <li><b>Bot-authored workflows:</b> bots author workflows via the <code>save_workflow</code> agent tool.</li>
+      <li><b>Example shipped:</b> Sales &amp; Marketing Funnel Automation (lead-capture → lead-qualification → nurture-conversion → retention).</li>
+    </ul>
+  </div>
+
+  <div class="func">
+    <h3>J. Wallet, Trading &amp; Quant Terminal (Extended)</h3>
+    <ul>
+      <li><b>Sandbox ledger</b> with micro-USD precision ($1.00 = 1,000,000 micro-USD; integer math, no floating-point).</li>
+      <li><b>Four rails:</b> x402 USDC micropayments, Razorpay UPI (₹400 cap), Stripe virtual agent cards, Hyperliquid WS quant rail (5 bps builder rebate) — plus a sandbox faucet (3 top-ups/day) and per-bot circuit breakers.</li>
+      <li><b>Configurable policy gates</b> (max/tx, daily cap, approval threshold, slippage, kill switch) plus transaction review and sandbox top-ups.</li>
+      <li><b>Two-layer quant pipeline:</b> LLM signal → Rust policy signer; quant dispatch (pair, side, size, analyst, thesis) and position closing.</li>
+      <li><b>Ledger modes:</b> sandbox vs live_signer — live signs everything but external network rails stay physically locked in this build.</li>
+      <li><b>Burst Compute:</b> wallet-gated OpenRouter wholesale proxy (cost + 20%) via the cloud control plane.</li>
+    </ul>
+  </div>
+
+  <div class="func">
+    <h3>K. Self-Modify, Self-Repair, Sentinels &amp; Kernel Ops</h3>
+    <ul>
+      <li><b>4-tier self-repair engine</b> (~860 LOC): Tier 1 — 500ms anti-hang watchdog + SQLite WAL unlocker; Tier 2 — CDP DOM selector auto-healer with recorded heals; Tier 3 — shadow-git instant checkpoint rollback; Tier 4 — Harness² recursive script/skill auto-patcher with real node --check syntax probes and trailing-comma JSON healing.</li>
+      <li><b>Autonomous sentinel fleet:</b> 5 sentinels (Sentry, Supabase, Vercel, GitHub, Middleware) running real local checks every 30s in a background thread with capped audit tails; scan/acknowledge/remediate.</li>
+      <li><b>Local extensions:</b> save, toggle, and generate extensions from a natural-language prompt.</li>
+      <li><b>Repair doctor:</b> shadow-backup restore (path-name validated), workspace refresh (release stuck turns, WAL checkpoint), and a self-patcher that rewrites known-bad skill scripts.</li>
+      <li><b>Kernel ops:</b> DB diagnostics (page/WAL/freelist bytes), DB maintenance (VACUUM/optimize), shadow-git pruning, whole-workspace folder backups.</li>
+      <li><b>Harness² engine:</b> prompt complexity scoring, recursive plan records, budgeted runs, a run library with keep/promote/revert into the bot's soul.</li>
+      <li><b>Bug reports:</b> preview and submit — <b>API keys stripped before saving</b> (Anthropic/OpenAI/Stripe/GitHub keys, bearer tokens, AWS creds, PEM blocks).</li>
+      <li><b>Reset workspace</b> with confirmation guard.</li>
+    </ul>
+  </div>
+
+  <div class="func">
+    <h3>L. Settings, Themes &amp; System</h3>
+    <ul>
+      <li><b>Settings</b> with runtime themes and density; command palette (Ctrl+K), debug overlay (Ctrl+Shift+D), workspace recovery (Ctrl+Shift+R), embedded terminal (Ctrl+`).</li>
+      <li><b>Native integration:</b> file/folder pickers, save-to-disk export, snapshot polling, <code>ronic://</code> deep links.</li>
+    </ul>
+  </div>
+
+  <div class="func">
+    <h3>M. Cloud Control Plane (Vercel + Supabase)</h3>
+    <ul>
+      <li><b>Dual-gateway billing:</b> Stripe (USD) + Razorpay (INR/UPI) webhooks, idempotent via a billing-events ledger.</li>
+      <li><b>Founder Pass:</b> atomic claim capped at 500 ($149 / ₹11,999), badge numbers 1–500, founder_lifetime tier with 3 device seats, never downgraded by later billing events.</li>
+      <li><b>PKCE desktop auth</b> bounce, Burst LLM proxy, ghost-runner stub (501 until the Firecracker cluster ships), and the Tauri updater manifest endpoint.</li>
+      <li><b>Schema:</b> profiles, device_activations, licenses, founder_pass_pool, compute_wallets, billing_events, ghost_runners + marketplace tables; RLS everywhere; money mutations only via service-role RPCs.</li>
+    </ul>
+  </div>
+
+  <div class="func">
+    <h3>N. Security Model (Cross-Cutting)</h3>
+    <ul>
+      <li><b>Scoped Tauri capabilities:</b> main-window IPC only; third-party webviews get zero IPC.</li>
+      <li><b>Loopback-only MCP bridge</b> with a fixed tool whitelist; opt-in public tunnel only.</li>
+      <li><b>Sensitive-path denylist + attachment allowlist</b> on model-controlled file access.</li>
+      <li><b>Argon2id + AES-256-GCM vault</b>; Ed25519 hardware-bound leases; redacted bug reports.</li>
+    </ul>
+  </div>
+
+  <!-- ============================ BENEFITS ============================ -->
+  <h2>User Benefits — Why Users Choose Ronic OS</h2>
+
+  <div class="benefit"><h3>1. Total Privacy &amp; Data Sovereignty</h3><p>Everything runs on your machine. Conversations, bot configs, memory, API keys, and workflows never leave your disk unless you explicitly opt into a cloud feature. Genuinely local-first in a cloud-everything era.</p></div>
+  <div class="benefit"><h3>2. One App Replaces Ten</h3><p>Instead of juggling terminals, browser tabs for different agents, MCP managers, note apps, and scripting glue — you get a single coherent shell. Fewer context switches, less setup, more output.</p></div>
+  <div class="benefit"><h3>3. Run Multiple AI Bots in Parallel, Safely</h3><p>Isolated cookie partitions and virtual cursors mean bots never interfere with each other or your main session, and the blackboard bus lets them collaborate at machine speed — multi-agent orchestration at the OS level, not in a chat thread.</p></div>
+  <div class="benefit"><h3>4. You Never Lose Control of Spending</h3><p>The policy engine is a hard, deterministic Rust gate — not a prompt instruction. Set a daily cap, per-transaction max, slippage limit, or flip the kill switch, and the AI physically cannot exceed it.</p></div>
+  <div class="benefit"><h3>5. Enterprise-Grade Security Without the Enterprise</h3><p>Argon2id, AES-256-GCM, Ed25519 offline licenses, hardware-bound device seats, loopback-only bridges, scoped IPC, redacted bug reports — security architecture that would cost a team months, baked in.</p></div>
+  <div class="benefit"><h3>6. Workflows That Pause for Your Approval</h3><p>Approval gates mean the bot does the work and waits for your sign-off on anything sensitive. Checkpoints mean you resume exactly where it paused — no lost state, no re-runs.</p></div>
+  <div class="benefit"><h3>7. Instant Access to a Curated Skill Library</h3><p>18 production-grade skills ship in the box — computer-use, browser agents, NVIDIA GPU tooling, MinerU document parsing, Vercel React best practices, HyperFrames video. Installed on launch; no hunting, no setup.</p></div>
+  <div class="benefit"><h3>8. Works Offline, Licenses Offline</h3><p>The Ed25519 lease model gives paying users 7 days of full access with zero cloud calls on startup — no "phone home to verify you still exist." Dev mode runs unsigned and every local feature keeps working.</p></div>
+  <div class="benefit"><h3>9. Self-Healing Workspace</h3><p>Sentinels watch for problems, shadow backups let you roll back, and the repair doctor fixes the workspace automatically. Bug reports strip your API keys before they're saved.</p></div>
+  <div class="benefit"><h3>10. Built for Power Users</h3><p>Command palette, embedded terminal, debug overlay, workspace recovery, deep links, native pickers, Obsidian export — every interaction is designed for speed.</p></div>
+  <div class="benefit"><h3>11. Your Bots Live Where You Already Talk</h3><p>Native Telegram, Discord, Slack, and WhatsApp gateways mean your bots reply inside the apps you already use — with a strict owner-allowlist firewall so only you can issue commands, and interactive push buttons so you can approve a spend or acknowledge an incident from your phone. Tokens are validated against live APIs and never exposed to the frontend.</p></div>
+  <div class="benefit"><h3>12. Safe Agent Code Execution, Not Just Chat</h3><p>Code Mode compiles your live MCP/ACP tool surface into a TypeScript definition and interprets the model's code <b>in-process</b> with a denylist (no process, fetch, eval, imports, Node builtins) — agents orchestrate tools with real code, but untrusted JS never touches Node/Bun or your shell.</p></div>
+
+  <!-- ============================ ARCHITECTURE ============================ -->
+  <h2>Technical Architecture Summary</h2>
+  <table>
+    <tr><th>Layer</th><th>Technology</th></tr>
+    <tr><td>Desktop shell</td><td>Tauri 2 (WebView2), Windows</td></tr>
+    <tr><td>Backend</td><td>Rust (~23k LOC, 45 modules), tokio async, SQLite (rusqlite, bundled)</td></tr>
+    <tr><td>Frontend</td><td>React 19, TypeScript, Vite 7, Tailwind CSS 4, Zustand</td></tr>
+    <tr><td>UI extras</td><td>xterm.js terminal, @xyflow/react node graphs, react-markdown + GFM + highlight</td></tr>
+    <tr><td>Crypto</td><td>AES-256-GCM, Argon2id, Ed25519 (dalek), SHA-256, getrandom, OS keychain (keyring)</td></tr>
+    <tr><td>Desktop control</td><td>webview2-com, windows-rs (Win32/GDI), uiautomation, portable-pty, image+imageproc (SoM badges)</td></tr>
+    <tr><td>Messaging gateways</td><td>Telegram Bot API, Discord Gateway WS, Slack Socket Mode, WhatsApp QR</td></tr>
+    <tr><td>Networking</td><td>reqwest (rustls), tokio-tungstenite (rustls), cloudflared (opt-in)</td></tr>
+    <tr><td>Cloud control plane</td><td>Vercel serverless (zero runtime deps), Supabase (schema + Edge Functions)</td></tr>
+    <tr><td>Billing</td><td>Stripe (USD) + Razorpay (INR/UPI), idempotent webhooks</td></tr>
+    <tr><td>Licensing</td><td>Ed25519-signed 7-day offline leases, hardware-bound, compile-time public key</td></tr>
+    <tr><td>State</td><td><code>~/.omniworkspace/state.db</code> (SQLite, WAL) + <code>secrets.vault</code></td></tr>
+    <tr><td>Protocols</td><td><code>ronic://</code> deep links, MCP on 127.0.0.1, CDP browser driving</td></tr>
+  </table>
+
+  <div class="callout">
+    <b>Scale of the surface area:</b> 212 Tauri IPC commands across 27 feature domains (122 in the central command module), 21 application screens, 12 studio components, 45 Rust backend modules, and 18 bundled skills. In-file <code>#[cfg(test)]</code> suites validate policy gates, vault round-trips, sentinel break→detect→remediate→verify flows, the attachment allowlist, and Code Mode sandboxing.
+  </div>
+
+  <div class="footer">
+    <span>Ronic OS — Product Specification &amp; Benefits Report</span>
+    <span>Generated from direct codebase analysis · No source files modified · 2026-10-30</span>
+  </div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-squad-window-status"
+description = "Enables the squad_window_status command without any pre-configured scope."
+commands.allow = ["squad_window_status"]
+
+[[permission]]
+identifier = "deny-squad-window-status"
+description = "Denies the squad_window_status command without any pre-configured scope."
+commands.deny = ["squad_window_status"]

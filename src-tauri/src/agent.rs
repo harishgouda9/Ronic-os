@@ -4,6 +4,7 @@ use crate::redact::redact;
 use crate::util::{now_ms, run_capture, truncate_utf8};
 use crate::wallet;
 use crate::AppState;
+use tauri::{Emitter, Manager};
 use regex::Regex;
 use rusqlite::{params, Connection};
 use serde::Serialize;
@@ -124,8 +125,28 @@ fn with_db<T>(state: &AppState, f: impl FnOnce(&Connection) -> T) -> T {
     f(&conn)
 }
 
+pub fn strip_directives(text: &str) -> String {
+    let mut s = text.to_string();
+    while let Some(start) = s.find("[APPROVAL MODE:") {
+        if let Some(end) = s[start..].find(']') {
+            s.replace_range(start..start + end + 1, "");
+        } else {
+            break;
+        }
+    }
+    while let Some(start) = s.find("[FORMATTING DIRECTIVE:") {
+        if let Some(end) = s[start..].find(']') {
+            s.replace_range(start..start + end + 1, "");
+        } else {
+            break;
+        }
+    }
+    s.trim().to_string()
+}
+
 pub fn dispatch(state: &AppState, prompt: &str, secrets: &HashMap<String, String>, provider_override: Option<&str>, model: Option<&str>, effort: Option<&str>, attachments: &[String]) -> Result<String> {
-    let prompt = prompt.trim();
+    let clean = strip_directives(prompt);
+    let prompt = clean.trim();
     if prompt.is_empty() && attachments.is_empty() {
         return Err(err("write a task first"));
     }
@@ -154,7 +175,7 @@ pub fn dispatch(state: &AppState, prompt: &str, secrets: &HashMap<String, String
         AfterPrep::Talk { thread_id, turn_id, bot_id, composed, settings, effort, pinned, speaker_handle } => {
             let home = state.home.clone();
             with_db(state, |conn| crate::harness2_engine::arm_chat(conn, &home, prompt, attachments));
-            let name = match answer_bot(state, &thread_id, &turn_id, &bot_id, secrets, model, &effort, &composed, &settings, true, pinned)? {
+            let name = match answer_bot(state, &thread_id, &turn_id, &bot_id, secrets, model, &effort, &composed, &settings, true, pinned, attachments)? {
                 BotTurn::Paused(note) => {
                     with_db(state, |conn| finish(conn, &thread_id))?;
                     return Ok(note);
@@ -183,7 +204,7 @@ pub fn dispatch(state: &AppState, prompt: &str, secrets: &HashMap<String, String
                     Ok(())
                 })?;
                 already.push(id.clone());
-                match answer_bot(state, &thread_id, &turn_id, &id, secrets, None, &effort, &composed, &settings, false, false) {
+                match answer_bot(state, &thread_id, &turn_id, &id, secrets, None, &effort, &composed, &settings, false, false, attachments) {
                     Ok(BotTurn::Spoke(_)) => current = id,
                     Ok(BotTurn::Paused(_)) => break,
                     Err(error) => {
@@ -210,10 +231,18 @@ fn prepare_turn(conn: &Connection, title_source: &str, prompt: &str, provider_ov
     let thread_id = db::kv_get(conn, "active_thread")?.ok_or_else(|| err("no active thread"))?;
     db::require_thread(conn, &thread_id)?;
     let owner_id: String = conn.query_row("SELECT bot_profile_id FROM chat_threads WHERE id = ?1", params![thread_id], |r| r.get(0))?;
+    // Wipe any live-activity markers left by an earlier turn so the pill
+    // never shows a stale "working on X" line from before this send.
+    conn.execute("DELETE FROM execution_steps WHERE action_type = 'turn_activity' AND thread_id = ?1", params![thread_id])?;
     let bot_id = crate::bots::mentioned(conn, &thread_id, prompt, &owner_id)?;
     let speaker = crate::bots::flags(conn, &bot_id)?;
     let turn_id = crate::util::nid("turn");
-    let composed = compose_user_text(conn, prompt, attachments);
+    // The user-visible bubble shows a clean summary — the prompt plus compact
+    // attachment chips — not the multi-thousand-character inlined file dump the
+    // model receives. `composed` still goes to the model unchanged, but it is
+    // built only after the short-circuit gates below so a gated turn (wallet
+    // hold, takeover pause) never pays to read and inline the attachments.
+    let display = display_user_text(prompt, attachments);
     let skip_key = format!("skip_gate:{thread_id}");
     let skip = db::kv_get(conn, &skip_key)?.as_deref() == Some("1");
     if skip {
@@ -224,9 +253,12 @@ fn prepare_turn(conn: &Connection, title_source: &str, prompt: &str, provider_ov
         params![thread_id],
         |row| row.get(0),
     ).unwrap_or_default();
-    let replay = skip && (last_user.trim() == prompt || last_user.trim() == composed.trim());
+    // Match the stored step against the display text actually persisted (and
+    // the bare prompt for the no-attachment case) so a gateway-retry with an
+    // attachment never double-inserts the user bubble.
+    let replay = skip && (last_user.trim() == prompt || last_user.trim() == display.trim());
     if !replay {
-        insert_step_in(conn, &thread_id, &turn_id, "user", "", &composed, "message", &json!({}), 0)?;
+        insert_step_in(conn, &thread_id, &turn_id, "user", "", &display, "message", &json!({}), 0)?;
     }
     conn.execute("UPDATE chat_threads SET status = 'running' WHERE id = ?1", params![thread_id])?;
 
@@ -255,7 +287,7 @@ fn prepare_turn(conn: &Connection, title_source: &str, prompt: &str, provider_ov
                 finish(conn, &thread_id)?;
                 return Ok(AfterPrep::Done(note));
             }
-            if speaker.require_wallet {
+            if speaker.require_wallet && speaker.approval_mode != "auto" {
                 crate::bots::hold(conn, &thread_id, &turn_id, &speaker, "wallet", prompt, Some(amount), "wallet.x402", &target)?;
                 finish(conn, &thread_id)?;
                 return Ok(AfterPrep::Done("Held for your approval.".into()));
@@ -271,7 +303,7 @@ fn prepare_turn(conn: &Connection, title_source: &str, prompt: &str, provider_ov
             finish(conn, &thread_id)?;
             return Ok(AfterPrep::Done(note));
         }
-        if speaker.require_external && crate::bots::external_action(prompt) {
+        if speaker.require_external && speaker.approval_mode != "auto" && crate::bots::external_action(prompt) {
             let target = crate::bots::clip_target(prompt);
             if crate::bots::is_denied(conn, &bot_id, "external.send", &target)? {
                 crate::bots::audit(conn, &bot_id, &thread_id, "external.send", &target, "denied_by_rule", "user_deny")?;
@@ -291,6 +323,10 @@ fn prepare_turn(conn: &Connection, title_source: &str, prompt: &str, provider_ov
         return Ok(AfterPrep::Audit { thread_id, turn_id, root });
     }
 
+    // Build the model-facing text (read + inline the attachments) only now that
+    // every short-circuit gate has passed and the turn will reach the model.
+    let composed = compose_user_text(conn, prompt, attachments);
+
     Ok(AfterPrep::Talk {
         thread_id,
         turn_id,
@@ -303,7 +339,7 @@ fn prepare_turn(conn: &Connection, title_source: &str, prompt: &str, provider_ov
     })
 }
 
-fn answer_bot(state: &AppState, thread_id: &str, turn_id: &str, bot_id: &str, secrets: &HashMap<String, String>, model: Option<&str>, effort: &str, composed: &str, settings: &crate::models::Settings, use_composer: bool, pinned: bool) -> Result<BotTurn> {
+fn answer_bot(state: &AppState, thread_id: &str, turn_id: &str, bot_id: &str, secrets: &HashMap<String, String>, model: Option<&str>, effort: &str, composed: &str, settings: &crate::models::Settings, use_composer: bool, pinned: bool, attachments: &[String]) -> Result<BotTurn> {
     let ready = with_db(state, |conn| -> Result<std::result::Result<(crate::bots::BotFlags, String, String, Vec<Value>), String>> {
         let speaker = crate::bots::flags(conn, bot_id)?;
         if speaker.takeover {
@@ -316,8 +352,20 @@ fn answer_bot(state: &AppState, thread_id: &str, turn_id: &str, bot_id: &str, se
         } else {
             None
         };
-        let mut provider_id = override_model.filter(|value| !value.is_empty()).unwrap_or(speaker.primary.clone());
-        if !pinned {
+        // A bound bot (cloud API or original subscription) speaks only through
+        // its own linked engine: the thread's model override and provider
+        // failover would answer as some other model while the UI still says
+        // @grokbot, so both are bypassed here.
+        let bound = matches!(speaker.engine_kind.as_str(), "openai_api" | "subscription");
+        let mut provider_id = if bound {
+            speaker.primary.clone()
+        } else {
+            override_model.filter(|value| !value.is_empty()).unwrap_or(speaker.primary.clone())
+        };
+        // Failover is the Pro entitlement: <50ms handoff when a subscription
+        // cap hits mid-task. Starter gets the honest error instead of a silent
+        // provider switch; dev builds are entitled.
+        if !pinned && !bound && crate::licensing::pro_entitled(conn) {
             let (next, capsule) = failover(conn, &provider_id, &settings.auto_failover)?;
             provider_id = next;
             if let Some(capsule) = capsule {
@@ -343,9 +391,25 @@ fn answer_bot(state: &AppState, thread_id: &str, turn_id: &str, bot_id: &str, se
         Err(note) => return Ok(BotTurn::Paused(note)),
         Ok(ready) => ready,
     };
+    // Bound bots default to the model they were linked with; the composer can
+    // still pick a different model from that same engine's list.
+    let model = model
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            if matches!(speaker.engine_kind.as_str(), "openai_api" | "subscription") {
+                let own = speaker.api_model.trim().to_string();
+                if own.is_empty() { None } else { Some(own) }
+            } else {
+                None
+            }
+        });
     let started = Instant::now();
     let epoch = turn_epoch();
-    let (reply, failed) = match run_turn(state, thread_id, turn_id, bot_id, &provider_id, &system, secrets, model, effort, &tools, speaker.allow_code, speaker.allow_computer, speaker.allow_browser, speaker.allow_file) {
+    // Definition of done for this turn, read once from the user's own words.
+    let contract = crate::coworker::compile_contract(composed);
+    let (reply, failed) = match run_turn(state, thread_id, turn_id, bot_id, &provider_id, &system, secrets, model.as_deref(), effort, &tools, speaker.allow_code, speaker.allow_computer, speaker.allow_browser, speaker.allow_file, &contract, composed, attachments) {
         Err(first) if reply_was_cleared(&first) => {
             let _ = with_db(state, |conn| finish(conn, thread_id));
             return Ok(BotTurn::Paused(first));
@@ -357,8 +421,10 @@ fn answer_bot(state: &AppState, thread_id: &str, turn_id: &str, bot_id: &str, se
                 None
             } else {
                 with_db(state, |conn| -> Result<Option<String>> {
-                    let tools_ran: i64 = conn.query_row("SELECT COUNT(*) FROM execution_steps WHERE thread_id=?1 AND turn_id=?2 AND role='tool'", params![thread_id, turn_id], |row| row.get(0)).unwrap_or(0);
-                    if pinned || tools_ran > 0 {
+                    let tools_ran: i64 = conn.query_row("SELECT COUNT(*) FROM execution_steps WHERE thread_id=?1 AND turn_id=?2 AND role='tool' AND action_type != 'turn_activity'", params![thread_id, turn_id], |row| row.get(0)).unwrap_or(0);
+                    // Bound bots do not silently fail over to another provider:
+                    // @grokbot answering through Gemini would be a fake reply.
+                    if pinned || tools_ran > 0 || matches!(speaker.engine_kind.as_str(), "openai_api" | "subscription") {
                         return Ok(None);
                     }
                     fallback_of(conn, &provider_id)
@@ -374,7 +440,7 @@ fn answer_bot(state: &AppState, thread_id: &str, turn_id: &str, bot_id: &str, se
                 // The retry keeps the bot's own tool permissions. Overriding
                 // them here would let a fenced tool call run on failover even
                 // when the bot was configured with every tool disabled.
-                let text = match run_turn(state, thread_id, turn_id, bot_id, &provider_id, &system, secrets, model, effort, &tools, speaker.allow_code, speaker.allow_computer, speaker.allow_browser, speaker.allow_file) {
+                let text = match run_turn(state, thread_id, turn_id, bot_id, &provider_id, &system, secrets, model.as_deref(), effort, &tools, speaker.allow_code, speaker.allow_computer, speaker.allow_browser, speaker.allow_file, &contract, composed, attachments) {
                     Err(error) if reply_was_cleared(&error) => {
                         let _ = with_db(state, |conn| finish(conn, thread_id));
                         return Ok(BotTurn::Paused(error));
@@ -397,11 +463,8 @@ fn answer_bot(state: &AppState, thread_id: &str, turn_id: &str, bot_id: &str, se
         if failed && ms >= speaker.stall_ms {
             crate::bots::note_stall(conn, bot_id, thread_id, ms)?;
         }
-        let name = provider_name(conn, &provider_id)?;
-        let label = match model.map(str::trim).filter(|value| !value.is_empty()).map(short_model) {
-            Some(bit) => format!("{} · {name} · {bit}", speaker.handle),
-            None => format!("{} · {name}", speaker.handle),
-        };
+        let _ = provider_name(conn, &provider_id);
+        let label = speaker.handle.clone();
         insert_step_in(conn, thread_id, turn_id, "assistant", &label, &reply, "message", &json!({}), ms)?;
         crate::bots::touch_status(conn, bot_id, &reply)?;
         Ok(format!("{label} replied in {ms}ms"))
@@ -418,8 +481,36 @@ fn normalize_effort(effort: Option<&str>) -> String {
     }
 }
 
+/// The clean, user-visible version of a sent message: the prompt plus one
+/// compact chip per attachment. The full file contents go to the model via
+/// `compose_user_text`; this is what renders in the chat bubble, so a large
+/// attached file never floods the transcript.
+fn display_user_text(prompt: &str, attachments: &[String]) -> String {
+    let clean = strip_directives(prompt);
+    let mut text = clean.trim().to_string();
+    if text.is_empty() {
+        text = "Read the attached files.".into();
+    }
+    if attachments.is_empty() {
+        return text;
+    }
+    let names: Vec<String> = attachments
+        .iter()
+        .map(|path| {
+            let name = std::path::Path::new(path.trim())
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.trim().to_string());
+            format!("📎 `{name}`")
+        })
+        .collect();
+    text.push_str(&format!("\n\n{}", names.join("  ")));
+    text
+}
+
 fn compose_user_text(conn: &Connection, prompt: &str, attachments: &[String]) -> String {
-    let mut text = prompt.trim().to_string();
+    let clean = strip_directives(prompt);
+    let mut text = clean.trim().to_string();
     if text.is_empty() {
         text = "Read the attached files.".into();
     }
@@ -427,24 +518,64 @@ fn compose_user_text(conn: &Connection, prompt: &str, attachments: &[String]) ->
         return text;
     }
     text.push_str("\n\nAttached files:");
+    let mut any_failed = false;
     for path in attachments {
         match crate::workspace_bridge::read_attachment(conn, path) {
             Ok(body) => {
-                text.push_str(&format!("\n- {path}\n```\n{body}\n```"));
+                // Images come back as "[Image: name]\ndata:mime;base64,..." — pass through
+                // without code fences so vision models can read the data URL directly.
+                if body.starts_with("[Image:") {
+                    text.push_str(&format!("\n- {path}\n{body}"));
+                } else {
+                    text.push_str(&format!("\n- {path}\n```\n{body}\n```"));
+                }
             }
-            Err(error) => text.push_str(&format!("\n- {path} — {error}")),
+            Err(error) => {
+                any_failed = true;
+                text.push_str(&format!("\n- {path} — could not be read ({error})"));
+            }
         }
+    }
+    // When a file genuinely failed, tell the model to retry it with read_file
+    // on the absolute path, and only if that also fails to report the specific
+    // reason — never to claim it has "no files in memory" or "no access".
+    if any_failed {
+        text.push_str("\n\n[ATTACHMENT NOTE] One or more attached files could not be inlined (reason is inline above). First retry by calling read_file with the full absolute path shown next to the failed file — read_file opens attached and Desktop files directly. If read_file also fails, tell the user the specific file and the exact reason in one sentence, then continue answering from the rest of the request. Never say you have no files in memory or no access.");
     }
     text
 }
 
-fn run_turn(state: &AppState, thread_id: &str, turn_id: &str, bot_id: &str, provider_id: &str, system: &str, secrets: &HashMap<String, String>, model: Option<&str>, effort: &str, tools: &[Value], allow_code: bool, allow_computer: bool, allow_browser: bool, allow_file: bool) -> std::result::Result<String, String> {
+/// Persist the turn's recovery story to the bot's EXPERIENCE.md so the next
+/// similar task starts smarter. Idempotent per turn via take() on the first
+/// failure; turns without tool failures leave nothing behind.
+fn note_coworker_lesson(state: &AppState, bot_id: &str, first_failure: &mut Option<String>, ended_in_failure: bool) {
+    let Some(desc) = first_failure.take() else { return };
+    let lesson = if ended_in_failure {
+        format!("'{desc}' failed and the turn ended reporting the blocker. On similar tasks, try a different surface first (a script, browser or desktop automation, or fix the missing dependency) before the approach that broke.")
+    } else {
+        format!("'{desc}' failed mid-task; recovered by pivoting approaches and finished. Prefer the working alternative on similar tasks.")
+    };
+    crate::coworker::record_lesson(&state.home, bot_id, &lesson);
+}
+
+fn run_turn(state: &AppState, thread_id: &str, turn_id: &str, bot_id: &str, provider_id: &str, system: &str, secrets: &HashMap<String, String>, model: Option<&str>, effort: &str, tools: &[Value], allow_code: bool, allow_computer: bool, allow_browser: bool, allow_file: bool, contract: &crate::coworker::Contract, current_user_text: &str, attachments: &[String]) -> std::result::Result<String, String> {
     let epoch = turn_epoch();
     let mut messages = with_db(state, |conn| history_messages(conn, thread_id, system))?;
-    let quick = messages.iter().rev().find(|message| message.role == "user").is_some_and(|message| quick_question(&message.content));
+    // The transcript stores the clean display text (prompt + attachment chips),
+    // but the model still needs the full current-turn content — including the
+    // inlined attached-file bodies. Swap the trailing user message (this turn's)
+    // for the composed text so attachments reach the model without flooding the
+    // visible bubble or the replayed history of later turns.
+    if !current_user_text.trim().is_empty() {
+        if let Some(last_user) = messages.iter_mut().rev().find(|message| message.role == "user") {
+            last_user.content = current_user_text.to_string();
+        }
+    }
+    let is_task_history = messages.iter().any(|m| m.role == "tool" || !m.tool_calls.is_empty()) || messages.len() > 3;
+    let quick = !is_task_history && messages.iter().rev().find(|message| message.role == "user").is_some_and(|message| quick_question(&message.content));
     if quick {
         let mut system_text = messages.iter().find(|message| message.role == "system").map(|message| message.content.clone()).unwrap_or_default();
-        system_text.push_str("\n\nThis is a short question. Answer in a few sentences. Do not call a tool.");
+        system_text.push_str("\n\nFor simple greetings or identity questions, answer concisely in a few sentences.");
         let mut kept: Vec<ChatMsg> = messages.iter().rev().filter(|message| message.role != "system").take(4).cloned().collect();
         kept.reverse();
         messages = vec![ChatMsg::new("system", system_text)];
@@ -454,12 +585,40 @@ fn run_turn(state: &AppState, thread_id: &str, turn_id: &str, bot_id: &str, prov
     let active: &[Value] = if quick { &[] } else { tools };
     let mut last_text = String::new();
     let mut tools_executed_total = 0usize;
+    // Co-worker dead-loop guard: (tool, args) signatures that already failed
+    // this turn. Two identical failures block a third identical retry and the
+    // model is forced to pivot. `last_failure` powers the verification gate
+    // that stops the bot from signing off while its last action failed.
+    let mut failed_sigs: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut last_failure: Option<(String, String)> = None;
+    let mut first_failure: Option<String> = None;
+    let mut gates_injected = 0u8;
+    // Pivot ladder needs to know which surfaces this bot may actually use, and
+    // the definition of done collects real tool proofs as the turn runs.
+    let surfaces = crate::coworker::Surfaces { computer: allow_computer, browser: allow_browser, files: allow_code && allow_file };
+    let mut dod_proofs: Vec<crate::coworker::Proof> = Vec::new();
+    // Live-activity writes are deduped: the pill only re-renders when the
+    // detail actually changes, so identical consecutive markers skip the DB.
+    let mut last_activity = String::new();
+    let mut note_activity = |conn: &rusqlite::Connection, detail: &str| {
+        if detail != last_activity {
+            last_activity.clear();
+            last_activity.push_str(detail);
+            let _ = db::record_turn_activity(conn, thread_id, turn_id, detail);
+        }
+    };
+    with_db(state, |conn| note_activity(conn, "analyzing request and checking tools..."));
     for _round in 0..TOOL_ROUNDS {
         if turn_epoch() != epoch {
             return Err("The reply was cleared. Send the question again.".into());
         }
+        if _round > 0 {
+            with_db(state, |conn| note_activity(conn, "evaluating tool results and planning next step..."));
+        } else {
+            with_db(state, |conn| note_activity(conn, "consulting model for next action..."));
+        }
         let round_effort = if quick { "fast" } else { effort };
-        let completion = match answer(state, provider_id, &messages, secrets, model, round_effort, active) {
+        let mut completion = match answer(state, provider_id, &messages, secrets, model, round_effort, active) {
             Ok(c) => c,
             Err(err) => {
                 if turn_epoch() != epoch || reply_was_cleared(&err) {
@@ -492,12 +651,43 @@ fn run_turn(state: &AppState, thread_id: &str, turn_id: &str, bot_id: &str, prov
             return Ok(text);
         }
         let thinking = completion.thinking.trim().to_string();
-        let calls = if completion.tool_calls.is_empty() {
-            fence_call(&completion.text).into_iter().collect::<Vec<_>>()
+        let (clean_text, fence_calls) = extract_all_tool_calls(&completion.text);
+        let mut calls = if completion.tool_calls.is_empty() {
+            fence_calls
         } else {
             completion.tool_calls
         };
+        completion.text = clean_text;
         if calls.is_empty() {
+            // Verification gate: refuse to let the turn end on a failed action.
+            // Injected at most twice per turn so a genuinely blocked task can
+            // still be reported honestly instead of looping forever.
+            if gates_injected < 2 {
+                if let Some((tool, failure)) = &last_failure {
+                    gates_injected += 1;
+                    let failure = failure.clone();
+                    let tool = tool.clone();
+                    messages.push(ChatMsg::new(
+                        "user",
+                        format!(
+                            "[VERIFICATION GATE] Your last action (`{tool}`) failed: {failure}\nDo not report success. Either fix the problem with a different approach and verify it, or state plainly what failed, what you already tried, and what remains. Identical retries of a failed action are blocked."
+                        ),
+                    ));
+                    last_failure = None;
+                    continue;
+                }
+                if let Some(missing) = contract.unmet(&dod_proofs) {
+                    gates_injected += 1;
+                    let required = contract.requirement_line().unwrap_or_default();
+                    messages.push(ChatMsg::new(
+                        "user",
+                        format!(
+                            "[DEFINITION-OF-DONE GATE] The task is not verified yet. Still missing: {missing}.\nRequired proof:\n{required}\nProduce the missing proof with your tools now. If one check is genuinely impossible, say plainly which and why; do not claim it passed."
+                        ),
+                    ));
+                    continue;
+                }
+            }
             let mut text = completion.text.trim().to_string();
             if !thinking.is_empty() {
                 with_db(state, |conn| insert_step_in(conn, thread_id, turn_id, "assistant", provider_id, &thinking, "thinking", &json!({}), 0).map_err(|error| error.0))?;
@@ -507,34 +697,50 @@ fn run_turn(state: &AppState, thread_id: &str, turn_id: &str, bot_id: &str, prov
                 let prompt_msg = if tools_executed_total > 0 {
                     "Please provide your complete, final response to the user based on the tool results above. Explain clearly what you did, what was found, and any next steps."
                 } else if !thinking.is_empty() {
-                    "Please provide your complete response to the user based on your thought process above."
+                    "Please proceed with your planned action or provide your final response to the user. Call the relevant tool now if action or inspection is needed."
                 } else {
                     "Please provide your response to the user. Do not return an empty reply."
                 };
                 messages.push(ChatMsg::new("user", prompt_msg));
-                if let Ok(synthesis) = answer(state, provider_id, &messages, secrets, model, effort, &[]) {
-                    let syn_text = synthesis.text.trim().to_string();
-                    if !syn_text.is_empty() {
-                        text = syn_text;
+                let tool_set: &[Value] = if tools_executed_total > 0 { &[] } else { active };
+                if let Ok(mut synthesis) = answer(state, provider_id, &messages, secrets, model, effort, tool_set) {
+                    let (clean_syn, syn_calls) = extract_all_tool_calls(&synthesis.text);
+                    if synthesis.tool_calls.is_empty() && !syn_calls.is_empty() {
+                        synthesis.tool_calls = syn_calls;
+                    }
+                    if !synthesis.tool_calls.is_empty() {
+                        calls = synthesis.tool_calls;
+                        completion.text = clean_syn;
+                    } else {
+                        let syn_text = clean_syn.trim().to_string();
+                        if !syn_text.is_empty() {
+                            text = syn_text;
+                        }
                     }
                 }
             }
-            if !text.is_empty() {
-                return Ok(text);
+            if calls.is_empty() {
+                note_coworker_lesson(state, bot_id, &mut first_failure, last_failure.is_some());
+                if !text.is_empty() {
+                    return Ok(text);
+                }
+                if tools_executed_total > 0 && !last_text.trim().is_empty() {
+                    return Ok(format!("{}\n\n(Finished executing tools. See details above.)", last_text));
+                }
+                if !last_text.trim().is_empty() {
+                    return Ok(last_text);
+                }
+                if tools_executed_total > 0 {
+                    return Ok("Finished executing the requested tools. Please check the steps above.".into());
+                }
+                return Ok("I have processed your request. Please let me know if you would like me to proceed or need more information.".into());
             }
-            if tools_executed_total > 0 && !last_text.trim().is_empty() {
-                return Ok(format!("{}\n\n(Finished executing tools. See details above.)", last_text));
-            }
-            if !last_text.trim().is_empty() {
-                return Ok(last_text);
-            }
-            if tools_executed_total > 0 {
-                return Ok("Finished executing the requested tools. Please check the steps above.".into());
-            }
-            return Ok("I have processed your request. Please let me know if you would like me to proceed or need more information.".into());
         }
         if !completion.text.trim().is_empty() {
             last_text = completion.text.trim().to_string();
+        }
+        if !thinking.is_empty() {
+            with_db(state, |conn| note_activity(conn, "thinking through the next step…"));
         }
         let assistant_text = if completion.text.trim().is_empty() {
             let tool_names = calls.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(", ");
@@ -556,18 +762,84 @@ fn run_turn(state: &AppState, thread_id: &str, turn_id: &str, bot_id: &str, prov
         }
         messages.push(ChatMsg::assistant_tools(assistant_text, calls.clone()));
         for call in calls {
+            let detail = match call.name.as_str() {
+                "workspace_webapp" => {
+                    let action = serde_json::from_str::<Value>(&call.arguments).ok().and_then(|v| v.get("action").and_then(|a| a.as_str()).map(str::to_string)).unwrap_or_else(|| "running".into());
+                    let target = serde_json::from_str::<Value>(&call.arguments).ok().and_then(|v| v.get("app").and_then(|a| a.as_str()).map(str::to_string)).unwrap_or_else(|| "webapp".into());
+                    format!("workspace webapp: {action} ({target})")
+                }
+                "desktop_app" => {
+                    let action = serde_json::from_str::<Value>(&call.arguments).ok().and_then(|v| v.get("action").and_then(|a| a.as_str()).map(str::to_string)).unwrap_or_else(|| "running".into());
+                    let target = serde_json::from_str::<Value>(&call.arguments).ok().and_then(|v| v.get("app").and_then(|a| a.as_str()).map(str::to_string)).unwrap_or_else(|| "app".into());
+                    format!("desktop app: {action} ({target})")
+                }
+                "install_skill" => "installing skill from source...".into(),
+                "install_plugin" => "installing plugin from source...".into(),
+                "connect_mcp" => "connecting MCP server...".into(),
+                _ => {
+                    let args_preview = serde_json::from_str::<Value>(&call.arguments).unwrap_or_else(|_| json!({}));
+                    let bit = args_preview
+                        .as_object()
+                        .and_then(|obj| obj.values().find_map(|value| value.as_str().map(str::to_owned)))
+                        .unwrap_or_default();
+                    let bit: String = bit.chars().take(56).collect();
+                    if bit.is_empty() { call.name.clone() } else { format!("{} · {}", call.name, bit) }
+                }
+            };
+            with_db(state, |conn| note_activity(conn, &detail));
             if turn_epoch() != epoch {
                 return Err("The reply was cleared. Send the question again.".into());
             }
             tools_executed_total += 1;
             let args = serde_json::from_str::<Value>(&call.arguments).unwrap_or_else(|_| json!({}));
             let started = Instant::now();
-            let (action, payload, output) = execute_tool(state, bot_id, call.name.as_str(), &args, allow_code, allow_computer, allow_browser, allow_file);
+            // Dead-loop guard: a third identical attempt at an action that
+            // already failed twice never reaches the tool layer. The model
+            // receives the block as the tool result and must pivot.
+            let sig = crate::coworker::action_signature(&call.name, &args);
+            let already_failed = failed_sigs.get(&sig).copied().unwrap_or(0);
+            let blocked = already_failed >= 2;
+            let (action, payload, mut output) = if blocked {
+                (
+                    "handoff_capsule".to_string(),
+                    json!({"guard": "dead_loop", "tool": call.name}),
+                    "[BLOCKED BY DEAD-LOOP GUARD] This exact action already failed twice in this turn, so the identical retry is disabled. Change the approach: different tool or arguments, fix the underlying cause, write a script, use browser or desktop automation, or report precisely what is blocked and why.".to_string(),
+                )
+            } else {
+                execute_tool(state, thread_id, bot_id, call.name.as_str(), &args, allow_code, allow_computer, allow_browser, allow_file, attachments)
+            };
             let ms = started.elapsed().as_millis() as i64;
             let name = call.name.clone();
+            let failed = !blocked && crate::coworker::tool_failed(&action, &payload, &output);
+            if failed {
+                let entry = failed_sigs.entry(sig).or_insert(0);
+                *entry += 1;
+                if *entry == 1 {
+                    let args_short = serde_json::to_string(&args).unwrap_or_default().chars().take(120).collect::<String>();
+                    first_failure = Some(format!("{name} {args_short}"));
+                }
+                last_failure = Some((name.clone(), output.chars().take(180).collect::<String>()));
+                // Pivot ladder: the next approach rides along in the tool result
+                // so a failure always arrives with a direction, never a dead end.
+                let pivot = crate::coworker::pivot_for(&name, &output, *entry, failed_sigs.len() as u32, surfaces);
+                output.push_str(&format!("\n\n[SYSTEM PIVOT DIRECTIVE] {}", pivot.directive));
+            } else if !blocked {
+                last_failure = None;
+                if let Some(proof) = crate::coworker::proof_of(&name, &payload, false) {
+                    if !dod_proofs.contains(&proof) {
+                        dod_proofs.push(proof);
+                    }
+                }
+            }
             with_db(state, |conn| -> std::result::Result<(), String> {
-                record_tool(conn, bot_id, thread_id, &name, &args, &output);
-                insert_step_in(conn, thread_id, turn_id, "tool", &name, &output, &action, &payload, ms).map_err(|error| error.0)?;
+                if !blocked {
+                    record_tool(conn, bot_id, thread_id, &name, &args, &output);
+                }
+                if blocked {
+                    insert_step_in(conn, thread_id, turn_id, "system", "dead-loop-guard", &output, "handoff_capsule", &payload, ms).map_err(|error| error.0)?;
+                } else {
+                    insert_step_in(conn, thread_id, turn_id, "tool", &name, &output, &action, &payload, ms).map_err(|error| error.0)?;
+                }
                 Ok(())
             })?;
             messages.push(ChatMsg::tool_result(&call.id, &name, output));
@@ -579,6 +851,7 @@ fn run_turn(state: &AppState, thread_id: &str, turn_id: &str, bot_id: &str, prov
     }
 
     // Final synthesis: if tools ran, ask the model to produce its final answer explaining findings and results
+    note_coworker_lesson(state, bot_id, &mut first_failure, last_failure.is_some());
     if tools_executed_total > 0 {
         messages.push(ChatMsg::new(
             "user",
@@ -653,6 +926,7 @@ pub(crate) fn ensure_profile(conn: &Connection) -> Result<String> {
 }
 
 fn finish(conn: &Connection, thread_id: &str) -> Result<()> {
+    conn.execute("DELETE FROM execution_steps WHERE action_type = 'turn_activity' AND thread_id = ?1", params![thread_id])?;
     let capsule = thread_capsule(conn, thread_id)?;
     conn.execute(
         "UPDATE chat_threads SET status = 'completed', compacted_context_capsule = ?1, updated_at = ?2 WHERE id = ?3",
@@ -662,7 +936,7 @@ fn finish(conn: &Connection, thread_id: &str) -> Result<()> {
 }
 
 fn thread_capsule(conn: &Connection, thread_id: &str) -> Result<String> {
-    let mut stmt = conn.prepare("SELECT role, content_markdown FROM execution_steps WHERE thread_id = ?1 ORDER BY created_at ASC")?;
+    let mut stmt = conn.prepare("SELECT role, content_markdown FROM execution_steps WHERE thread_id = ?1 AND action_type != 'turn_activity' ORDER BY created_at ASC")?;
     let rows = stmt.query_map(params![thread_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
     let rows = rows.collect::<std::result::Result<Vec<_>, _>>()?;
     let goal = rows.iter().find(|(role, _)| role == "user").map(|(_, content)| clip(content, 400)).unwrap_or_default();
@@ -729,7 +1003,7 @@ fn provider_name(conn: &Connection, id: &str) -> Result<String> {
 
 fn history_messages(conn: &Connection, thread_id: &str, system: &str) -> std::result::Result<Vec<ChatMsg>, String> {
     let capsule: String = conn.query_row("SELECT compacted_context_capsule FROM chat_threads WHERE id = ?1", params![thread_id], |row| row.get(0)).unwrap_or_default();
-    let mut stmt = conn.prepare("SELECT role, model_used, content_markdown, action_type FROM execution_steps WHERE thread_id = ?1 ORDER BY created_at ASC").map_err(|error| error.to_string())?;
+    let mut stmt = conn.prepare("SELECT role, model_used, content_markdown, action_type FROM execution_steps WHERE thread_id = ?1 AND action_type != 'turn_activity' ORDER BY created_at ASC").map_err(|error| error.to_string())?;
     let rows = stmt.query_map(params![thread_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?))).map_err(|error| error.to_string())?;
     let steps = rows.collect::<std::result::Result<Vec<_>, _>>().map_err(|error| error.to_string())?;
     Ok(fold_history(&steps, system, &capsule, HISTORY_BUDGET))
@@ -805,10 +1079,15 @@ fn tool_specs(allow_code: bool, allow_computer: bool, allow_browser: bool, allow
         tool_spec("list_threads", "List chat tasks.", &[]),
         tool_spec("list_mcp", "List MCP servers saved in this workspace. This does not start them.", &[]),
         tool_spec("list_plugins", "List plugins and whether each one is on for this bot.", &[]),
+        tool_spec("install_skill", "Download and install any skill or playbook (from a GitHub repository URL, raw file link, web URL, or marketplace catalog slug) and enable it for this bot immediately. Call this whenever the user asks to add, download, or install a skill.", &["source"]),
+        tool_spec("install_plugin", "Download and install any plugin (from a GitHub repository URL, git clone link, or package source), trust it, and enable it for this bot immediately. Call this whenever the user asks to add, download, or install a plugin.", &["source"]),
+        tool_spec("connect_mcp", "Connect, trust, and enable an MCP server for this bot so it is immediately active. Give name, transport ('stdio' or 'sse'), command (for stdio, e.g. 'npx -y @modelcontextprotocol/server-filesystem'), args, or url (for sse). Call this whenever the user asks to connect or set up an MCP server.", &["name"]),
+        tool_spec("save_workflow", "Save a task as a workflow on the Workflows screen. steps is one step per line: 'Title | instruction'. schedule is \"\" for an idle workflow a person starts by hand, or daily HH:MM, every 15m, every 1h, or a daily cron like 0 8 * * *.", &["name", "steps", "schedule"]),
+        tool_spec("schedule_routine", "Repeat this chat on a timer while Ronic OS is open. schedule is daily HH:MM, every 15m, every 1h, or a daily cron like 0 8 * * *.", &["schedule"]),
     ];
     if allow_code {
-        tools.push(tool_spec("read_file", "Read a text file inside the project folder.", &["path"]));
-        tools.push(tool_spec("list_files", "List a folder inside the project.", &["path"]));
+        tools.push(tool_spec("read_file", "Read a text file. Give a project-relative path inside the project folder, or the absolute path of a file the user attached in this chat. Absolute paths outside the attached files are refused.", &["path"]));
+        tools.push(tool_spec("list_files", "List a folder. Give a project-relative path, or the absolute path of a folder the user attached in this chat.", &["path"]));
         if allow_file {
             tools.push(tool_spec("propose_diff", "Propose a file write. It is not saved until a person accepts the diff.", &["path", "body"]));
         }
@@ -817,12 +1096,18 @@ fn tool_specs(allow_code: bool, allow_computer: bool, allow_browser: bool, allow
         tools.push(tool_spec("terminal_command", "Run an allowlisted command in this bot's own workspace folder. It cannot read another bot's files or the user's profile.", &["command"]));
         tools.push(tool_spec("sandbox_command", "Run an allowlisted command in this bot's own workspace folder. Output stays on this bot's computer.", &["command"]));
         tools.push(tool_spec("terminal_write", "Send raw keystrokes to the workspace terminal session.", &["data"]));
+        tools.push(tool_spec("desktop_app", "Control and launch desktop applications on this computer (VS Code, Cursor, Claude Code, Obsidian, Ollama, or any local desktop app). Actions: 'list' (list desktop apps and status), 'open' (launch/open the desktop app), 'inspect' (read UI controls and windows using Windows UIAutomation), 'click' (click an interface control), 'type' (type text into a desktop window), 'status'.", &["action"]));
     }
     if allow_browser {
-        tools.push(tool_spec("inspect_page", "Open an https page, or http on localhost, in this bot's own browser and read its text and controls.", &["url"]));
-        tools.push(tool_spec("read_page", "Read the page already open in this bot's browser.", &[]));
-        tools.push(tool_spec("click_control", "Click a control in this bot's browser by the id from the last read.", &["id"]));
-        tools.push(tool_spec("type_text", "Type into a text field in this bot's browser. id is the control. text is what to type.", &["id", "text"]));
+        tools.push(tool_spec("workspace_webapp", "Access, inspect, and auto-control the webapps running inside this workspace right beside your chat (like ChatGPT, Claude, Gemini, Perplexity, or custom webapps). Use this to control the user's workspace session. Actions: 'list' (list available & open webapps), 'open' (open/switch a webapp beside you on the right side), 'read' (read the current page text, title, url, and numbered interactive controls), 'click' (click a button or control by id or match text), 'type' (type text into an input by id), 'submit' (submit/press enter on an input), 'scroll' (scroll up/down), 'eval' (evaluate JavaScript), 'close'.", &["action"]));
+        tools.push(tool_spec("inspect_page", "Open an https page, or http on localhost, as a tab in this bot's own mini computer's Chrome (a visible window with its own isolated browser profile and desktop) and read its text and controls. The user sees this window.", &["url"]));
+        tools.push(tool_spec("read_page", "Read the page already open in this bot's mini computer window: text, numbered visible controls, and (when a video is present) whether it is actually playing. Usually not needed right after inspect_page, click_control, or type_text: those already return the fresh page state.", &[]));
+        tools.push(tool_spec("click_control", "Click in this bot's mini computer window. Give id (the number from the last read) OR match (text to look for, like \"add to cart\" — the window picks and clicks the best visible match itself and reports what it clicked). Clicks are synthetic; the user's mouse never moves. Returns the fresh page state.", &["id"]));
+        tools.push(tool_spec("type_text", "Type into a text field in this bot's mini computer window. id is the control. text is what to type. Returns the fresh page state.", &["id", "text"]));
+        tools.push(tool_spec("scroll_page", "Scroll the page in this bot's mini computer window one viewport down (or up) and return the fresh state. Use it to reach buttons and fields below the fold.", &["direction"]));
+        tools.push(tool_spec("find_control", "Search the page for visible controls matching the query, ranked best-first, like find \"checkout\". Returns numbered ids you can click or type into immediately.", &["query"]));
+        tools.push(tool_spec("wait_for", "Wait efficiently instead of re-reading: pause until a control matching query appears on the page, or — with media: \"playing\" — until the page's video is actually playing. ms caps the wait (default 6000). Use after a click that opens or loads something.", &["query"]));
+        tools.push(tool_spec("computer_shell", "Drive your mini computer's DESKTOP itself: action open_app (app: chrome | files | terminal | desktop), open_tab (url), focus_tab (tabId), close_tab (tabId), list_tabs, back, forward, reload, or status. Use it to work across your whole computer — read files, run something in the terminal, then return to the browser — instead of living in one page.", &["action"]));
     }
     tools
 }
@@ -842,29 +1127,31 @@ fn tool_spec(name: &str, description: &str, required: &[&str]) -> Value {
     })
 }
 
-fn fence_call(text: &str) -> Option<ToolCall> {
-    for tag in &["```omni-tool", "```tool", "```json", "```"] {
-        if let Some(rest) = text.split(tag).nth(1) {
-            let block = rest.split("```").next().unwrap_or("").trim();
-            if let Ok(value) = serde_json::from_str::<Value>(block) {
-                if let Some(name) = value.get("tool").or_else(|| value.get("name")).and_then(|item| item.as_str()) {
-                    let name = name.trim().to_string();
-                    if !name.is_empty() {
-                        let args = value.get("arguments").or_else(|| value.get("parameters")).cloned().unwrap_or_else(|| value.clone());
-                        return Some(ToolCall { id: String::new(), name, arguments: args.to_string() });
-                    }
-                }
-            }
+fn find_json_object(s: &str) -> Option<(usize, usize)> {
+    let start = s.find('{')?;
+    let mut depth = 0;
+    let mut in_str = false;
+    let mut escaped = false;
+    for (i, c) in s[start..].char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
         }
-    }
-    let trimmed = text.trim();
-    if trimmed.starts_with('{') && trimmed.ends_with('}') {
-        if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
-            if let Some(name) = value.get("tool").or_else(|| value.get("name")).and_then(|item| item.as_str()) {
-                let name = name.trim().to_string();
-                if !name.is_empty() {
-                    let args = value.get("arguments").or_else(|| value.get("parameters")).cloned().unwrap_or_else(|| value.clone());
-                    return Some(ToolCall { id: String::new(), name, arguments: args.to_string() });
+        if c == '\\' && in_str {
+            escaped = true;
+            continue;
+        }
+        if c == '"' {
+            in_str = !in_str;
+            continue;
+        }
+        if !in_str {
+            if c == '{' {
+                depth += 1;
+            } else if c == '}' {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((start, start + i + 1));
                 }
             }
         }
@@ -872,15 +1159,179 @@ fn fence_call(text: &str) -> Option<ToolCall> {
     None
 }
 
-fn execute_tool(state: &AppState, bot_id: &str, name: &str, args: &Value, allow_code: bool, allow_computer: bool, allow_browser: bool, allow_file: bool) -> (String, Value, String) {
+fn extract_all_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
+    let mut calls = Vec::new();
+    let mut cleaned = text.to_string();
+
+    // 1. Parse <|tool_call|> and <tool_call> tags
+    let tool_tags = ["<|tool_call|>", "<tool_call>"];
+    let mut iteration = 0;
+    while iteration < 20 {
+        iteration += 1;
+        let mut found = false;
+        for tag in &tool_tags {
+            if let Some(tag_pos) = cleaned.find(tag) {
+                found = true;
+                let after_tag = &cleaned[tag_pos + tag.len()..];
+                let trimmed_after = after_tag.trim_start();
+                let mut consumed_len = 0;
+                let mut matched_call = None;
+
+                // Pattern A: name={...}
+                if let Some(eq_pos) = trimmed_after.find('=') {
+                    let candidate_name = trimmed_after[..eq_pos].trim();
+                    let rest = &trimmed_after[eq_pos + 1..];
+                    if !candidate_name.is_empty() && candidate_name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
+                        if let Some((json_start, json_end)) = find_json_object(rest) {
+                            let json_str = &rest[json_start..json_end];
+                            if let Ok(val) = serde_json::from_str::<Value>(json_str) {
+                                matched_call = Some(ToolCall {
+                                    id: format!("call_txt_{}", crate::util::nid("tc")),
+                                    name: candidate_name.to_string(),
+                                    arguments: val.to_string(),
+                                });
+                                let whitespace_len = after_tag.len() - trimmed_after.len();
+                                consumed_len = tag.len() + whitespace_len + eq_pos + 1 + json_end;
+                            }
+                        }
+                    }
+                }
+
+                // Pattern B: {"name": "...", "arguments": ...} or {"tool": "..."}
+                if matched_call.is_none() {
+                    if let Some((json_start, json_end)) = find_json_object(after_tag) {
+                        let json_str = &after_tag[json_start..json_end];
+                        if let Ok(val) = serde_json::from_str::<Value>(json_str) {
+                            if let Some(name) = val.get("name").or_else(|| val.get("tool")).and_then(|v| v.as_str()) {
+                                let name = name.trim().to_string();
+                                if !name.is_empty() {
+                                    let args = val.get("arguments").or_else(|| val.get("parameters")).cloned().unwrap_or_else(|| val.clone());
+                                    matched_call = Some(ToolCall {
+                                        id: format!("call_txt_{}", crate::util::nid("tc")),
+                                        name,
+                                        arguments: args.to_string(),
+                                    });
+                                    let whitespace_len = after_tag.len() - trimmed_after.len();
+                                    consumed_len = tag.len() + whitespace_len + json_end;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if let Some(call) = matched_call {
+                    calls.push(call);
+                    let mut cut_end = tag_pos + consumed_len;
+                    let remainder = &cleaned[cut_end..];
+                    if remainder.starts_with('>') {
+                        cut_end += 1;
+                    }
+                    if cleaned[cut_end..].starts_with("<|tool_call|>") {
+                        cut_end += "<|tool_call|>".len();
+                    } else if cleaned[cut_end..].starts_with("</tool_call>") {
+                        cut_end += "</tool_call>".len();
+                    }
+                    cleaned.replace_range(tag_pos..cut_end, "");
+                    break;
+                } else {
+                    cleaned.replace_range(tag_pos..tag_pos + tag.len(), "");
+                    break;
+                }
+            }
+        }
+        if !found {
+            break;
+        }
+    }
+
+    // 2. Parse Markdown fences: ```ronic-tool, ```tool, ```json, ```
+    for tag in &["```ronic-tool", "```tool", "```json", "```"] {
+        let mut fence_iter = 0;
+        while fence_iter < 10 {
+            fence_iter += 1;
+            if let Some(start) = cleaned.find(tag) {
+                let rest = &cleaned[start + tag.len()..];
+                if let Some(end_rel) = rest.find("```") {
+                    let block = rest[..end_rel].trim();
+                    let full_fence_end = start + tag.len() + end_rel + 3;
+                    if let Ok(value) = serde_json::from_str::<Value>(block) {
+                        if let Some(name) = value.get("tool").or_else(|| value.get("name")).and_then(|item| item.as_str()) {
+                            let name = name.trim().to_string();
+                            if !name.is_empty() {
+                                let args = value.get("arguments").or_else(|| value.get("parameters")).cloned().unwrap_or_else(|| value.clone());
+                                calls.push(ToolCall {
+                                    id: format!("call_fence_{}", crate::util::nid("tc")),
+                                    name,
+                                    arguments: args.to_string(),
+                                });
+                                cleaned.replace_range(start..full_fence_end, "");
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            break;
+        }
+    }
+
+    // 3. Raw full JSON if nothing else matched
+    if calls.is_empty() {
+        let trimmed = cleaned.trim();
+        if trimmed.starts_with('{') && trimmed.ends_with('}') {
+            if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+                if let Some(name) = value.get("tool").or_else(|| value.get("name")).and_then(|item| item.as_str()) {
+                    let name = name.trim().to_string();
+                    if !name.is_empty() {
+                        let args = value.get("arguments").or_else(|| value.get("parameters")).cloned().unwrap_or_else(|| value.clone());
+                        calls.push(ToolCall {
+                            id: format!("call_raw_{}", crate::util::nid("tc")),
+                            name,
+                            arguments: args.to_string(),
+                        });
+                        cleaned = String::new();
+                    }
+                }
+            }
+        }
+    }
+
+    // Final sweep of stray tags
+    cleaned = cleaned
+        .replace("<|tool_call|>", "")
+        .replace("</tool_call>", "")
+        .replace("<tool_call>", "")
+        .replace("<|im_end|>", "")
+        .replace("<ant-thinking>", "")
+        .replace("</ant-thinking>", "")
+        .replace("<thinking>", "")
+        .replace("</thinking>", "")
+        .replace("<think>", "")
+        .replace("</think>", "")
+        .replace("<thought>", "")
+        .replace("</thought>", "")
+        .replace("<reasoning>", "")
+        .replace("</reasoning>", "")
+        .trim()
+        .to_string();
+
+    (cleaned, calls)
+}
+
+fn fence_call(text: &str) -> Option<ToolCall> {
+    let (_, calls) = extract_all_tool_calls(text);
+    calls.into_iter().next()
+}
+
+fn execute_tool(state: &AppState, thread_id: &str, bot_id: &str, name: &str, args: &Value, allow_code: bool, allow_computer: bool, allow_browser: bool, allow_file: bool, attachments: &[String]) -> (String, Value, String) {
     let refused = ("message".into(), json!({}), "That tool is off for this bot.".into());
     let file_off = ("message".into(), json!({}), "File write is off for this bot.".into());
     match name {
         "read_file" | "list_files" | "propose_diff" if !allow_code => refused,
         "propose_diff" if !allow_file => file_off,
-        "sandbox_command" | "terminal_command" | "run_command" | "execute_command" | "terminal_write" | "terminal_input" if !allow_computer => refused,
-        "inspect_page" | "read_page" | "click_control" | "type_text" if !allow_browser => refused,
-        "inspect_page" | "read_page" | "click_control" | "type_text" | "sandbox_command" | "terminal_command" | "run_command" | "execute_command" if other_computer(bot_id, args) => {
+        "sandbox_command" | "terminal_command" | "run_command" | "execute_command" | "terminal_write" | "terminal_input" | "desktop_app" if !allow_computer => refused,
+        "inspect_page" | "read_page" | "click_control" | "type_text" | "scroll_page" | "find_control" | "wait_for" | "computer_shell" | "workspace_webapp" if !allow_browser => refused,
+        "inspect_page" | "read_page" | "click_control" | "type_text" | "scroll_page" | "find_control" | "wait_for" | "computer_shell" | "sandbox_command" | "terminal_command" | "run_command" | "execute_command" if other_computer(bot_id, args) => {
             ("message".into(), json!({}), "That computer belongs to another bot.".into())
         }
         "propose_diff" => {
@@ -896,9 +1347,21 @@ fn execute_tool(state: &AppState, bot_id: &str, name: &str, args: &Value, allow_
                 let app = state.app_handle.lock().ok().and_then(|g| g.clone());
                 if let Some(app) = app {
                     use tauri::Manager;
+                    // Default to the bot's OWN mini-computer terminal (a live
+                    // PTY rooted at its workspace, the same session the shell
+                    // Terminal app shows); session: "global" reaches the
+                    // user's shared terminal instead.
+                    let which = args.get("session").and_then(|v| v.as_str()).unwrap_or("own");
+                    let session_id = if which == "global" { "ronic_global".to_string() } else { format!("mini-{}", bot_id.trim()) };
                     let mgr = app.state::<crate::terminal_pty::TerminalManager>();
-                    match mgr.write_session("omni_global", data) {
-                        Ok(()) => ("message".into(), json!({"sent": data}), format!("Sent {} bytes to global terminal stdin", data.len())),
+                    let sent = if which == "global" {
+                        mgr.write_session(&session_id, data)
+                    } else {
+                        let cwd = crate::bot_screen::shell_cwd(&state.home, bot_id, "").ok();
+                        mgr.ensure_session(&app, &session_id, 100, 30, cwd.as_deref()).and_then(|_| mgr.write_session(&session_id, data))
+                    };
+                    match sent {
+                        Ok(()) => ("message".into(), json!({"sent": data, "session": session_id}), format!("Sent {} bytes to the {} terminal", data.len(), if which == "global" { "global" } else { "bot's own mini-computer" })),
                         Err(e) => ("message".into(), json!({}), format!("Terminal write failed: {e}")),
                     }
                 } else {
@@ -908,17 +1371,60 @@ fn execute_tool(state: &AppState, bot_id: &str, name: &str, args: &Value, allow_
         }
         "inspect_page" => {
             let url = args.get("url").and_then(|item| item.as_str()).unwrap_or("").trim();
-            if url.is_empty() {
+            let target = args.get("target").or_else(|| args.get("mode")).and_then(|item| item.as_str()).unwrap_or("").trim().to_lowercase();
+            let app_id = args.get("app").and_then(|item| item.as_str()).map(str::trim);
+            if url.is_empty() && app_id.is_none() {
                 ("message".into(), json!({}), "inspect_page needs an https address, or http://localhost.".into())
+            } else if target == "workspace" || target == "stage" || app_id.is_some() {
+                let app = match desktop_handle(state) {
+                    Ok(app) => app,
+                    Err(message) => return ("message".into(), json!({}), message),
+                };
+                let id = app_id.unwrap_or_else(|| if url.contains("chatgpt") { "chatgpt" } else if url.contains("claude") { "claude" } else { "custom" });
+                let _ = crate::workspace_apps::open_workspace_webapp_by_bot(&app, id, if url.is_empty() { None } else { Some(url) }, None);
+                match crate::computer_subsystem::agent_drive_workspace_webapp(&app, bot_id, Some(id), "read", None, None, None) {
+                    Ok(hit) => remember_mini_window(state, bot_id, hit),
+                    Err(error) => ("message".into(), json!({}), error.0),
+                }
             } else {
                 drive_open(state, bot_id, url)
             }
         }
-        "read_page" => drive_read(state, bot_id),
-        "click_control" => match control_id(args) {
-            Ok(id) => drive_click(state, bot_id, id),
-            Err(message) => ("message".into(), json!({}), message),
-        },
+        "read_page" => {
+            let target = args.get("target").or_else(|| args.get("mode")).and_then(|item| item.as_str()).unwrap_or("").trim().to_lowercase();
+            let app_id = args.get("app").and_then(|item| item.as_str()).map(str::trim);
+            if target == "workspace" || target == "stage" || app_id.is_some() {
+                let app = match desktop_handle(state) {
+                    Ok(app) => app,
+                    Err(message) => return ("message".into(), json!({}), message),
+                };
+                match crate::computer_subsystem::agent_drive_workspace_webapp(&app, bot_id, app_id, "read", None, None, None) {
+                    Ok(hit) => remember_mini_window(state, bot_id, hit),
+                    Err(error) => ("message".into(), json!({}), error.0),
+                }
+            } else {
+                drive_read(state, bot_id)
+            }
+        }
+        "click_control" => {
+            let app = match desktop_handle(state) {
+                Ok(app) => app,
+                Err(message) => return ("message".into(), json!({}), message),
+            };
+            // match mode: the window picks the best visible control itself.
+            let wanted = args.get("match").and_then(|item| item.as_str()).map(str::trim).filter(|item| !item.is_empty());
+            if let Some(query) = wanted {
+                match crate::computer_subsystem::agent_drive_smart_click(&app, bot_id, query) {
+                    Ok(hit) => remember_mini_window(state, bot_id, hit),
+                    Err(error) => ("message".into(), json!({}), error.0),
+                }
+            } else {
+                match control_id(args) {
+                    Ok(id) => drive_click(state, bot_id, id),
+                    Err(message) => ("message".into(), json!({}), format!("{message} — or call click_control with match: \"button text\".")),
+                }
+            }
+        }
         "type_text" => {
             let text = args.get("text").and_then(|item| item.as_str()).unwrap_or("");
             match control_id(args) {
@@ -926,11 +1432,317 @@ fn execute_tool(state: &AppState, bot_id: &str, name: &str, args: &Value, allow_
                 Err(message) => ("message".into(), json!({}), message),
             }
         }
+        "scroll_page" => {
+            let direction = args.get("direction").and_then(|item| item.as_str()).unwrap_or("down");
+            let app = match desktop_handle(state) {
+                Ok(app) => app,
+                Err(message) => return ("message".into(), json!({}), message),
+            };
+            match crate::computer_subsystem::agent_drive_scroll(&app, bot_id, direction) {
+                Ok(hit) => remember_mini_window(state, bot_id, hit),
+                Err(error) => ("message".into(), json!({}), error.0),
+            }
+        }
+        "find_control" => {
+            let query = args.get("query").and_then(|item| item.as_str()).unwrap_or("").trim();
+            if query.is_empty() {
+                ("message".into(), json!({}), "find_control needs a query, like \"add to cart\" or \"email\".".into())
+            } else {
+                let app = match desktop_handle(state) {
+                    Ok(app) => app,
+                    Err(message) => return ("message".into(), json!({}), message),
+                };
+                match crate::computer_subsystem::agent_drive_find(&app, bot_id, query) {
+                    Ok(hit) => remember_mini_window(state, bot_id, hit),
+                    Err(error) => ("message".into(), json!({}), error.0),
+                }
+            }
+        }
+        "wait_for" => {
+            let query = args.get("query").and_then(|item| item.as_str()).map(str::trim).filter(|item| !item.is_empty());
+            let media = args.get("media").and_then(|item| item.as_str()).map(str::trim).filter(|item| !item.is_empty());
+            let ms = args.get("ms").and_then(|item| item.as_u64()).unwrap_or(6000);
+            let app = match desktop_handle(state) {
+                Ok(app) => app,
+                Err(message) => return ("message".into(), json!({}), message),
+            };
+            match crate::computer_subsystem::agent_drive_wait(&app, bot_id, query, media, ms) {
+                Ok(hit) => remember_mini_window(state, bot_id, hit),
+                Err(error) => ("message".into(), json!({}), error.0),
+            }
+        }
+        "computer_shell" => {
+            let app = match desktop_handle(state) {
+                Ok(app) => app,
+                Err(message) => return ("message".into(), json!({}), message),
+            };
+            crate::computer_subsystem::shell_control(&app, state, bot_id, args)
+        }
+        "workspace_webapp" => {
+            let app = match desktop_handle(state) {
+                Ok(app) => app,
+                Err(message) => return ("message".into(), json!({}), message),
+            };
+            let action = args.get("action").or_else(|| args.get("op")).and_then(|v| v.as_str()).unwrap_or("read").trim().to_lowercase();
+            let target_app = args.get("app").or_else(|| args.get("id")).or_else(|| args.get("name")).and_then(|v| v.as_str()).map(str::trim);
+            let url = args.get("url").and_then(|v| v.as_str()).map(str::trim);
+
+            match action.as_str() {
+                "list" => {
+                    let list = with_db(state, |conn| crate::workspace_apps::list_available_webapps(Some(conn)));
+                    let active = crate::workspace_apps::active_webapp();
+                    let summary = json!({
+                        "active": active,
+                        "webapps": list
+                    });
+                    ("workspace_webapp".into(), summary.clone(), format!("Workspace Webapps:\n{}", serde_json::to_string_pretty(&summary).unwrap_or_default()))
+                }
+                "open" | "switch" => {
+                    let target = target_app.unwrap_or_else(|| if let Some(u) = url { if u.contains("chatgpt") { "chatgpt" } else if u.contains("claude") { "claude" } else { "custom" } } else { "chatgpt" });
+                    match crate::workspace_apps::open_workspace_webapp_by_bot(&app, target, url, None) {
+                        Ok(msg) => ("workspace_webapp".into(), json!({"action": "open", "app": target, "status": "opened"}), msg),
+                        Err(err) => ("message".into(), json!({}), err.0),
+                    }
+                }
+                "close" => {
+                    crate::workspace_apps::hide_all(&app);
+                    let _ = app.emit("ronic://close-workspace-webapp", ());
+                    ("workspace_webapp".into(), json!({"action": "close"}), "Closed workspace webapp stage.".into())
+                }
+                "read" | "inspect" => {
+                    match crate::computer_subsystem::agent_drive_workspace_webapp(&app, bot_id, target_app, "read", None, None, None) {
+                        Ok(hit) => remember_mini_window(state, bot_id, hit),
+                        Err(err) => ("message".into(), json!({}), err.0),
+                    }
+                }
+                "click" => {
+                    let wanted_match = args.get("match").or_else(|| args.get("text")).and_then(|v| v.as_str()).map(str::trim);
+                    if let Some(query) = wanted_match.filter(|q| !q.is_empty()) {
+                        match crate::computer_subsystem::agent_drive_workspace_webapp(&app, bot_id, target_app, "find", None, None, Some(query)) {
+                            Ok(hit) => {
+                                if let Some(first_node) = hit.nodes.first() {
+                                    match crate::computer_subsystem::agent_drive_workspace_webapp(&app, bot_id, target_app, "click", Some(first_node.id), None, None) {
+                                        Ok(fresh) => remember_mini_window(state, bot_id, fresh),
+                                        Err(e) => ("message".into(), json!({}), e.0),
+                                    }
+                                } else {
+                                    ("message".into(), json!({}), format!("No control matching '{query}' found on the webapp page."))
+                                }
+                            }
+                            Err(e) => ("message".into(), json!({}), e.0),
+                        }
+                    } else {
+                        let id = control_id(args).unwrap_or(1);
+                        match crate::computer_subsystem::agent_drive_workspace_webapp(&app, bot_id, target_app, "click", Some(id), None, None) {
+                            Ok(hit) => remember_mini_window(state, bot_id, hit),
+                            Err(e) => ("message".into(), json!({}), e.0),
+                        }
+                    }
+                }
+                "type" => {
+                    let text = args.get("text").or_else(|| args.get("value")).and_then(|v| v.as_str()).unwrap_or("");
+                    let id = control_id(args).unwrap_or(1);
+                    let submit = args.get("submit").or_else(|| args.get("press_enter")).and_then(|v| v.as_bool()).unwrap_or(false);
+                    match crate::computer_subsystem::agent_drive_workspace_webapp(&app, bot_id, target_app, "type", Some(id), Some(text), None) {
+                        Ok(hit) => {
+                            if submit {
+                                let active_id = target_app.map(str::to_string).or_else(crate::workspace_apps::active_webapp).unwrap_or_else(|| "chatgpt".into());
+                                let label = format!("webapp_{active_id}");
+                                if let Some(view) = app.get_webview(&label) {
+                                    let script = format!(
+                                        r#"(function(){{
+                                            var list = document.querySelectorAll("a,button,input,select,textarea,[role=button],[role=textbox],[role=searchbox],[role=combobox],[role=tab],[contenteditable=true]");
+                                            var el = list[{index}];
+                                            if (el) {{
+                                                el.dispatchEvent(new KeyboardEvent("keydown", {{ bubbles: true, cancelable: true, key: "Enter", code: "Enter", keyCode: 13, which: 13 }}));
+                                                el.dispatchEvent(new KeyboardEvent("keypress", {{ bubbles: true, cancelable: true, key: "Enter", code: "Enter", keyCode: 13, which: 13 }}));
+                                                el.dispatchEvent(new KeyboardEvent("keyup", {{ bubbles: true, cancelable: true, key: "Enter", code: "Enter", keyCode: 13, which: 13 }}));
+                                                try {{ if (el.closest("form")) el.closest("form").requestSubmit(); }} catch(_) {{}}
+                                            }}
+                                        }})()"#,
+                                        index = id.saturating_sub(1).max(0)
+                                    );
+                                    let _ = view.eval(&script);
+                                }
+                            }
+                            remember_mini_window(state, bot_id, hit)
+                        }
+                        Err(e) => ("message".into(), json!({}), e.0),
+                    }
+                }
+                "submit" | "enter" => {
+                    let id = control_id(args).unwrap_or(1);
+                    let active_id = target_app.map(str::to_string).or_else(crate::workspace_apps::active_webapp).unwrap_or_else(|| "chatgpt".into());
+                    let label = format!("webapp_{active_id}");
+                    if let Some(view) = app.get_webview(&label) {
+                        let script = format!(
+                            r#"(function(){{
+                                var list = document.querySelectorAll("a,button,input,select,textarea,[role=button],[role=textbox],[role=searchbox],[role=combobox],[role=tab],[contenteditable=true]");
+                                var el = list[{index}];
+                                if (el) {{
+                                    el.dispatchEvent(new KeyboardEvent("keydown", {{ bubbles: true, cancelable: true, key: "Enter", code: "Enter", keyCode: 13, which: 13 }}));
+                                    el.dispatchEvent(new KeyboardEvent("keypress", {{ bubbles: true, cancelable: true, key: "Enter", code: "Enter", keyCode: 13, which: 13 }}));
+                                    el.dispatchEvent(new KeyboardEvent("keyup", {{ bubbles: true, cancelable: true, key: "Enter", code: "Enter", keyCode: 13, which: 13 }}));
+                                    try {{ if (el.closest("form")) el.closest("form").requestSubmit(); }} catch(_) {{}}
+                                }}
+                            }})()"#,
+                            index = id.saturating_sub(1).max(0)
+                        );
+                        let _ = view.eval(&script);
+                    }
+                    match crate::computer_subsystem::agent_drive_workspace_webapp(&app, bot_id, target_app, "read", None, None, None) {
+                        Ok(hit) => remember_mini_window(state, bot_id, hit),
+                        Err(e) => ("message".into(), json!({}), e.0),
+                    }
+                }
+                "scroll" => {
+                    let dir = args.get("direction").and_then(|v| v.as_str()).unwrap_or("down");
+                    match crate::computer_subsystem::agent_drive_workspace_webapp(&app, bot_id, target_app, "scroll", None, None, Some(dir)) {
+                        Ok(hit) => remember_mini_window(state, bot_id, hit),
+                        Err(e) => ("message".into(), json!({}), e.0),
+                    }
+                }
+                "eval" => {
+                    let script = args.get("script").or_else(|| args.get("js")).and_then(|v| v.as_str()).unwrap_or("");
+                    let active_id = target_app.map(str::to_string).or_else(crate::workspace_apps::active_webapp).unwrap_or_else(|| "chatgpt".into());
+                    let label = format!("webapp_{active_id}");
+                    if let Some(view) = app.get_webview(&label) {
+                        match view.eval(script) {
+                            Ok(()) => ("workspace_webapp".into(), json!({"action": "eval", "status": "executed"}), format!("Script evaluated in {active_id}.")),
+                            Err(err) => ("message".into(), json!({}), format!("Script eval failed: {err}")),
+                        }
+                    } else {
+                        ("message".into(), json!({}), format!("Webapp '{active_id}' is not currently loaded."))
+                    }
+                }
+                other => ("message".into(), json!({}), format!("Unknown workspace_webapp action '{other}'. Use list, open, read, click, type, scroll, eval, or close.")),
+            }
+        }
+        "desktop_app" => {
+            let app = match desktop_handle(state) {
+                Ok(app) => app,
+                Err(message) => return ("message".into(), json!({}), message),
+            };
+            let action = args.get("action").or_else(|| args.get("op")).and_then(|v| v.as_str()).unwrap_or("list").trim().to_lowercase();
+            let target_app = args.get("app").or_else(|| args.get("id")).or_else(|| args.get("name")).and_then(|v| v.as_str()).map(str::trim).unwrap_or("");
+
+            match action.as_str() {
+                "list" => {
+                    let list = crate::workspace_apps::list_available_desktop_apps();
+                    let summary = json!({ "desktop_apps": list });
+                    ("desktop_app".into(), summary.clone(), format!("Available Desktop Apps:\n{}", serde_json::to_string_pretty(&summary).unwrap_or_default()))
+                }
+                "open" | "launch" => {
+                    let path = args.get("path").and_then(|v| v.as_str());
+                    match crate::workspace_apps::launch_desktop(&app, target_app, None, path, None) {
+                        Ok(outcome) => ("desktop_app".into(), json!({"action": "launch", "app": target_app, "status": "launched"}), outcome.note),
+                        Err(err) => ("message".into(), json!({}), format!("Failed to launch desktop app '{target_app}': {}", err.0)),
+                    }
+                }
+                "inspect" => {
+                    let filter = args.get("window").or_else(|| args.get("filter")).and_then(|v| v.as_str()).unwrap_or(target_app);
+                    match crate::computer_subsystem::inspect_and_cache(filter) {
+                        Ok(nodes) => {
+                            let summary: Vec<Value> = nodes.iter().take(30).map(|n| json!({
+                                "mark": n.mark_id,
+                                "name": n.name,
+                                "type": n.control_type,
+                                "rect": n.bounds,
+                                "center": n.center_xy
+                            })).collect();
+                            ("desktop_app".into(), json!({"nodes": summary}), format!("Inspected window controls for '{}':\n{}", filter, serde_json::to_string_pretty(&json!(summary)).unwrap_or_default()))
+                        }
+                        Err(err) => ("message".into(), json!({}), format!("Failed to inspect desktop window: {}", err.0)),
+                    }
+                }
+                "click" => {
+                    let mark_id = args.get("mark_id").or_else(|| args.get("id")).and_then(|v| v.as_u64()).map(|n| n as u32).unwrap_or(1);
+                    match crate::computer_subsystem::som_click_sync(mark_id) {
+                        Ok(msg) => ("desktop_app".into(), json!({"mark_id": mark_id, "action": "click"}), msg),
+                        Err(err) => ("message".into(), json!({}), format!("Click failed: {err}")),
+                    }
+                }
+                "type" => {
+                    let mark_id = args.get("mark_id").or_else(|| args.get("id")).and_then(|v| v.as_u64()).map(|n| n as u32).unwrap_or(1);
+                    let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                    match crate::computer_subsystem::som_type_sync(mark_id, text) {
+                        Ok(msg) => ("desktop_app".into(), json!({"mark_id": mark_id, "action": "type"}), msg),
+                        Err(err) => ("message".into(), json!({}), format!("Type failed: {err}")),
+                    }
+                }
+                "status" => {
+                    let found = crate::util::which(target_app).is_some();
+                    ("desktop_app".into(), json!({"app": target_app, "installed": found}), format!("Desktop app '{target_app}' installed: {found}"))
+                }
+                other => ("message".into(), json!({}), format!("Unknown desktop_app action '{other}'. Use list, open, inspect, click, type, or status.")),
+            }
+        }
+        "install_skill" => {
+            let source = args.get("source").or_else(|| args.get("url")).or_else(|| args.get("link")).or_else(|| args.get("slug")).and_then(|v| v.as_str()).unwrap_or("").trim();
+            let slug = args.get("slug").or_else(|| args.get("name")).and_then(|v| v.as_str()).map(str::trim);
+            let home = state.home.clone();
+            with_db(state, |conn| match crate::capabilities::install_skill_from_source(conn, &home, bot_id, source, slug) {
+                Ok(msg) => ("skill_install".into(), json!({"source": source, "status": "installed"}), msg),
+                Err(error) => ("message".into(), json!({}), error.0),
+            })
+        }
+        "install_plugin" => {
+            let source = args.get("source").or_else(|| args.get("url")).or_else(|| args.get("repo")).and_then(|v| v.as_str()).unwrap_or("").trim();
+            let slug = args.get("slug").or_else(|| args.get("name")).and_then(|v| v.as_str()).map(str::trim);
+            let home = state.home.clone();
+            with_db(state, |conn| match crate::capabilities::install_plugin_from_source(conn, &home, bot_id, source, slug) {
+                Ok(msg) => ("plugin_install".into(), json!({"source": source, "status": "installed"}), msg),
+                Err(error) => ("message".into(), json!({}), error.0),
+            })
+        }
+        "connect_mcp" => {
+            let name = args.get("name").or_else(|| args.get("server")).and_then(|v| v.as_str()).unwrap_or("").trim();
+            let transport = args.get("transport").and_then(|v| v.as_str());
+            let command = args.get("command").or_else(|| args.get("cmd")).and_then(|v| v.as_str());
+            let url = args.get("url").or_else(|| args.get("endpoint")).and_then(|v| v.as_str());
+            let secret = args.get("secret").or_else(|| args.get("apiKey")).and_then(|v| v.as_str());
+            let args_list: Vec<String> = if let Some(arr) = args.get("args").and_then(|v| v.as_array()) {
+                arr.iter().filter_map(|s| s.as_str().map(str::to_string)).collect()
+            } else if let Some(s) = args.get("args").and_then(|v| v.as_str()) {
+                crate::util::split_args(s)
+            } else {
+                Vec::new()
+            };
+            let home = state.home.clone();
+            with_db(state, |conn| match crate::capabilities::connect_mcp_server(conn, &home, bot_id, name, transport, command, &args_list, url, secret) {
+                Ok(msg) => ("mcp_connect".into(), json!({"name": name, "status": "connected"}), msg),
+                Err(error) => ("message".into(), json!({}), error.0),
+            })
+        }
         "list_memory" | "search_memory" | "save_memory" | "list_skills" | "load_skill" | "load_skill_file" | "skill_manage" | "list_providers" | "list_threads" | "list_mcp" | "list_plugins" | "read_file" | "list_files" => {
-            with_db(state, |conn| match crate::workspace_bridge::run_chat_tool(conn, name, args) {
+            with_db(state, |conn| match crate::workspace_bridge::run_chat_tool_with_attachments(conn, name, args, attachments) {
                 Ok(text) => ("message".into(), json!({}), text),
                 Err(error) => ("message".into(), json!({}), error),
             })
+        }
+        "save_workflow" => {
+            let name = args.get("name").and_then(|item| item.as_str()).unwrap_or("").trim().to_string();
+            let steps = args.get("steps").or_else(|| args.get("steps_text")).and_then(|item| item.as_str()).unwrap_or("").to_string();
+            let schedule = args.get("schedule").and_then(|item| item.as_str()).unwrap_or("").trim().to_string();
+            let home = state.home.clone();
+            with_db(state, |conn| match crate::coworker::save_workflow(conn, &home, &name, &steps, &schedule) {
+                Ok(note) => ("workflow".into(), json!({"name": name, "schedule": schedule}), note),
+                Err(error) => ("message".into(), json!({}), error),
+            })
+        }
+        "schedule_routine" => {
+            let raw = args.get("schedule").and_then(|item| item.as_str()).unwrap_or("");
+            match crate::coworker::normalize_schedule(raw) {
+                Some(schedule) => with_db(state, |conn| match crate::bots::set_routine(conn, thread_id, &schedule) {
+                    Ok(()) => (
+                        "routine".into(),
+                        json!({"threadId": thread_id, "schedule": schedule}),
+                        format!("This chat now runs {schedule} while Ronic OS is open. Change or clear it any time from the chat header."),
+                    ),
+                    Err(error) => ("message".into(), json!({}), error.0),
+                }),
+                None => ("message".into(), json!({}), "That schedule is not one this app can store. Use daily HH:MM, every 15m, every 1h, or a daily cron like 0 8 * * *.".into()),
+            }
         }
         _ => refused,
     }
@@ -1029,13 +1841,54 @@ fn remember_screen(state: &AppState, bot_id: &str, hit: crate::bot_screen::Scree
     ("browser_inspect".into(), json!({ "url": hit.url, "log": lines, "latencyMs": hit.ms }), text)
 }
 
+/// Keeps the karl's-screen panel fed from mini-window drives too, and adds
+/// the two signals the model cannot get from DOM text alone: what a smart
+/// action picked, and whether the page's video is actually playing.
+fn remember_mini_window(state: &AppState, bot_id: &str, hit: crate::computer_subsystem::MiniWindowHit) -> (String, Value, String) {
+    let screen = crate::bot_screen::ScreenHit {
+        url: hit.url.clone(),
+        text: hit.text.clone(),
+        nodes: hit
+            .nodes
+            .iter()
+            .map(|node| crate::models::DomNode { id: node.id, tag: node.tag.clone(), label: node.label.clone(), kind: "control".into() })
+            .collect(),
+        ms: hit.ms,
+    };
+    let (kind, payload, mut text) = remember_screen(state, bot_id, screen);
+    if let Some(note) = &hit.note {
+        text.insert_str(0, format!("{note}\n").as_str());
+    }
+    if let Some(media) = &hit.media {
+        let state_text = if media.playing {
+            format!("playing at {}s of {}s{}", media.current_time, media.duration, if media.muted { " (muted)" } else { "" })
+        } else if media.paused {
+            format!("paused at {}s of {}s", media.current_time, media.duration)
+        } else {
+            "not started".into()
+        };
+        text.push_str(&format!("\nmedia: {state_text}"));
+    }
+    (kind, payload, text)
+}
+
+/// The mini window titlebar shows the bot's handle; fall back to @id when the
+/// profile row is gone.
+fn bot_handle_of(state: &AppState, bot_id: &str) -> String {
+    with_db(state, |conn| {
+        conn.query_row("SELECT handle FROM bot_profiles WHERE id = ?1", params![bot_id], |row| row.get::<_, String>(0))
+            .unwrap_or_else(|_| format!("@{bot_id}"))
+    })
+}
+
 fn drive_open(state: &AppState, bot_id: &str, url: &str) -> (String, Value, String) {
     let app = match desktop_handle(state) {
         Ok(app) => app,
         Err(message) => return ("message".into(), json!({}), message),
     };
-    match crate::bot_screen::open_and_read(&app, &state.home, bot_id, url) {
-        Ok(hit) => remember_screen(state, bot_id, hit),
+    let handle = bot_handle_of(state, bot_id);
+    match crate::computer_subsystem::agent_drive_open(&app, state, bot_id, &handle, url) {
+        Ok(hit) => remember_mini_window(state, bot_id, hit),
         Err(error) => ("message".into(), json!({}), error.0),
     }
 }
@@ -1045,8 +1898,8 @@ fn drive_read(state: &AppState, bot_id: &str) -> (String, Value, String) {
         Ok(app) => app,
         Err(message) => return ("message".into(), json!({}), message),
     };
-    match crate::bot_screen::read_bot(&app, bot_id, None) {
-        Ok(hit) => remember_screen(state, bot_id, hit),
+    match crate::computer_subsystem::agent_drive_read(&app, bot_id) {
+        Ok(hit) => remember_mini_window(state, bot_id, hit),
         Err(error) => ("message".into(), json!({}), error.0),
     }
 }
@@ -1056,8 +1909,8 @@ fn drive_click(state: &AppState, bot_id: &str, id: i64) -> (String, Value, Strin
         Ok(app) => app,
         Err(message) => return ("message".into(), json!({}), message),
     };
-    match crate::bot_screen::click_bot(&app, bot_id, id) {
-        Ok(hit) => remember_screen(state, bot_id, hit),
+    match crate::computer_subsystem::agent_drive_click(&app, bot_id, id) {
+        Ok(hit) => remember_mini_window(state, bot_id, hit),
         Err(error) => ("message".into(), json!({}), error.0),
     }
 }
@@ -1067,8 +1920,8 @@ fn drive_type(state: &AppState, bot_id: &str, id: i64, text: &str) -> (String, V
         Ok(app) => app,
         Err(message) => return ("message".into(), json!({}), message),
     };
-    match crate::bot_screen::type_bot(&app, bot_id, id, text) {
-        Ok(hit) => remember_screen(state, bot_id, hit),
+    match crate::computer_subsystem::agent_drive_type(&app, bot_id, id, text) {
+        Ok(hit) => remember_mini_window(state, bot_id, hit),
         Err(error) => ("message".into(), json!({}), error.0),
     }
 }
@@ -1255,8 +2108,25 @@ fn quick_question(text: &str) -> bool {
         return false;
     }
     let lower = text.to_ascii_lowercase();
-    let task = ["mcp", "composio", "skill", "plugin", "file", "folder", "command", "run ", "check ", "list ", "connect", "install", "open ", "read ", "write ", "remember", "search", "wallet", "browser", "page", "diff", "git ", "npm", "cargo"];
-    !task.iter().any(|word| lower.contains(word))
+    let task = [
+        "mcp", "composio", "skill", "plugin", "file", "folder", "command", "run", "check", "list",
+        "connect", "install", "open", "read", "write", "remember", "search", "wallet", "browser", "page",
+        "diff", "git", "npm", "cargo", "access", "webapp", "web app", "desktop", "chatgpt", "claude",
+        "gemini", "grok", "deepseek", "qwen", "nvidia", "perplexity", "copilot", "app", "window",
+        "control", "auto", "inspect", "click", "type", "submit", "enter", "scroll", "working", "work",
+        "status", "test", "start", "proceed", "continue", "go ahead", "show", "look", "see", "find",
+        "help", "yes", "do it", "can you", "try", "please", "again"
+    ];
+    if task.iter().any(|word| lower.contains(word)) {
+        return false;
+    }
+    let is_greeting_or_id = lower.contains("model")
+        || lower.contains("who are you")
+        || lower.contains("what is your name")
+        || lower.starts_with("hi")
+        || lower.starts_with("hello")
+        || lower.starts_with("hey");
+    is_greeting_or_id
 }
 
 fn token_budget(effort: &str) -> u32 {
@@ -1373,7 +2243,7 @@ pub(crate) struct HttpJob {
 pub(crate) fn run_off_runtime<T: Send + 'static>(limit: Duration, cancel_on_refresh: bool, work: impl FnOnce() -> T + Send + 'static) -> std::result::Result<T, String> {
     let epoch = turn_epoch();
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    if let Err(error) = std::thread::Builder::new().name("omni-model".into()).spawn(move || {
+    if let Err(error) = std::thread::Builder::new().name("ronic-model".into()).spawn(move || {
         let _ = tx.send(work());
     }) {
         return Err(error.to_string());
@@ -1612,17 +2482,73 @@ fn tool_calls_of(value: &Value) -> Vec<ToolCall> {
 }
 
 fn parse_think_tags(raw: &str) -> (String, String) {
-    if let Some(start) = raw.find("<think>") {
-        if let Some(end) = raw.find("</think>") {
-            let thought = raw[start + 7..end].trim().to_string();
-            let rest = format!("{}{}", &raw[..start], &raw[end + 8..]).trim().to_string();
-            return (thought, rest);
-        } else {
-            let thought = raw[start + 7..].trim().to_string();
-            return (thought, String::new());
+    let mut thinking_chunks = Vec::new();
+    let mut text = raw.to_string();
+
+    let tag_pairs = [
+        ("<ant-thinking>", "</ant-thinking>"),
+        ("<thinking>", "</thinking>"),
+        ("<think>", "</think>"),
+        ("<thought>", "</thought>"),
+        ("<reasoning>", "</reasoning>"),
+        ("[THINK]", "[/THINK]"),
+    ];
+
+    // 1. Extract closed tag pairs
+    let mut iteration = 0;
+    while iteration < 20 {
+        iteration += 1;
+        let mut matched = false;
+        for (open_tag, close_tag) in &tag_pairs {
+            if let Some(start) = text.find(open_tag) {
+                if let Some(end_rel) = text[start + open_tag.len()..].find(close_tag) {
+                    let end = start + open_tag.len() + end_rel;
+                    let thought = text[start + open_tag.len()..end].trim().to_string();
+                    if !thought.is_empty() {
+                        thinking_chunks.push(thought);
+                    }
+                    text.replace_range(start..end + close_tag.len(), "");
+                    matched = true;
+                    break;
+                }
+            }
+        }
+        if !matched {
+            break;
         }
     }
-    (String::new(), raw.trim().to_string())
+
+    // 2. Handle orphan closing tags where thinking started at token 0 without an open tag
+    // e.g. "Let me check if I can reach ChatGPT... </ant-thinking>Here is the result."
+    let close_tags = ["</ant-thinking>", "</thinking>", "</think>", "</thought>", "</reasoning>", "[/THINK]"];
+    for close_tag in &close_tags {
+        if let Some(end) = text.find(close_tag) {
+            let thought = text[..end].trim().to_string();
+            if !thought.is_empty() {
+                thinking_chunks.push(thought);
+            }
+            text = text[end + close_tag.len()..].to_string();
+        }
+    }
+
+    // 3. Handle unclosed opening tags at the end of the completion
+    let open_tags = ["<ant-thinking>", "<thinking>", "<think>", "<thought>", "<reasoning>", "[THINK]"];
+    for open_tag in &open_tags {
+        if let Some(start) = text.find(open_tag) {
+            let thought = text[start + open_tag.len()..].trim().to_string();
+            if !thought.is_empty() {
+                thinking_chunks.push(thought);
+            }
+            text = text[..start].to_string();
+        }
+    }
+
+    // 4. Final sweep of any remaining stray thinking tags
+    for (open_tag, close_tag) in &tag_pairs {
+        text = text.replace(open_tag, "").replace(close_tag, "");
+    }
+
+    (thinking_chunks.join("\n\n").trim().to_string(), text.trim().to_string())
 }
 
 fn completion_from_message(message: &Value) -> std::result::Result<Completion, String> {
@@ -1633,7 +2559,12 @@ fn completion_from_message(message: &Value) -> std::result::Result<Completion, S
         thinking = tag_thinking.clone();
     }
     let text = if !tag_thinking.is_empty() { clean_text } else { raw_text };
-    let tool_calls = tool_calls_of(&message["tool_calls"]);
+    let mut tool_calls = tool_calls_of(&message["tool_calls"]);
+    let (sanitized_text, extracted_calls) = extract_all_tool_calls(&text);
+    if tool_calls.is_empty() && !extracted_calls.is_empty() {
+        tool_calls = extracted_calls;
+    }
+    let text = if !tool_calls.is_empty() { sanitized_text } else { text };
     if text.is_empty() && thinking.is_empty() && tool_calls.is_empty() {
         return Err("empty completion".into());
     }
@@ -2213,6 +3144,30 @@ mod tests {
         assert!(quick_question("which model are you"));
         assert!(!quick_question("check for mcp servers configs or connect one ( composio.io )"));
         assert!(!quick_question("/find-skills"));
+        assert!(!quick_question("yes, can you do it"));
+        assert!(!quick_question("now can you access desktop webapp"));
+        assert!(!quick_question("hey are you working or not"));
+        assert!(!quick_question("open chatgpt"));
+    }
+
+    #[test]
+    fn parse_think_tags_handles_ant_thinking_and_orphans() {
+        use super::parse_think_tags;
+
+        let raw = "Let me check if I can reach ChatGPT as a webapp or visible window right now. </ant-thinking>";
+        let (thought, text) = parse_think_tags(raw);
+        assert_eq!(thought, "Let me check if I can reach ChatGPT as a webapp or visible window right now.");
+        assert_eq!(text, "");
+
+        let raw_paired = "<ant-thinking>Analyzing user environment...</ant-thinking>I am ready to access the webapp.";
+        let (thought2, text2) = parse_think_tags(raw_paired);
+        assert_eq!(thought2, "Analyzing user environment...");
+        assert_eq!(text2, "I am ready to access the webapp.");
+
+        let raw_standard = "<thinking>Step 1</thinking>Result";
+        let (thought3, text3) = parse_think_tags(raw_standard);
+        assert_eq!(thought3, "Step 1");
+        assert_eq!(text3, "Result");
     }
 
     #[test]

@@ -5,5 +5,5 @@ has_agent_part: true
 has_desktop_part: false
 tools:
 hooks: []
-skills: [find-skills, grill-me, agent-browser, improve-codebase-architecture, computer-use, code-review, vercel-react-best-practices, remotion-to-hyperframes, hyperframes-cli, composio]
+skills: [find-skills, grill-me, agent-browser, improve-codebase-architecture, computer-use, code-review, vercel-react-best-practices, remotion-to-hyperframes, hyperframes-cli, composio, accelerated-computing-cudf, cudaq-guide, cuopt-numerical-optimization-api, cuopt-numerical-optimization-formulation, nemo-retriever, nemo-retriever-mcp, nemotron-policy-generator, mineru]
 desktop:

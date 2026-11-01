@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-appoint-chief-officer"
+description = "Enables the appoint_chief_officer command without any pre-configured scope."
+commands.allow = ["appoint_chief_officer"]
+
+[[permission]]
+identifier = "deny-appoint-chief-officer"
+description = "Denies the appoint_chief_officer command without any pre-configured scope."
+commands.deny = ["appoint_chief_officer"]

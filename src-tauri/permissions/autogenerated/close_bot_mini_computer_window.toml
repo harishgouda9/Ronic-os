@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-close-bot-mini-computer-window"
+description = "Enables the close_bot_mini_computer_window command without any pre-configured scope."
+commands.allow = ["close_bot_mini_computer_window"]
+
+[[permission]]
+identifier = "deny-close-bot-mini-computer-window"
+description = "Denies the close_bot_mini_computer_window command without any pre-configured scope."
+commands.deny = ["close_bot_mini_computer_window"]

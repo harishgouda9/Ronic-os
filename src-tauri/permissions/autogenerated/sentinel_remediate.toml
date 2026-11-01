@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-sentinel-remediate"
+description = "Enables the sentinel_remediate command without any pre-configured scope."
+commands.allow = ["sentinel_remediate"]
+
+[[permission]]
+identifier = "deny-sentinel-remediate"
+description = "Denies the sentinel_remediate command without any pre-configured scope."
+commands.deny = ["sentinel_remediate"]

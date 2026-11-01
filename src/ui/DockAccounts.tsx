@@ -2,7 +2,7 @@ import { useState } from "react";
 import { WEB_APPS, type ChatModel, type WebApp } from "../kernel/liveChat";
 import { addCustom } from "../kernel/modelPrefs";
 import type { Provider } from "../types";
-import { useOmni } from "../store";
+import { useRonic } from "../store";
 import { Pill } from "./bits";
 
 const CHAT_IDS = ["prov_chatgpt", "prov_anthropic", "prov_gemini", "prov_grok", "prov_mistral", "prov_perplexity", "prov_groq", "prov_together", "prov_cohere", "prov_nvidia", "prov_openrouter", "prov_deepseek", "prov_qwen", "prov_tokenrouter", "prov_bedrock", "prov_ollama"];
@@ -19,9 +19,9 @@ const SITES: { id: string; providerId: string; title: string; detail: string }[]
 ];
 
 export function DockAccounts({ models, selectedId, ollamaReady, onOpenSite, onSelectModel, onModelsChanged }: { models: ChatModel[]; selectedId: string; ollamaReady: boolean; onOpenSite: (app: WebApp) => void; onSelectModel: (id: string) => void; onModelsChanged: (id?: string) => void }) {
-  const snap = useOmni((s) => s.snap)!;
-  const run = useOmni((s) => s.run);
-  const busy = useOmni((s) => s.busy);
+  const snap = useRonic((s) => s.snap)!;
+  const run = useRonic((s) => s.run);
+  const busy = useRonic((s) => s.busy);
   const [openId, setOpenId] = useState("");
   const providers = CHAT_IDS.map((id) => snap.providers.find((item) => item.id === id)).filter((item): item is Provider => Boolean(item));
 

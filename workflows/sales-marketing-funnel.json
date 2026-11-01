@@ -1,0 +1,212 @@
+{
+  "id": "sales-marketing-funnel-001",
+  "name": "Sales & Marketing Funnel Automation",
+  "description": "End-to-end funnel: lead capture, qualification, nurture & conversion, retention.",
+  "version": "1.0.0",
+  "nodes": [
+    {
+      "id": "lead-capture",
+      "type": "browser_automation",
+      "name": "Lead Capture",
+      "trigger": "on_form_submission + on_ad_click",
+      "config": {
+        "watch_url": "https://ronic-os.example.com/leads",
+        "form_selector": "#lead-form",
+        "ad_click_selector": ".ad-cta-button",
+        "capture_fields": [
+          "email",
+          "name",
+          "job_title",
+          "company_size",
+          "utm_source",
+          "utm_medium",
+          "utm_campaign",
+          "referrer"
+        ],
+        "write_to_crm": {
+          "entity": "lead",
+          "fields": {
+            "email": "crm.email",
+            "name": "crm.name",
+            "company": "crm.company",
+            "job_title": "crm.job_title",
+            "company_size": "crm.company_size",
+            "utm_source": "crm.utm_source",
+            "utm_medium": "crm.utm_medium",
+            "utm_campaign": "crm.utm_campaign",
+            "captured_at": "crm.captured_at"
+          }
+        }
+      },
+      "outputs": [
+        "lead_id",
+        "email",
+        "company",
+        "captured_at"
+      ],
+      "next": [
+        "lead-qualification"
+      ]
+    },
+    {
+      "id": "lead-qualification",
+      "type": "llm_reasoning",
+      "name": "Lead Qualification",
+      "trigger": "on_lead_captured",
+      "config": {
+        "input_fields": [
+          "crm.company_size",
+          "crm.job_title",
+          "crm.engagement_history",
+          "crm.utm_source",
+          "crm.utm_campaign"
+        ],
+        "scoring_rules": {
+          "hot": ">=80",
+          "warm": "50-79",
+          "cold": "<50"
+        },
+        "user_prompt_template": "Lead data: company_size={{crm.company_size}}, job_title={{crm.job_title}}, engagement_history={{crm.engagement_history}}, utm_source={{crm.utm_source}}, utm_campaign={{crm.utm_campaign}}.",
+        "write_to_crm": {
+          "entity": "lead",
+          "fields": {
+            "score": "crm.lead_score",
+            "tier": "crm.lead_tier",
+            "qualified_at": "crm.qualified_at"
+          }
+        }
+      },
+      "outputs": [
+        "lead_id",
+        "score",
+        "tier"
+      ],
+      "next": [
+        "nurture-conversion"
+      ]
+    },
+    {
+      "id": "nurture-conversion",
+      "type": "bot_action",
+      "name": "Nurture & Conversion",
+      "trigger": "on_lead_qualified",
+      "config": {
+        "email_provider": "sendgrid",
+        "sequences": {
+          "hot": [
+            {
+              "delay_days": 0,
+              "template": "hot-immediate-demo",
+              "subject": "Book your demo - {{crm.company}}"
+            },
+            {
+              "delay_days": 1,
+              "template": "hot-follow-up",
+              "subject": "Quick question about {{crm.company}}"
+            }
+          ],
+          "warm": [
+            {
+              "delay_days": 0,
+              "template": "warm-welcome",
+              "subject": "Welcome to Ronic OS, {{crm.name}}"
+            },
+            {
+              "delay_days": 3,
+              "template": "warm-case-study",
+              "subject": "How {{crm.company}} can grow with Ronic OS"
+            },
+            {
+              "delay_days": 7,
+              "template": "warm-soft-cta",
+              "subject": "Ready to explore Ronic OS?"
+            }
+          ],
+          "cold": [
+            {
+              "delay_days": 0,
+              "template": "cold-newsletter",
+              "subject": "Ronic OS product updates"
+            },
+            {
+              "delay_days": 14,
+              "template": "cold-re-engage",
+              "subject": "Still interested in Ronic OS?"
+            }
+          ]
+        },
+        "calendly_integration": {
+          "trigger_condition": "crm.lead_tier == 'hot'",
+          "action": "book_demo_call",
+          "event_type": "demo-30min",
+          "write_to_crm": {
+            "fields": {
+              "demo_booked_at": "crm.demo_booked_at",
+              "calendly_event_uri": "crm.calendly_event_uri"
+            }
+          }
+        },
+        "conversion_tracking": {
+          "event": "purchase_completed",
+          "write_to_crm": {
+            "entity": "lead",
+            "fields": {
+              "purchased_at": "crm.purchased_at",
+              "plan": "crm.plan",
+              "arr": "crm.arr"
+            }
+          }
+        }
+      },
+      "outputs": [
+        "lead_id",
+        "tier",
+        "emails_sent",
+        "demo_booked",
+        "purchased_at"
+      ],
+      "next": [
+        "retention"
+      ]
+    },
+    {
+      "id": "retention",
+      "type": "llm_reasoning + bot_action",
+      "name": "Retention",
+      "trigger": "on_purchase + 7_days_post_purchase",
+      "config": {
+        "delay_days": 7,
+        "input_fields": [
+          "crm.usage_data",
+          "crm.plan",
+          "crm.arr",
+          "crm.lead_tier",
+          "crm.purchased_at"
+        ],
+        "llm_step": {
+          "system_prompt": "You are a customer success retention engine. Analyze usage data, plan, and ARR to recommend onboarding tasks and upsell offers. Output JSON with 'onboarding_tasks' (array of strings) and 'upsell_offer'.",
+          "user_prompt_template": "Customer usage: {{crm.usage_data}}, plan: {{crm.plan}}, ARR: {{crm.arr}}."
+        },
+        "actions": [
+          {
+            "condition": "churn_risk == 'high'",
+            "action": "alert_csm_slack",
+            "channel": "#csm-churn-alerts"
+          },
+          {
+            "condition": "onboarding_tasks.length > 0",
+            "action": "send_email",
+            "template": "onboarding-guide"
+          }
+        ]
+      },
+      "outputs": [
+        "onboarding_tasks",
+        "upsell_offer",
+        "churn_risk_score"
+      ],
+      "next": []
+    }
+  ]
+}
+

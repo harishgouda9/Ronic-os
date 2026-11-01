@@ -58,8 +58,8 @@ function probeDevServer(timeoutMs = 5000) {
 function desktopAppRunning() {
   if (process.platform !== "win32") return Promise.resolve(null);
   return new Promise((resolve) => {
-    execFile("tasklist", ["/FI", "IMAGENAME eq omniworkspace.exe", "/NH"], { windowsHide: true }, (error, stdout) => {
-      resolve(error ? null : /omniworkspace\.exe/i.test(stdout ?? ""));
+    execFile("tasklist", ["/FI", "IMAGENAME eq ronicos.exe", "/NH"], { windowsHide: true }, (error, stdout) => {
+      resolve(error ? null : /ronicos\.exe/i.test(stdout ?? ""));
     });
   });
 }
@@ -81,13 +81,13 @@ function focusDesktopWindow() {
 function killDesktopApp() {
   if (process.platform !== "win32") return Promise.resolve(false);
   return new Promise((resolve) => {
-    execFile("taskkill", ["/IM", "omniworkspace.exe", "/F"], { windowsHide: true }, () => {
+    execFile("taskkill", ["/IM", "ronicos.exe", "/F"], { windowsHide: true }, () => {
       execFile(
         "powershell.exe",
         [
           "-NoProfile",
           "-Command",
-          "Get-CimInstance Win32_Process -Filter \"Name = 'msedgewebview2.exe'\" | Where-Object { $_.CommandLine -like '*omniworkspace*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }",
+          "Get-CimInstance Win32_Process -Filter \"Name = 'msedgewebview2.exe'\" | Where-Object { $_.CommandLine -like '*ronicos*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }",
         ],
         { windowsHide: true },
         () => resolve(true),
@@ -160,7 +160,7 @@ async function main() {
   }
 
   const home = process.env.USERPROFILE || "";
-  const targetDir = path.join(localAppData, "omniworkspace-target");
+  const targetDir = path.join(localAppData, "ronicos-target");
   const cargoBin = path.join(home, ".cargo", "bin");
   const gnuBin = path.join(home, ".rustup", "toolchains", "stable-x86_64-pc-windows-gnu", "bin");
   const env = {
@@ -185,12 +185,12 @@ async function main() {
   child.on("exit", (code) => {
     if (code === 0 && (tauriArgs[0] === "build" || tauriArgs[0] === "dev")) {
       const mode = tauriArgs[0] === "build" ? "release" : "debug";
-      const builtExe = path.join(targetDir, mode, "omniworkspace.exe");
-      const rootExe = path.join(root, "omniworkspace.exe");
+      const builtExe = path.join(targetDir, mode, "ronicos.exe");
+      const rootExe = path.join(root, "ronicos.exe");
       if (existsSync(builtExe)) {
         try {
           copyFileSync(builtExe, rootExe);
-          console.log(`Synchronized ${mode} binary to root omniworkspace.exe successfully.`);
+          console.log(`Synchronized ${mode} binary to root ronicos.exe successfully.`);
         } catch (copyErr) {
           // If the exe is currently locked by a running process, ignore
         }

@@ -1,20 +1,20 @@
 /* Host script for embedded web apps. It runs before the page and does not get Tauri IPC.
    Chat requests that contain the user's text are extended with the live workspace pack.
-   The host drains window.__OMNI_OUTBOX and answers through window.__OMNI_DELIVER. */
+   The host drains window.__RONIC_OUTBOX and answers through window.__RONIC_DELIVER. */
 (function () {
-  if (window.__OMNI_BRIDGE === 4) return;
-  window.__OMNI_BRIDGE = 4;
+  if (window.__RONIC_BRIDGE === 4) return;
+  window.__RONIC_BRIDGE = 4;
   var hooksArmed = false;
-  window.__OMNI_OUTBOX = [];
-  window.__OMNI_ARMED = "";
-  window.__OMNI_PENDING = "";
-  window.__OMNI_CACHE = "";
-  window.__OMNI_SEEN = {};
-  window.__OMNI_CHAIN = 0;
-  window.__OMNI_CHAIN_AT = 0;
+  window.__RONIC_OUTBOX = [];
+  window.__RONIC_ARMED = "";
+  window.__RONIC_PENDING = "";
+  window.__RONIC_CACHE = "";
+  window.__RONIC_SEEN = {};
+  window.__RONIC_CHAIN = 0;
+  window.__RONIC_CHAIN_AT = 0;
 
-  window.__OMNI_DELIVER = function (id, payload) {
-    var table = window.__OMNI_WAITERS || {};
+  window.__RONIC_DELIVER = function (id, payload) {
+    var table = window.__RONIC_WAITERS || {};
     var fn = table[id];
     if (!fn) return;
     delete table[id];
@@ -23,26 +23,26 @@
 
   function bridgeRoot() {
     try {
-      if (window.top && window.top.__OMNI_OUTBOX) return window.top;
+      if (window.top && window.top.__RONIC_OUTBOX) return window.top;
     } catch (e) {}
     return window;
   }
 
   function bridgeCall(op, text, waitMs) {
     if (op !== "context") {
-      return Promise.resolve("Embedded pages cannot run Omni tools. Use the Omni chat or the signed MCP bridge.");
+      return Promise.resolve("Embedded pages cannot run Ronic tools. Use the Ronic chat or the signed MCP bridge.");
     }
     return new Promise(function (resolve) {
       var root = bridgeRoot();
-      var id = (root.__OMNI_SEQ = (root.__OMNI_SEQ || 1) + 1);
-      var table = root.__OMNI_WAITERS || (root.__OMNI_WAITERS = {});
+      var id = (root.__RONIC_SEQ = (root.__RONIC_SEQ || 1) + 1);
+      var table = root.__RONIC_WAITERS || (root.__RONIC_WAITERS = {});
       var done = false;
       table[id] = function (payload) {
         if (done) return;
         done = true;
         resolve(payload);
       };
-      root.__OMNI_OUTBOX.push({ id: id, op: "context", text: text || "" });
+      root.__RONIC_OUTBOX.push({ id: id, op: "context", text: text || "" });
       setTimeout(function () {
         if (done) return;
         done = true;
@@ -187,11 +187,11 @@
   var lastKnownAuthed = null;
 
   function updateBadge(authed, customText) {
-    var el = document.getElementById("omni-bridge-badge");
+    var el = document.getElementById("ronic-bridge-badge");
     if (!el) {
       el = document.createElement("div");
-      el.id = "omni-bridge-badge";
-      el.setAttribute("data-omni", "bridge");
+      el.id = "ronic-bridge-badge";
+      el.setAttribute("data-ronic", "bridge");
       el.onclick = handleBadgeClick;
       var parent = document.documentElement || document.body;
       if (!parent) return;
@@ -204,12 +204,12 @@
     }
 
     if (authed) {
-      el.className = "omni-mcp-connected";
+      el.className = "ronic-mcp-connected";
       el.style.cssText = "position:fixed;right:14px;bottom:14px;z-index:2147483646;display:inline-flex;align-items:center;gap:8px;padding:6px 14px;border-radius:9999px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;font-size:12px;font-weight:600;line-height:1.4;background:rgba(15,23,42,0.92);color:#ecfdf5;border:1px solid rgba(16,185,129,0.5);box-shadow:0 4px 16px rgba(0,0,0,0.36);cursor:pointer;user-select:none;transition:all 0.2s ease;";
       el.title = "Ronic OS MCP Bridge is Active. Click to inject workspace skills & memory into this composer.";
       el.innerHTML = '<span style="display:inline-block;width:8px;height:8px;border-radius:99px;background:#10b981;box-shadow:0 0 8px #10b981;"></span><span>MCP Connected · Ronic OS</span>';
     } else {
-      el.className = "omni-mcp-not-connected";
+      el.className = "ronic-mcp-not-connected";
       el.style.cssText = "position:fixed;right:14px;bottom:14px;z-index:2147483646;display:inline-flex;align-items:center;gap:8px;padding:6px 14px;border-radius:9999px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;font-size:12px;font-weight:600;line-height:1.4;background:rgba(24,18,12,0.94);color:#fef3c7;border:1px solid rgba(245,158,11,0.55);box-shadow:0 4px 16px rgba(0,0,0,0.36);cursor:pointer;user-select:none;transition:all 0.2s ease;";
       el.title = "Ronic OS MCP Bridge Waiting. Log in to this app to link workspace memory, skills, and tools.";
       el.innerHTML = '<span style="display:inline-block;width:8px;height:8px;border-radius:99px;background:#f59e0b;box-shadow:0 0 8px #f59e0b;"></span><span>MCP: Sign in to Connect</span>';
@@ -219,8 +219,8 @@
       lastKnownAuthed = authed;
       try {
         var root = bridgeRoot();
-        if (root && root.__OMNI_OUTBOX) {
-          root.__OMNI_OUTBOX.push({
+        if (root && root.__RONIC_OUTBOX) {
+          root.__RONIC_OUTBOX.push({
             op: "auth_status",
             signedIn: authed,
             host: location.hostname || ""
@@ -242,7 +242,7 @@
           return;
         }
         var current = box.tagName === "TEXTAREA" || box.tagName === "INPUT" ? String(box.value || "") : String(box.innerText || "");
-        if (current.indexOf("[Omni Workspace connection]") !== -1) {
+        if (current.indexOf("[Ronic OS connection]") !== -1) {
           updateBadge(true, '<span style="display:inline-block;width:8px;height:8px;border-radius:99px;background:#10b981;"></span><span>✓ Context already in composer</span>');
           setTimeout(function () { updateBadge(true); }, 2200);
           return;
@@ -257,37 +257,37 @@
   }
 
   function showAuthPopup() {
-    var existing = document.getElementById("omni-bridge-auth-modal");
+    var existing = document.getElementById("ronic-bridge-auth-modal");
     if (existing) {
       existing.remove();
       return;
     }
     var modal = document.createElement("div");
-    modal.id = "omni-bridge-auth-modal";
+    modal.id = "ronic-bridge-auth-modal";
     modal.style.cssText = "position:fixed;right:14px;bottom:54px;z-index:2147483647;width:320px;background:#18181b;color:#f4f4f5;border:1px solid #3f3f46;border-radius:12px;padding:16px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;font-size:12px;box-shadow:0 16px 36px rgba(0,0,0,0.6);line-height:1.4;";
     var hostName = location.hostname || "this app";
     modal.innerHTML = '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">' +
       '<strong style="font-size:13px;display:flex;align-items:center;gap:6px;"><span style="display:inline-block;width:8px;height:8px;border-radius:99px;background:#f59e0b;"></span>MCP Bridge Authentication</strong>' +
-      '<button id="omni-auth-close" style="background:none;border:none;color:#a1a1aa;cursor:pointer;font-size:16px;padding:0;line-height:1;">×</button>' +
+      '<button id="ronic-auth-close" style="background:none;border:none;color:#a1a1aa;cursor:pointer;font-size:16px;padding:0;line-height:1;">×</button>' +
       '</div>' +
       '<p style="margin:0 0 10px;color:#d4d4d8;">Sign in to your account on <strong>' + hostName + '</strong>. Ronic OS will automatically verify your login and connect the MCP Bridge to share workspace skills and memory.</p>' +
       '<div style="display:flex;gap:8px;margin-top:12px;">' +
-      '<button id="omni-auth-check" style="flex:1;background:#2563eb;color:#ffffff;border:none;border-radius:6px;padding:7px 12px;font-size:11.5px;font-weight:600;cursor:pointer;">Check Connection Now</button>' +
-      '<button id="omni-auth-dismiss" style="background:#27272a;color:#a1a1aa;border:1px solid #3f3f46;border-radius:6px;padding:7px 12px;font-size:11.5px;cursor:pointer;">Dismiss</button>' +
+      '<button id="ronic-auth-check" style="flex:1;background:#2563eb;color:#ffffff;border:none;border-radius:6px;padding:7px 12px;font-size:11.5px;font-weight:600;cursor:pointer;">Check Connection Now</button>' +
+      '<button id="ronic-auth-dismiss" style="background:#27272a;color:#a1a1aa;border:1px solid #3f3f46;border-radius:6px;padding:7px 12px;font-size:11.5px;cursor:pointer;">Dismiss</button>' +
       '</div>';
     var parent = document.documentElement || document.body;
     if (parent) parent.appendChild(modal);
 
-    document.getElementById("omni-auth-close").onclick = function () { modal.remove(); };
-    document.getElementById("omni-auth-dismiss").onclick = function () { modal.remove(); };
-    document.getElementById("omni-auth-check").onclick = function () {
+    document.getElementById("ronic-auth-close").onclick = function () { modal.remove(); };
+    document.getElementById("ronic-auth-dismiss").onclick = function () { modal.remove(); };
+    document.getElementById("ronic-auth-check").onclick = function () {
       if (signedIn()) {
         modal.innerHTML = '<div style="padding:10px 0;text-align:center;"><strong style="color:#10b981;font-size:13px;">✓ MCP Connected Successfully!</strong><p style="margin:6px 0 0;color:#a1a1aa;font-size:11.5px;">Ronic OS workspace bridge is active.</p></div>';
         updateBadge(true);
         if (mayEnrich()) { try { armHooks(); } catch (e) {} }
         setTimeout(function () { modal.remove(); }, 1800);
       } else {
-        var btn = document.getElementById("omni-auth-check");
+        var btn = document.getElementById("ronic-auth-check");
         if (btn) {
           btn.textContent = "Still waiting for login...";
           btn.style.background = "#d97706";
@@ -307,8 +307,8 @@
   }
 
   function cachePack() {
-    if (window.__OMNI_CACHE) return window.__OMNI_CACHE;
-    try { return (window.top && window.top.__OMNI_CACHE) || ""; } catch (e) { return ""; }
+    if (window.__RONIC_CACHE) return window.__RONIC_CACHE;
+    try { return (window.top && window.top.__RONIC_CACHE) || ""; } catch (e) { return ""; }
   }
 
   function composerText() {
@@ -338,13 +338,13 @@
 
   function remember() {
     if (!mayEnrich()) {
-      window.__OMNI_ARMED = "";
+      window.__RONIC_ARMED = "";
       return;
     }
     var text = composerText();
-    var cut = text.indexOf("[Omni Workspace connection]");
+    var cut = text.indexOf("[Ronic OS connection]");
     if (cut !== -1) text = text.slice(0, cut).trim();
-    if (text) window.__OMNI_ARMED = text;
+    if (text) window.__RONIC_ARMED = text;
   }
 
   document.addEventListener("keydown", function (event) {
@@ -362,12 +362,12 @@
   }, true);
   function reloadBlankOnce() {
     try {
-      if (sessionStorage.getItem("omni-blank-reload")) return;
+      if (sessionStorage.getItem("ronic-blank-reload")) return;
       var host = location.hostname || "";
       if (!/chatgpt\.com|claude\.ai|gemini\.google\.com|grok\.com|x\.com|twitter\.com|perplexity\.ai|deepseek\.com|mistral\.ai/.test(host)) return;
       if (authSurface()) return;
       if (!pageLooksBlank()) return;
-      sessionStorage.setItem("omni-blank-reload", "1");
+      sessionStorage.setItem("ronic-blank-reload", "1");
       location.replace(location.origin + "/");
     } catch (e) {}
   }
@@ -379,7 +379,7 @@
     var autoPromptShown = false;
     function pill() {
       if (authHost(location.hostname || "")) {
-        var existing = document.getElementById("omni-bridge-badge");
+        var existing = document.getElementById("ronic-bridge-badge");
         if (existing) existing.remove();
         return;
       }
@@ -396,7 +396,7 @@
           }
         }, 1200);
       } else if (authed) {
-        var modal = document.getElementById("omni-bridge-auth-modal");
+        var modal = document.getElementById("ronic-bridge-auth-modal");
         if (modal) {
           modal.innerHTML = '<div style="padding:10px 0;text-align:center;"><strong style="color:#10b981;font-size:13px;">✓ MCP Connected Successfully!</strong><p style="margin:6px 0 0;color:#a1a1aa;font-size:11.5px;">Ronic OS workspace bridge is active.</p></div>';
           setTimeout(function () { modal.remove(); }, 1600);
@@ -425,11 +425,11 @@
 
   function armedText() {
     if (!mayEnrich()) return "";
-    var saved = window.__OMNI_ARMED || "";
-    var cut = saved.indexOf("[Omni Workspace connection]");
+    var saved = window.__RONIC_ARMED || "";
+    var cut = saved.indexOf("[Ronic OS connection]");
     if (cut !== -1) saved = saved.slice(0, cut).trim();
     var live = composerText();
-    var liveCut = live.indexOf("[Omni Workspace connection]");
+    var liveCut = live.indexOf("[Ronic OS connection]");
     var value = live && liveCut === -1 ? live : saved;
     if (/^\d{4,8}$/.test(value)) return "";
     if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)) return "";
@@ -465,7 +465,7 @@
 
   function splicePack(body, userText, extra) {
     if (!extra || typeof body !== "string" || !textual(body) || userText.length < 2) return body;
-    if (body.indexOf("Omni Workspace connection") !== -1 || body.indexOf(formEncode("Omni Workspace connection")) !== -1 || body.indexOf(encodeURIComponent("Omni Workspace connection")) !== -1) return body;
+    if (body.indexOf("Ronic OS connection") !== -1 || body.indexOf(formEncode("Ronic OS connection")) !== -1 || body.indexOf(encodeURIComponent("Ronic OS connection")) !== -1) return body;
     var quoted = JSON.stringify(userText);
     var atQuoted = body.indexOf(quoted);
     if (atQuoted !== -1) return body.slice(0, atQuoted) + JSON.stringify(userText + extra) + body.slice(atQuoted + quoted.length);
@@ -530,20 +530,20 @@
     var box = composerBox();
     if (authField(box)) return;
     var text = box ? String(box.tagName === "TEXTAREA" || box.tagName === "INPUT" ? box.value : box.innerText || "").trim() : armedText();
-    if (!text || text.indexOf("[Omni Workspace connection]") !== -1) return;
+    if (!text || text.indexOf("[Ronic OS connection]") !== -1) return;
     var pack = cachePack();
     if (!pack) return;
     var next = text + "\n\n" + pack;
     if (box) {
       try { writeBox(box, next); } catch (e) { return; }
     }
-    badge("Omni context attached");
+    badge("Ronic context attached");
   }
 
   function extraFor(suffix) {
-    var pending = window.__OMNI_PENDING || "";
+    var pending = window.__RONIC_PENDING || "";
     var extra = "";
-    if (pending) extra += "\n\n[Omni tool result]\n" + pending;
+    if (pending) extra += "\n\n[Ronic tool result]\n" + pending;
     if (suffix) extra += (extra ? "\n\n" : "\n\n") + suffix;
     return { extra: extra, pending: pending };
   }
@@ -580,7 +580,7 @@
     if (!mayEnrich() || authRequest(url)) return body;
     if (!body || !chatUrl(url) || !/post|put|patch/i.test(method || "POST")) return body;
     var text = armedText();
-    if (!text || text.indexOf("[Omni tool result]") === 0) return body;
+    if (!text || text.indexOf("[Ronic tool result]") === 0) return body;
     if (!carries(body, text)) return body;
     var suffix = await bridgeCall("context", text);
     if (!suffix) suffix = cachePack();
@@ -588,8 +588,8 @@
     if (!packed.extra) return body;
     var next = splicePack(body, text, packed.extra);
     if (next !== body) {
-      if (packed.pending) window.__OMNI_PENDING = "";
-      badge("Omni context sent");
+      if (packed.pending) window.__RONIC_PENDING = "";
+      badge("Ronic context sent");
     }
     return next;
   }
@@ -643,14 +643,14 @@
   var origOpen = XMLHttpRequest.prototype.open;
   var origSend = XMLHttpRequest.prototype.send;
   XMLHttpRequest.prototype.open = function (method, url) {
-    this.__omniMethod = method;
-    this.__omniUrl = url;
+    this.__ronicMethod = method;
+    this.__ronicUrl = url;
     return origOpen.apply(this, arguments);
   };
   XMLHttpRequest.prototype.send = function (body) {
     var xhr = this;
-    var method = xhr.__omniMethod || "GET";
-    var url = xhr.__omniUrl || "";
+    var method = xhr.__ronicMethod || "GET";
+    var url = xhr.__ronicUrl || "";
     if (!mayEnrich() || authRequest(url) || typeof body !== "string" || !chatUrl(url) || !/post|put|patch/i.test(method)) {
       return origSend.apply(this, arguments);
     }
@@ -667,12 +667,12 @@
       if (!mayEnrich()) return wsSend.call(this, data);
       if (typeof data === "string" && cachePack()) {
         var text = armedText();
-        if (text && text.indexOf("[Omni tool result]") !== 0) {
+        if (text && text.indexOf("[Ronic tool result]") !== 0) {
           var packed = extraFor(cachePack());
           var next = splicePack(data, text, packed.extra);
           if (next !== data) {
-            if (packed.pending) window.__OMNI_PENDING = "";
-            badge("Omni context sent");
+            if (packed.pending) window.__RONIC_PENDING = "";
+            badge("Ronic context sent");
             data = next;
           }
         }

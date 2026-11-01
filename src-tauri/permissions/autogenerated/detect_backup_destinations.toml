@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-detect-backup-destinations"
+description = "Enables the detect_backup_destinations command without any pre-configured scope."
+commands.allow = ["detect_backup_destinations"]
+
+[[permission]]
+identifier = "deny-detect-backup-destinations"
+description = "Denies the detect_backup_destinations command without any pre-configured scope."
+commands.deny = ["detect_backup_destinations"]

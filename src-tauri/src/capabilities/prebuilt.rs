@@ -6,7 +6,7 @@ use crate::error::Result;
 
 pub const PLUGIN_ID: &str = "plug-prebuilt-skills";
 
-const STAMP: &str = "2026-10-17.1";
+const STAMP: &str = "2026-10-28.2";
 
 static PREBUILT: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/resources/builtin-skills/prebuilt");
 

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-gateway-send-push-alert"
+description = "Enables the gateway_send_push_alert command without any pre-configured scope."
+commands.allow = ["gateway_send_push_alert"]
+
+[[permission]]
+identifier = "deny-gateway-send-push-alert"
+description = "Denies the gateway_send_push_alert command without any pre-configured scope."
+commands.deny = ["gateway_send_push_alert"]

@@ -13,6 +13,12 @@ fn patterns() -> &'static [Regex] {
             r"(?i)\bgh[pousr]_[A-Za-z0-9]{20,}",
             r"(?i)\bbearer\s+[A-Za-z0-9\-_\.=]{8,}",
             r#"(?i)(api[_-]?key|secret|token|password|seed)\s*[:=]\s*["']?[^\s"',]{6,}"#,
+            // Cloud credential-file keys (AWS credentials, config) whose name
+            // does not end in the generic keywords above.
+            r#"(?i)(aws_access_key_id|aws_secret_access_key|aws_session_token|aws_security_token)\s*[:=]\s*["']?[^\s"',]{6,}"#,
+            // Private-key / certificate PEM blocks, header line through the
+            // base64 body (matched non-greedily up to the END line).
+            r"(?s)-{3,}BEGIN [A-Z0-9 ]*PRIVATE KEY-{3,}.*?-{3,}END [A-Z0-9 ]*PRIVATE KEY-{3,}",
         ]
         .into_iter()
         .map(|p| Regex::new(p).expect("redaction pattern"))
@@ -61,5 +67,17 @@ mod tests {
     fn leaves_ordinary_prose() {
         let raw = "Claude Max quota is 78% and the vault is local.";
         assert_eq!(redact(raw), raw);
+    }
+
+    #[test]
+    fn redacts_aws_credentials_and_pem() {
+        let creds = "[default]\naws_access_key_id = AKIAIOSFODNN7EXAMPLE\naws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        let clean = redact(creds);
+        assert!(!clean.contains("AKIAIOSFODNN7EXAMPLE"));
+        assert!(!clean.contains("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"));
+
+        let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA7\n-----END RSA PRIVATE KEY-----";
+        let clean_pem = redact(pem);
+        assert!(!clean_pem.contains("MIIEpAIBAAKCAQEA7"));
     }
 }

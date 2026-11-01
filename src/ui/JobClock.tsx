@@ -1,11 +1,11 @@
 import { useEffect, useRef } from "react";
 import { anchorFor, isDue, markFired, parseSchedule, readFired, readModelMeta } from "../kernel/workspaceChrome";
 import { effortFor } from "../kernel/modelPrefs";
-import { useOmni } from "../store";
+import { useRonic } from "../store";
 
 export function JobClock() {
-  const ready = useOmni((s) => Boolean(s.snap?.vaultUnlocked && s.snap.onboardingComplete));
-  const run = useOmni((s) => s.run);
+  const ready = useRonic((s) => Boolean(s.snap?.vaultUnlocked && s.snap.onboardingComplete));
+  const run = useRonic((s) => s.run);
   const inflight = useRef<Set<string>>(new Set());
 
   useEffect(() => {
@@ -14,7 +14,7 @@ export function JobClock() {
 
     const tick = () => {
       if (dead || inflight.current.size > 0) return;
-      const state = useOmni.getState();
+      const state = useRonic.getState();
       if (state.busy || state.pending) return;
       const meta = readModelMeta();
       if (!meta) return;

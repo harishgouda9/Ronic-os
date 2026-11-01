@@ -1,0 +1,43 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "mini-shell",
+  "description": "The bot mini computer's desktop shell webview: app/tab control, sandboxed file explorer, and its own PTY terminal session",
+  "local": true,
+  "remote": {
+    "urls": [
+      "http://127.0.0.1:1420",
+      "http://127.0.0.1:1420/*",
+      "http://localhost:1420",
+      "http://localhost:1420/*"
+    ]
+  },
+  "windows": [
+    "ronic_mini_comp_*"
+  ],
+  "webviews": [
+    "ronic_mini_comp_*"
+  ],
+  "permissions": [
+    "allow-mini-shell-boot",
+    "allow-mini-shell-layout",
+    "allow-mini-shell-set-app",
+    "allow-mini-open-tab",
+    "allow-mini-close-tab",
+    "allow-mini-focus-tab",
+    "allow-mini-chrome-nav",
+    "allow-mini-fs-list",
+    "allow-mini-fs-read",
+    "allow-mini-fs-write",
+    "allow-mini-fs-write-bytes",
+    "allow-mini-fs-mkdir",
+    "allow-mini-fs-rename",
+    "allow-mini-fs-delete",
+    "allow-mini-history",
+    "allow-spawn-terminal",
+    "allow-write-terminal",
+    "allow-resize-terminal",
+    "allow-close-terminal",
+    "core:event:default",
+    "core:window:default"
+  ]
+}

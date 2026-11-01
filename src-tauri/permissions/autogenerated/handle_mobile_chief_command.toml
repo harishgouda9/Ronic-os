@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-handle-mobile-chief-command"
+description = "Enables the handle_mobile_chief_command command without any pre-configured scope."
+commands.allow = ["handle_mobile_chief_command"]
+
+[[permission]]
+identifier = "deny-handle-mobile-chief-command"
+description = "Denies the handle_mobile_chief_command command without any pre-configured scope."
+commands.deny = ["handle_mobile_chief_command"]

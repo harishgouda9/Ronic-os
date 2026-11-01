@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-mini-shell-boot"
+description = "Enables the mini_shell_boot command without any pre-configured scope."
+commands.allow = ["mini_shell_boot"]
+
+[[permission]]
+identifier = "deny-mini-shell-boot"
+description = "Denies the mini_shell_boot command without any pre-configured scope."
+commands.deny = ["mini_shell_boot"]

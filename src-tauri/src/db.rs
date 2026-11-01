@@ -2,7 +2,7 @@ use crate::error::{err, Result};
 use crate::models::*;
 use crate::util::{nid, now_ms};
 use rusqlite::{params, Connection};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::path::Path;
 
 pub fn open(path: &Path) -> Result<Connection> {
@@ -31,12 +31,17 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     ensure_column(conn, "bot_profiles", "harness_lane_id", "ALTER TABLE bot_profiles ADD COLUMN harness_lane_id TEXT NOT NULL DEFAULT ''")?;
     ensure_column(conn, "bot_profiles", "ag_ui_endpoint_url", "ALTER TABLE bot_profiles ADD COLUMN ag_ui_endpoint_url TEXT NOT NULL DEFAULT ''")?;
     ensure_column(conn, "bot_profiles", "browser_partition", "ALTER TABLE bot_profiles ADD COLUMN browser_partition TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(conn, "bot_profiles", "engine_kind", "ALTER TABLE bot_profiles ADD COLUMN engine_kind TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(conn, "bot_profiles", "api_base", "ALTER TABLE bot_profiles ADD COLUMN api_base TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(conn, "bot_profiles", "api_model", "ALTER TABLE bot_profiles ADD COLUMN api_model TEXT NOT NULL DEFAULT ''")?;
     ensure_column(conn, "bot_profiles", "workspace_dir", "ALTER TABLE bot_profiles ADD COLUMN workspace_dir TEXT NOT NULL DEFAULT ''")?;
     ensure_column(conn, "bot_profiles", "allow_file_write", "ALTER TABLE bot_profiles ADD COLUMN allow_file_write INTEGER NOT NULL DEFAULT 1")?;
     ensure_column(conn, "bot_profiles", "require_approval_external", "ALTER TABLE bot_profiles ADD COLUMN require_approval_external INTEGER NOT NULL DEFAULT 1")?;
     ensure_column(conn, "bot_profiles", "require_approval_wallet", "ALTER TABLE bot_profiles ADD COLUMN require_approval_wallet INTEGER NOT NULL DEFAULT 1")?;
+    ensure_column(conn, "bot_profiles", "approval_mode", "ALTER TABLE bot_profiles ADD COLUMN approval_mode TEXT NOT NULL DEFAULT 'ask'")?;
     ensure_column(conn, "bot_profiles", "stall_timeout_ms", "ALTER TABLE bot_profiles ADD COLUMN stall_timeout_ms INTEGER NOT NULL DEFAULT 45000")?;
     ensure_column(conn, "bot_profiles", "avatar_color", "ALTER TABLE bot_profiles ADD COLUMN avatar_color TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(conn, "bot_profiles", "wallet_frozen", "ALTER TABLE bot_profiles ADD COLUMN wallet_frozen INTEGER NOT NULL DEFAULT 0")?;
     ensure_column(conn, "chat_threads", "target_type", "ALTER TABLE chat_threads ADD COLUMN target_type TEXT NOT NULL DEFAULT 'direct_bot'")?;
     ensure_column(conn, "chat_threads", "group_id", "ALTER TABLE chat_threads ADD COLUMN group_id TEXT NOT NULL DEFAULT ''")?;
     ensure_column(conn, "chat_threads", "routine_schedule", "ALTER TABLE chat_threads ADD COLUMN routine_schedule TEXT NOT NULL DEFAULT ''")?;
@@ -50,6 +55,9 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         [],
     )?;
     ensure_column(conn, "execution_steps", "turn_id", "ALTER TABLE execution_steps ADD COLUMN turn_id TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(conn, "sentinels", "severity", "ALTER TABLE sentinels ADD COLUMN severity TEXT NOT NULL DEFAULT 'info'")?;
+    ensure_column(conn, "sentinels", "acknowledged", "ALTER TABLE sentinels ADD COLUMN acknowledged INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(conn, "quant_orders", "wallet_tx_id", "ALTER TABLE quant_orders ADD COLUMN wallet_tx_id TEXT")?;
     seed_memory_layer(conn)?;
     conn.execute(
         "UPDATE provider_accounts SET binary_or_endpoint = 'https://grok.com' WHERE binary_or_endpoint LIKE '%grok.x.ai%'",
@@ -97,6 +105,17 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             conn.execute("UPDATE provider_accounts SET fallback_account_id = '' WHERE id = ?1", params![id])?;
         }
     }
+    crate::remediation_core::sentinels_ensure(conn)?;
+    prune(conn)?;
+    Ok(())
+}
+
+fn prune(conn: &Connection) -> Result<()> {
+    let seven_days_ago = now_ms() - 7 * 86_400_000;
+    conn.execute("DELETE FROM quant_orders WHERE created_at < ?1", params![seven_days_ago])?;
+    conn.execute("DELETE FROM squad_shared_blackboard WHERE created_at < ?1", params![seven_days_ago])?;
+    conn.execute("DELETE FROM sentinel_events WHERE created_at < ?1", params![seven_days_ago])?;
+    conn.execute("DELETE FROM remediation_logs WHERE created_at < ?1", params![seven_days_ago])?;
     Ok(())
 }
 
@@ -326,6 +345,22 @@ CREATE TABLE IF NOT EXISTS wallet_balances (
   native_value REAL NOT NULL,
   detail TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS connected_wallets (
+  id TEXT PRIMARY KEY,
+  chain TEXT NOT NULL,
+  label TEXT NOT NULL,
+  address TEXT NOT NULL,
+  connection_type TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active',
+  balance_native TEXT NOT NULL DEFAULT '',
+  balance_usd REAL NOT NULL DEFAULT 0,
+  daily_limit_usd REAL NOT NULL DEFAULT 0,
+  is_default INTEGER NOT NULL DEFAULT 0,
+  added_at INTEGER NOT NULL,
+  key_mask TEXT NOT NULL DEFAULT '',
+  explorer_url TEXT NOT NULL DEFAULT '',
+  verified_at INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS wallet_transactions (
   id TEXT PRIMARY KEY,
   bot_profile_id TEXT,
@@ -454,6 +489,35 @@ CREATE TABLE IF NOT EXISTS bot_groups (
   routine_schedule TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS delegation_contracts (
+  id TEXT PRIMARY KEY,
+  issuer_bot_id TEXT NOT NULL,
+  assignee_bot_id TEXT NOT NULL,
+  group_id TEXT NOT NULL DEFAULT '',
+  scope_label TEXT NOT NULL,
+  sub_goal TEXT NOT NULL,
+  complexity_score INTEGER NOT NULL,
+  routed_endpoint TEXT NOT NULL,
+  cost_tier TEXT NOT NULL,
+  scopes_json TEXT NOT NULL,
+  verifier_rule TEXT NOT NULL,
+  requires_human INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL,
+  commitment TEXT NOT NULL,
+  friction_reason TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS delegation_reports (
+  id TEXT PRIMARY KEY,
+  contract_id TEXT NOT NULL,
+  from_bot_id TEXT NOT NULL,
+  to_bot_id TEXT NOT NULL,
+  report_type TEXT NOT NULL,
+  summary TEXT NOT NULL,
+  commitment TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS bot_gateway_audit_logs (
   id TEXT PRIMARY KEY,
   bot_id TEXT NOT NULL,
@@ -503,7 +567,52 @@ CREATE INDEX IF NOT EXISTS idx_threads_bot ON chat_threads(bot_profile_id, updat
 CREATE INDEX IF NOT EXISTS idx_bot_audit ON bot_gateway_audit_logs(bot_id, recorded_at DESC);
 CREATE INDEX IF NOT EXISTS idx_steps_thread ON execution_steps(thread_id, created_at ASC);
 CREATE INDEX IF NOT EXISTS idx_wallet_tx ON wallet_transactions(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_wallet_tx_bot ON wallet_transactions(bot_profile_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_remediation ON remediation_logs(tier, created_at DESC);
+CREATE TABLE IF NOT EXISTS quant_orders (
+  id TEXT PRIMARY KEY,
+  created_at INTEGER NOT NULL,
+  pair TEXT NOT NULL,
+  analyst TEXT NOT NULL,
+  thesis TEXT NOT NULL,
+  side TEXT NOT NULL,
+  size_usd REAL NOT NULL,
+  ws_latency_ms REAL NOT NULL,
+  rebate_usd REAL NOT NULL,
+  status TEXT NOT NULL,
+  mode TEXT NOT NULL,
+  bot_handle TEXT NOT NULL,
+  reference TEXT NOT NULL,
+  wallet_tx_id TEXT
+);
+CREATE TABLE IF NOT EXISTS sentinels (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  source TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'healthy',
+  severity TEXT NOT NULL DEFAULT 'info',
+  acknowledged INTEGER NOT NULL DEFAULT 0,
+  last_scan INTEGER NOT NULL DEFAULT 0,
+  finding TEXT NOT NULL DEFAULT '',
+  staged_fix TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS sentinel_events (
+  id TEXT PRIMARY KEY,
+  sentinel_id TEXT NOT NULL,
+  message TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sentinel_events ON sentinel_events(sentinel_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS squad_shared_blackboard (
+  id TEXT PRIMARY KEY,
+  from_bot TEXT NOT NULL,
+  to_bot TEXT NOT NULL,
+  topic TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  latency_ms INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_squad_blackboard_created ON squad_shared_blackboard(created_at DESC);
 "#;
 
 pub fn drop_reference_fixture(conn: &Connection, home: &Path) -> Result<()> {
@@ -582,6 +691,8 @@ fn clear_workspace_rows(conn: &Connection) -> Result<()> {
          DELETE FROM workflows;
          DELETE FROM wallet_transactions;
          DELETE FROM remediation_logs;
+         DELETE FROM quant_orders;
+         DELETE FROM sentinel_events;
          DELETE FROM fleet_logs;
          DELETE FROM extensions;
          DELETE FROM positions;
@@ -654,16 +765,17 @@ pub fn seed_if_empty(conn: &Connection, home: &Path) -> Result<()> {
     let _ = std::fs::create_dir_all(home.join("sandbox"));
 
     conn.execute(
-        "INSERT INTO wallet_policies (id, max_per_tx_usd, daily_cap_usd, require_human_approval_above_usd, max_slippage_bps, whitelisted_json, killswitch_engaged) VALUES (1, 5, 50, 10, 35, '[]', 0)",
+        "INSERT OR IGNORE INTO wallet_policies (id, max_per_tx_usd, daily_cap_usd, require_human_approval_above_usd, max_slippage_bps, whitelisted_json, killswitch_engaged) VALUES (1, 5, 50, 5, 35, '[]', 0)",
         [],
     )?;
     for (rail, label, native, detail) in [
         ("crypto_x402", "Crypto & x402", "0.00 USDC", "Sandbox ledger. No exchange is connected."),
         ("razorpay_upi", "Razorpay India", "₹0", "Sandbox ledger. No payout account is connected."),
         ("stripe_card", "Stripe virtual card", "No card", "Sandbox ledger. No card is connected."),
+        ("hyperliquid_ws", "Hyperliquid L1 margin", "0.00 USDC", "Sandbox ledger. Quant rail over wss://api.hyperliquid.xyz/ws."),
     ] {
         conn.execute(
-            "INSERT INTO wallet_balances (rail, label, amount_usd, native_amount, native_value, detail) VALUES (?1,?2,0,?3,0,?4)",
+            "INSERT OR IGNORE INTO wallet_balances (rail, label, amount_usd, native_amount, native_value, detail) VALUES (?1,?2,0,?3,0,?4)",
             params![rail, label, native, detail],
         )?;
     }
@@ -748,6 +860,27 @@ pub fn log_repair(conn: &Connection, tier: i64, fault: &str, target: &str, actio
 
 pub fn insert_step(conn: &Connection, thread_id: &str, role: &str, model: &str, content: &str, action: &str, payload: &Value, latency: i64) -> Result<()> {
     insert_step_in(conn, thread_id, "", role, model, content, action, payload, latency)
+}
+
+/// Live-activity step: a tiny `turn_activity` row the snapshot poll can see
+/// while the model turn is still running. The UI renders it in very small
+/// letters inside the working pill. Stale rows (a turn that ended without
+/// finishing cleanly) are swept after a minute.
+pub fn record_turn_activity(conn: &Connection, thread_id: &str, turn_id: &str, detail: &str) -> Result<()> {
+    let now = now_ms();
+    // One sweep clears this thread's prior marker plus any stale rows left by
+    // turns that ended without finishing cleanly (60s grace).
+    conn.execute(
+        "DELETE FROM execution_steps WHERE action_type = 'turn_activity' AND (thread_id = ?1 OR created_at < ?2)",
+        params![thread_id, now - 60_000],
+    )?;
+    // model_used='activity' keeps the row distinguishable from a real tool step
+    // for any consumer that forgets to filter on action_type.
+    conn.execute(
+        "INSERT INTO execution_steps (id, thread_id, turn_id, role, model_used, content_markdown, action_type, action_payload_json, execution_latency_ms, created_at) VALUES (?1,?2,?3,'tool','activity',?4,'turn_activity',?5,0,?6)",
+        params![nid("act"), thread_id, turn_id, detail, json!({"detail": detail}).to_string(), now],
+    )?;
+    Ok(())
 }
 
 pub fn insert_step_in(conn: &Connection, thread_id: &str, turn_id: &str, role: &str, model: &str, content: &str, action: &str, payload: &Value, latency: i64) -> Result<()> {

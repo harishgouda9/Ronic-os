@@ -6,7 +6,7 @@ mod skill_doc;
 use crate::db;
 use crate::error::{err, Result};
 use crate::models::*;
-use crate::util::{nid, now_ms};
+use crate::util::{nid, now_ms, run_capture};
 use rusqlite::{params, Connection};
 use serde::Deserialize;
 use serde_json::json;
@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 static RECONCILE_AFTER: AtomicU64 = AtomicU64::new(0);
 
@@ -148,7 +149,7 @@ pub fn view(conn: &Connection, home: &Path, profile_id: &str) -> Result<Capabili
     let proposals = read_proposals(conn, &skills)?;
     Ok(CapabilityView {
         skills,
-        registry: registry::assemble(&plugins, &mcp_servers),
+        registry: registry::assemble(&plugins, &mcp_servers, profile_id),
         plugins,
         mcp_servers,
         proposals,
@@ -423,7 +424,23 @@ pub fn save_mcp(conn: &Connection, home: &Path, draft: McpDraft) -> Result<()> {
          ON CONFLICT(id) DO UPDATE SET name=excluded.name, transport=excluded.transport, command=excluded.command, args_json=excluded.args_json, url=excluded.url, tools_json=excluded.tools_json, updated_at=excluded.updated_at",
         params![id, draft.name.trim(), transport, draft.command, serde_json::to_string(&draft.args)?, draft.url, trust, serde_json::to_string(&draft.tools)?, now_ms()],
     )?;
+    enable_mcp_defaults(conn, &id)?;
     Ok(())
+}
+
+/// Missing profile rows default to Active. An explicit Off is left alone.
+pub fn enable_mcp_defaults(conn: &Connection, id: &str) -> Result<()> {
+    for profile in profile_ids(conn)? {
+        conn.execute(
+            "INSERT INTO mcp_enables (server_id, profile_id, enabled) VALUES (?1, ?2, 1) ON CONFLICT(server_id, profile_id) DO NOTHING",
+            params![id, profile],
+        )?;
+    }
+    Ok(())
+}
+
+pub fn server_id_for_name(name: &str) -> String {
+    format!("mcp-{}", skill_doc::sanitize_slug(name))
 }
 
 pub fn toggle_mcp(conn: &Connection, id: &str, profile_id: &str, enabled: bool) -> Result<()> {
@@ -446,6 +463,7 @@ pub fn trust_mcp(conn: &Connection, id: &str) -> Result<()> {
     if changed == 0 {
         return Err(err("MCP server not found"));
     }
+    enable_mcp_defaults(conn, id)?;
     Ok(())
 }
 
@@ -548,6 +566,263 @@ pub fn install_catalog(conn: &Connection, home: &Path, profile_id: &str, slug: &
     ensure_enable(conn, &id, profile_id, true)?;
     note_delta(conn, profile_id, &format!("Skill index changed: /{slug} is on."))?;
     Ok(format!("Installed into the selected profile.{mcp_suffix}"))
+}
+
+fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_all(&from, &to)?;
+        } else {
+            fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+fn resolve_profile(conn: &Connection, profile_id: &str) -> String {
+    if !profile_id.trim().is_empty() {
+        return profile_id.trim().to_string();
+    }
+    if let Ok(Some(id)) = crate::db::kv_get(conn, "active_profile") {
+        if !id.trim().is_empty() {
+            return id.trim().to_string();
+        }
+    }
+    if let Ok(first_id) = conn.query_row("SELECT id FROM bot_profiles ORDER BY rowid ASC LIMIT 1", [], |row| row.get::<_, String>(0)) {
+        return first_id;
+    }
+    "bot_default".to_string()
+}
+
+pub fn install_skill_from_source(
+    conn: &Connection,
+    home: &Path,
+    profile_id: &str,
+    source: &str,
+    slug_opt: Option<&str>,
+) -> Result<String> {
+    let source = source.trim();
+    if source.is_empty() {
+        return Err(err("install_skill needs a source URL, GitHub link, or catalog slug"));
+    }
+    let profile = resolve_profile(conn, profile_id);
+    if !profile_exists(conn, &profile)? {
+        return Err(err(format!("Bot profile '{profile}' does not exist.")));
+    }
+
+    // 1. Is it a marketplace / catalog slug? (e.g. filesystem-mcp, brand, slides, etc.)
+    if !source.contains("://") && !source.contains('/') && !source.contains('\n') {
+        let slug = skill_doc::sanitize_slug(source);
+        if let Ok(msg) = install_catalog(conn, home, &profile, &slug, &slug, &format!("Skill {slug} installed from catalog.")) {
+            return Ok(format!("Installed catalog skill '/{slug}' for bot profile '{profile}'. {msg}"));
+        }
+    }
+
+    // 2. Is it a URL?
+    let content = if source.starts_with("http://") || source.starts_with("https://") {
+        let mut fetch_url = source.to_string();
+        // Transform GitHub web link to raw file if applicable
+        if fetch_url.contains("github.com") && !fetch_url.contains("raw.githubusercontent.com") {
+            if fetch_url.contains("/blob/") {
+                fetch_url = fetch_url.replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/");
+            } else if !fetch_url.ends_with(".md") {
+                // If it's a repo link like https://github.com/owner/repo, try main/SKILL.md or master/SKILL.md
+                let trimmed = fetch_url.trim_end_matches('/').trim_end_matches(".git");
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(Duration::from_secs(10))
+                    .build()
+                    .map_err(|e| err(e.to_string()))?;
+                let main_try = format!("{trimmed}/raw/main/SKILL.md");
+                let master_try = format!("{trimmed}/raw/master/SKILL.md");
+                if let Ok(res) = client.get(&main_try).send() {
+                    if res.status().is_success() {
+                        fetch_url = main_try;
+                    } else if let Ok(res_master) = client.get(&master_try).send() {
+                        if res_master.status().is_success() {
+                            fetch_url = master_try;
+                        }
+                    }
+                }
+            }
+        }
+
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .map_err(|e| err(e.to_string()))?;
+        let res = client.get(&fetch_url).send().map_err(|e| err(format!("Failed to download from {fetch_url}: {e}")))?;
+        if !res.status().is_success() {
+            return Err(err(format!("HTTP error {} downloading skill from {}", res.status(), fetch_url)));
+        }
+        res.text().map_err(|e| err(format!("Failed to read response text: {e}")))?
+    } else {
+        // Direct markdown text
+        source.to_string()
+    };
+
+    let slug = if let Some(custom) = slug_opt.map(str::trim).filter(|s| !s.is_empty()) {
+        skill_doc::sanitize_slug(custom)
+    } else {
+        let front = skill_doc::parse_skill(&content, "imported-skill");
+        if !front.name.is_empty() {
+            skill_doc::sanitize_slug(&front.name)
+        } else {
+            "imported-skill".into()
+        }
+    };
+
+    if slug.is_empty() {
+        return Err(err("Could not determine a valid slug for the skill."));
+    }
+
+    let parsed = skill_doc::parse_skill(&content, &slug);
+    let path = home.join("profiles").join(&profile).join("skills").join(&slug).join("SKILL.md");
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, &content)?;
+    let id = format!("sk-{profile}-{slug}");
+    upsert_skill(conn, &id, &slug, "profile", &profile, "", &parsed, &display_path(home, &path))?;
+    ensure_enable(conn, &id, &profile, true)?;
+    note_delta(conn, &profile, &format!("Skill index changed: /{slug} is on."))?;
+
+    Ok(format!("Successfully downloaded and installed skill '/{slug}' for bot '{profile}'. It is enabled and in your skill index immediately."))
+}
+
+pub fn install_plugin_from_source(
+    conn: &Connection,
+    home: &Path,
+    profile_id: &str,
+    source: &str,
+    slug_opt: Option<&str>,
+) -> Result<String> {
+    let source = source.trim();
+    if source.is_empty() {
+        return Err(err("install_plugin needs a source URL, GitHub link, or folder"));
+    }
+    let profile = resolve_profile(conn, profile_id);
+
+    let slug = if let Some(custom) = slug_opt.map(str::trim).filter(|s| !s.is_empty()) {
+        skill_doc::sanitize_slug(custom)
+    } else if let Some(last_seg) = source.trim_end_matches('/').split('/').last() {
+        skill_doc::sanitize_slug(last_seg.trim_end_matches(".git"))
+    } else {
+        "plugin".into()
+    };
+    if slug.is_empty() {
+        return Err(err("Invalid plugin slug"));
+    }
+
+    let plugin_dir = home.join("plugins").join(&slug);
+
+    if source.starts_with("http://") || source.starts_with("https://") || source.starts_with("git@") {
+        if plugin_dir.exists() {
+            let _ = fs::remove_dir_all(&plugin_dir);
+        }
+        fs::create_dir_all(home.join("plugins"))?;
+        let (code, output) = run_capture("git", &["clone", "--depth", "1", source, &plugin_dir.display().to_string()], None, Duration::from_secs(120))?;
+        if code != 0 {
+            return Err(err(format!("git clone failed: {}", output.lines().last().unwrap_or("no output"))));
+        }
+    } else {
+        let src_path = Path::new(source);
+        if !src_path.exists() {
+            return Err(err(format!("Source path '{source}' does not exist")));
+        }
+        if src_path != plugin_dir {
+            copy_dir_all(src_path, &plugin_dir)?;
+        }
+    }
+
+    let yaml_file = plugin_dir.join("plugin.yaml");
+    if !yaml_file.exists() {
+        let stub_yaml = format!("name: {slug}\nslug: {slug}\nversion: 1.0.0\nhas_agent: true\nhas_desktop: true\n");
+        let _ = fs::write(&yaml_file, stub_yaml);
+    }
+    let imported = import_plugin(conn, home, &plugin_dir, "folder")?;
+    let Some(plugin_id) = imported else {
+        return Err(err(format!("Could not load plugin from {slug}")));
+    };
+
+    // Trust it and enable for this profile
+    conn.execute("UPDATE plugins SET trust = 'trusted', desktop_enabled = 1 WHERE id = ?1", params![plugin_id])?;
+    if !profile.is_empty() && profile_exists(conn, &profile)? {
+        conn.execute(
+            "INSERT INTO plugin_agent_enables (plugin_id, profile_id, enabled) VALUES (?1, ?2, 1) ON CONFLICT(plugin_id, profile_id) DO UPDATE SET enabled = 1",
+            params![plugin_id, profile],
+        )?;
+        note_delta(conn, &profile, &format!("Plugin {slug} is now on."))?;
+    }
+
+    Ok(format!("Plugin '{slug}' was successfully downloaded, trusted, and enabled for bot profile '{profile}'."))
+}
+
+pub fn connect_mcp_server(
+    conn: &Connection,
+    home: &Path,
+    profile_id: &str,
+    name: &str,
+    transport: Option<&str>,
+    command: Option<&str>,
+    args: &[String],
+    url: Option<&str>,
+    secret: Option<&str>,
+) -> Result<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(err("connect_mcp needs an MCP server name"));
+    }
+    let slug = skill_doc::sanitize_slug(name);
+    let profile = resolve_profile(conn, profile_id);
+
+    let mut trans = transport.unwrap_or("stdio").trim().to_lowercase();
+    let mut cmd = command.unwrap_or("").trim().to_string();
+    let mut server_args = args.to_vec();
+    let mut endpoint_url = url.unwrap_or("").trim().to_string();
+
+    // If command and url are empty, check if it matches a catalog MCP (e.g. filesystem-mcp, github-mcp)
+    if cmd.is_empty() && endpoint_url.is_empty() {
+        if let Some(cat) = catalog_mcp(&slug) {
+            trans = cat.transport.to_string();
+            cmd = cat.command.to_string();
+            server_args = cat.args.iter().map(|s| s.to_string()).collect();
+            endpoint_url = cat.url.to_string();
+        }
+    }
+
+    if trans != "sse" && cmd.is_empty() {
+        return Err(err(format!("MCP server '{name}' needs a command (e.g. 'npx -y @modelcontextprotocol/server-filesystem') or an SSE URL")));
+    }
+    let remote = endpoint_url.starts_with("http://") || endpoint_url.starts_with("https://") || trans == "sse";
+    if remote && secret.unwrap_or("").trim().is_empty() {
+        return Err(err(format!("MCP server '{name}' needs a credential before it can be saved. An empty form is not a connection.")));
+    }
+
+    let id = server_id_for_name(name);
+    save_mcp(conn, home, McpDraft {
+        id: id.clone(),
+        name: name.to_string(),
+        transport: trans.clone(),
+        command: cmd,
+        args: server_args,
+        url: endpoint_url,
+        tools: Vec::new(),
+        secret: secret.unwrap_or("").to_string(),
+    })?;
+
+    conn.execute("UPDATE mcp_servers SET trust = 'trusted' WHERE id = ?1", params![id])?;
+    enable_mcp_defaults(conn, &id)?;
+    if !profile.is_empty() && profile_exists(conn, &profile)? {
+        note_delta(conn, &profile, &format!("MCP server {name} is trusted. Profile switches default to Active."))?;
+    }
+
+    let credential = if secret.unwrap_or("").trim().is_empty() { "No credential was stored." } else { "The credential is in the vault." };
+    Ok(format!("MCP server '{name}' is trusted. Profile switches default to Active. {credential}"))
 }
 
 struct SkillRow {
@@ -661,7 +936,7 @@ fn sync_plugins(conn: &Connection, home: &Path, project_root: &str) -> Result<()
             found.insert(id);
         }
     }
-    let project = PathBuf::from(project_root).join(".omniworkspace").join("plugins");
+    let project = PathBuf::from(project_root).join(".ronicos").join("plugins");
     if project.is_dir() {
         for dir in child_dirs(&project) {
             if let Some(id) = import_plugin(conn, home, &dir, "project")? {
@@ -743,6 +1018,8 @@ fn sync_mcp(conn: &Connection, home: &Path) -> Result<()> {
         if !found.contains(&id) {
             conn.execute("DELETE FROM mcp_enables WHERE server_id = ?1", params![id])?;
             conn.execute("DELETE FROM mcp_servers WHERE id = ?1", params![id])?;
+        } else {
+            enable_mcp_defaults(conn, &id)?;
         }
     }
     Ok(())
@@ -1193,7 +1470,7 @@ mod tests {
     use super::*;
 
     fn setup() -> (PathBuf, Connection, String) {
-        let home = std::env::temp_dir().join(format!("omni-caps-{}-{}-{}", std::process::id(), now_ms(), nid("t")));
+        let home = std::env::temp_dir().join(format!("ronic-caps-{}-{}-{}", std::process::id(), now_ms(), nid("t")));
         let _ = fs::remove_dir_all(&home);
         fs::create_dir_all(&home).unwrap();
         let conn = crate::db::open(&home.join("state.db")).unwrap();
@@ -1270,7 +1547,7 @@ mod tests {
     #[test]
     fn untrusted_project_plugins_cannot_be_enabled() {
         let (home, conn, profile) = setup();
-        let dir = home.join("repo").join(".omniworkspace").join("plugins").join("local-tool");
+        let dir = home.join("repo").join(".ronicos").join("plugins").join("local-tool");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("plugin.yaml"), "id: local-tool\nname: Local Tool\nversion: 1.0.0\nhas_agent_part: true\nhas_desktop_part: true\ntools:\n  - name: local_ping\n    description: Ping\nhooks: [session_start]\nskills: []\ndesktop:\n  - kind: status\n    label: LOCAL\n    target: \"\"\n").unwrap();
         reconcile(&conn, &home, &home.join("repo").display().to_string()).unwrap();

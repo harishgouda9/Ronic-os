@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-mini-chrome-nav"
+description = "Enables the mini_chrome_nav command without any pre-configured scope."
+commands.allow = ["mini_chrome_nav"]
+
+[[permission]]
+identifier = "deny-mini-chrome-nav"
+description = "Denies the mini_chrome_nav command without any pre-configured scope."
+commands.deny = ["mini_chrome_nav"]

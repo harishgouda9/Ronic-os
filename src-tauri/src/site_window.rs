@@ -498,12 +498,12 @@ fn allowed_popup(url: &Url) -> bool {
 fn fresh_label<R: Runtime>(app: &AppHandle<R>) -> String {
     for _ in 0..24 {
         let n = POPUP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let label = format!("omni_auth_{n}");
+        let label = format!("ronic_auth_{n}");
         if app.get_webview_window(&label).is_none() {
             return label;
         }
     }
-    format!("omni_auth_{}", POPUP_SEQ.fetch_add(1, Ordering::Relaxed))
+    format!("ronic_auth_{}", POPUP_SEQ.fetch_add(1, Ordering::Relaxed))
 }
 
 struct RuntimeVersion {
@@ -888,13 +888,13 @@ fn tell_sign_in<R: Runtime>(app: &AppHandle<R>, label: &str, message: &str) {
     };
     let id = serde_json::to_string(panel_id(label)).unwrap_or_else(|_| "\"\"".into());
     let text = serde_json::to_string(message).unwrap_or_else(|_| "\"\"".into());
-    let js = format!("window.dispatchEvent(new CustomEvent('omni-signin', {{ detail: {{ id: {id}, message: {text} }} }}))");
+    let js = format!("window.dispatchEvent(new CustomEvent('ronic-signin', {{ detail: {{ id: {id}, message: {text} }} }}))");
     let _ = window.eval(js);
 }
 
 fn close_profile_views<R: Runtime>(app: &AppHandle<R>, label: &str) {
     let mut labels = vec![label.to_string()];
-    labels.extend(app.webviews().keys().filter(|name| name.starts_with("omni_auth_")).cloned());
+    labels.extend(app.webviews().keys().filter(|name| name.starts_with("ronic_auth_")).cloned());
     for name in labels {
         if let Some(window) = app.get_webview_window(&name) {
             let _ = window.close();
@@ -975,7 +975,7 @@ fn browser_launch_script(browser: &Path, data_dir: &Path, url: &str) -> Result<S
 
 fn script_file() -> PathBuf {
     let n = POPUP_SEQ.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("omni-signin-{}-{n}.vbs", std::process::id()))
+    std::env::temp_dir().join(format!("ronic-signin-{}-{n}.vbs", std::process::id()))
 }
 
 #[cfg(windows)]
@@ -1101,11 +1101,11 @@ mod tests {
     #[test]
     fn google_sign_in_script_uses_the_site_profile() {
         let browser = PathBuf::from(r"C:\Program Files\Google\Chrome\Application\chrome.exe");
-        let dir = PathBuf::from(r"C:\Users\haris\.omniworkspace\webapps\browser\webapp_chatgpt-p2\EBWebView");
+        let dir = PathBuf::from(r"C:\Users\haris\.ronicos\webapps\browser\webapp_chatgpt-p2\EBWebView");
         let url = "https://accounts.google.com/o/oauth2/v2/auth?client_id=x&redirect_uri=https%3A%2F%2Fchatgpt.com%2F";
         let script = browser_launch_script(&browser, &dir, url).unwrap();
         assert!(script.contains(r"C:\Program Files\Google\Chrome\Application\chrome.exe"));
-        assert!(script.contains(r#"--user-data-dir=""C:\Users\haris\.omniworkspace\webapps\browser\webapp_chatgpt-p2\EBWebView""#));
+        assert!(script.contains(r#"--user-data-dir=""C:\Users\haris\.ronicos\webapps\browser\webapp_chatgpt-p2\EBWebView""#));
         assert!(script.contains("client_id=x&redirect_uri="));
         assert!(script.contains("--no-first-run"));
         assert!(script.contains("--new-window"));

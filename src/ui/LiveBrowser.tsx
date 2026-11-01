@@ -3,7 +3,7 @@ import { ArrowLeft, ArrowRight, Box, Plus, RefreshCw, X } from "lucide-react";
 import { pageHost, restartAsk, safePageUrl } from "../kernel/workspaceChrome";
 import { hidePageBrowser, isTauriRuntime, pageBrowserGo, placePageBrowser, showPageBrowser, type WebAppBounds } from "../lib/tauriBridge";
 
-const PAGE_KEY = "omni.pageBrowser.v1";
+const PAGE_KEY = "ronic.pageBrowser.v1";
 const TEMPLATE = new Set(["http://127.0.0.1:3000/", "http://127.0.0.1:3000"]);
 
 type PageTab = { id: string; url: string; past: string[]; future: string[] };
@@ -131,8 +131,8 @@ export function LiveBrowser({ botName, onAsk, onClose }: { botName: string; onAs
       }));
       if (document.activeElement !== inputRef.current) setDraft(next);
     };
-    window.addEventListener("omni-page", onPage);
-    return () => window.removeEventListener("omni-page", onPage);
+    window.addEventListener("ronic-page", onPage);
+    return () => window.removeEventListener("ronic-page", onPage);
   }, []);
 
   applyRef.current = () => {

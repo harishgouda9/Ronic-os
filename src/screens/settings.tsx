@@ -1,24 +1,32 @@
 import { useEffect, useState, type ComponentType } from "react";
-import { Activity, ArrowLeft, Bot, Database, Globe, LayoutGrid, Monitor, Sparkles, Terminal, UserRound, Wallet, X } from "lucide-react";
+import { Activity, ArrowLeft, Bot, Database, Globe, LayoutGrid, Monitor, RefreshCw, Sparkles, Terminal, UserRound, Wallet, X } from "lucide-react";
+import { UpdateSettings } from "./UpdateSettings";
+import { normalizeUpdateSettings, rememberUpdatePrefs } from "../updates/feed";
 import { pickPaths } from "../api";
 import type { Policy, Settings } from "../types";
-import { useOmni } from "../store";
-import { AccountPanel } from "../ui/AccountPanel";
+import { useRonic } from "../store";
 import { money, Pill } from "../ui/bits";
+import { invoke } from "@tauri-apps/api/core";
+import { isTauriRuntime } from "../lib/tauriBridge";
+import { cloudConfig } from "../services/cloud";
+import { ApprovalModeSelector } from "../ui/ApprovalModeSelector";
 
-type SectionId = "general" | "account" | "binaries" | "bots" | "memory" | "skills" | "computer" | "network" | "repair" | "wallet";
+type SectionId = "general" | "account" | "binaries" | "bots" | "memory" | "skills" | "computer" | "approvals" | "network" | "storage" | "repair" | "wallet" | "update";
 
 const SECTIONS: { id: SectionId; label: string; detail: string; group: string; icon: ComponentType<{ size?: number }> }[] = [
   { id: "general", label: "General", detail: "Theme, density, project", group: "Workspace", icon: LayoutGrid },
-  { id: "account", label: "Account and vault", detail: "This machine only", group: "Workspace", icon: UserRound },
+  { id: "account", label: "Data and vault", detail: "Local workspace data", group: "Workspace", icon: UserRound },
   { id: "memory", label: "Memory", detail: "Journal and vault", group: "Workspace", icon: Database },
   { id: "binaries", label: "Local binaries", detail: "CLI paths", group: "Agents and tools", icon: Terminal },
   { id: "bots", label: "External bots", detail: "Fleet runners", group: "Agents and tools", icon: Bot },
   { id: "skills", label: "Skills and plugins", detail: "Where those live", group: "Agents and tools", icon: Sparkles },
   { id: "computer", label: "Computer and browser", detail: "Per profile", group: "Agents and tools", icon: Monitor },
+  { id: "approvals", label: "Approvals", detail: "Auto-approve, ask, or manual", group: "Agents and tools", icon: Bot },
   { id: "network", label: "Network", detail: "Proxy and reports", group: "System", icon: Globe },
+  { id: "storage", label: "Storage and backups", detail: "state.db, WAL, shadow-git", group: "System", icon: Database },
   { id: "repair", label: "Self-repair", detail: "Doctor and failover", group: "System", icon: Activity },
-  { id: "wallet", label: "Wallet and updates", detail: "Spend rules", group: "System", icon: Wallet },
+  { id: "wallet", label: "Wallet", detail: "Spend rules", group: "System", icon: Wallet },
+  { id: "update", label: "Update", detail: "Releases and notices", group: "System", icon: RefreshCw },
 ];
 
 function Switch({ on, warn = false }: { on: boolean; warn?: boolean }) {
@@ -35,38 +43,111 @@ const BINARIES = [
   ["bunPath", "bun"],
 ] as const;
 
+function mb(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 MB";
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+type KernelDiag = {
+  db: { dbBytes: number; walBytes: number; journalMode: string; freelistBytes: number; memories: number; threads: number; steps: number; profiles: number; heartbeatMs: number };
+  shadowFiles: number;
+  shadowBytes: number;
+  backupCount: number;
+  homeDir: string;
+};
+
 function amount(raw: string, fallback: number) {
   const value = Number(raw);
   return Number.isFinite(value) ? value : fallback;
 }
 
 export function SettingsScreen() {
-  const snap = useOmni((s) => s.snap)!;
-  const run = useOmni((s) => s.run);
-  const recover = useOmni((s) => s.recover);
-  const recovering = useOmni((s) => s.recovering);
-  const go = useOmni((s) => s.go);
-  const busy = useOmni((s) => s.busy);
-  const [section, setSection] = useState<SectionId>("general");
+  const snap = useRonic((s) => s.snap)!;
+  const run = useRonic((s) => s.run);
+  const recover = useRonic((s) => s.recover);
+  const recovering = useRonic((s) => s.recovering);
+  const go = useRonic((s) => s.go);
+  const busy = useRonic((s) => s.busy);
+  const [section, setSection] = useState<SectionId>(() => (sessionStorage.getItem("ronic.settings.section") === "update" ? "update" : "general"));
   const [filter, setFilter] = useState("");
-  const [draft, setDraft] = useState(snap.settings);
+  const [draft, setDraft] = useState(() => normalizeUpdateSettings(snap.settings));
   const [policy, setPolicy] = useState(snap.policy);
   const [confirm, setConfirm] = useState("");
   const [copied, setCopied] = useState(false);
   const [profileId, setProfileId] = useState(snap.activeProfileId || snap.profiles[0]?.id || "");
-  const [runners, setRunners] = useState(snap.settings.ghostRunners.join(", "));
-  const settingsStamp = JSON.stringify(snap.settings);
+  const desktop = isTauriRuntime();
+  const [diag, setDiag] = useState<KernelDiag | null>(null);
+  const [maintBusy, setMaintBusy] = useState(false);
+  const [maintNote, setMaintNote] = useState("");
+  const [tunnelNote, setTunnelNote] = useState("");
+
+  function loadDiag() {
+    if (!desktop) return;
+    setMaintBusy(true);
+    void invoke<KernelDiag>("kernel_diagnostics").then((next) => {
+      setDiag(next);
+      setMaintBusy(false);
+    }).catch((error) => {
+      setMaintNote(error instanceof Error ? error.message : String(error));
+      setMaintBusy(false);
+    });
+    void invoke<{ running: boolean; publicUrl: string; note: string }>("mesh_tunnel_status").then((tunnel) => {
+      if (tunnel) setTunnelNote(tunnel.running ? `A public relay is active (${tunnel.publicUrl || "tunnel up"}). Consumer web sessions do not route through it.` : "No public relay is active — all traffic stays on this machine's own connection.");
+    }).catch(() => setTunnelNote(""));
+  }
+
+  useEffect(() => {
+    if (section === "storage" || section === "network") loadDiag();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [section, desktop]);
+
+  async function maintenance(kind: "vacuum" | "prune" | "backup") {
+    if (!desktop) return;
+    setMaintBusy(true);
+    setMaintNote(kind === "vacuum" ? "Running WAL checkpoint and VACUUM…" : kind === "prune" ? "Pruning old shadow-git snapshots…" : "Copying the workspace to Documents…");
+    try {
+      if (kind === "vacuum") {
+        const res = await invoke<{ dbBytes: number; walBytes: number; freedBytes: number }>("db_maintenance");
+        setMaintNote(`Checkpoint and VACUUM finished. Database ${mb(res.dbBytes)}, WAL ${mb(res.walBytes)}, freed about ${mb(res.freedBytes)}.`);
+      } else if (kind === "prune") {
+        const res = await invoke<{ removed: number; freedBytes: number; keptDays: number }>("shadow_git_prune", { days: 14 });
+        setMaintNote(res.removed > 0 ? `Removed ${res.removed} snapshot file${res.removed === 1 ? "" : "s"} older than ${res.keptDays} days (about ${mb(res.freedBytes)}).` : `Nothing older than ${res.keptDays} days to prune.`);
+      } else {
+        const res = await invoke<{ path: string; bytes: number }>("workspace_backup");
+        setMaintNote(`Backup written to ${res.path} (${mb(res.bytes)}).`);
+      }
+      const next = await invoke<KernelDiag>("kernel_diagnostics");
+      setDiag(next);
+    } catch (error) {
+      setMaintNote(error instanceof Error ? error.message : String(error));
+    } finally {
+      setMaintBusy(false);
+    }
+  }
+  const savedSettings = normalizeUpdateSettings(snap.settings);
+  const [runners, setRunners] = useState(savedSettings.ghostRunners.join(", "));
+  const settingsStamp = JSON.stringify(savedSettings);
   const policyStamp = JSON.stringify(snap.policy);
   useEffect(() => {
-    setDraft(snap.settings);
-    setRunners(snap.settings.ghostRunners.join(", "));
+    const openUpdate = () => {
+      sessionStorage.removeItem("ronic.settings.section");
+      setSection("update");
+    };
+    window.addEventListener("ronic-open-update", openUpdate);
+    if (sessionStorage.getItem("ronic.settings.section") === "update") openUpdate();
+    return () => window.removeEventListener("ronic-open-update", openUpdate);
+  }, []);
+  useEffect(() => {
+    const next = normalizeUpdateSettings(useRonic.getState().snap?.settings ?? snap.settings);
+    setDraft(next);
+    setRunners(next.ghostRunners.join(", "));
   }, [settingsStamp]);
   useEffect(() => setPolicy(snap.policy), [policyStamp]);
   useEffect(() => {
     document.documentElement.dataset.theme = draft.theme;
     document.documentElement.dataset.density = draft.density;
     return () => {
-      const saved = useOmni.getState().snap?.settings;
+      const saved = useRonic.getState().snap?.settings;
       if (!saved) return;
       document.documentElement.dataset.theme = saved.theme;
       document.documentElement.dataset.density = saved.density;
@@ -94,6 +175,7 @@ export function SettingsScreen() {
 
   async function save() {
     if (settingsDirty) {
+      rememberUpdatePrefs(draft);
       const saved = await run("save_settings", { settings: draft });
       if (!saved) return;
     }
@@ -114,42 +196,46 @@ export function SettingsScreen() {
   }
 
   return (
-    <div className="screen">
-      <div className="between">
-        <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
-          <div className="row-actions" style={{ gap: "4px" }}>
-            <button
-              type="button"
-              className="btn ghost small"
-              onClick={() => go("chat")}
-              title="Back to Chat (Alt+Left)"
-              style={{ display: "inline-flex", alignItems: "center", gap: "4px" }}
-            >
-              <ArrowLeft size={13} />
-              <span>Back</span>
-            </button>
-            <button
-              type="button"
-              className="btn ghost small"
-              onClick={() => go("chat")}
-              title="Close Settings (Esc)"
-              aria-label="Close"
-              style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", padding: "6px" }}
-            >
-              <X size={14} />
-            </button>
-          </div>
-          <div>
-            <h1 className="title">Settings</h1>
-            <p className="saved-line">
-              {dirty ? <span className="pill warn">Unsaved</span> : <span className="pill ok"><i className="dot" />Saved</span>}
-              <span className="mono">{snap.homeDir}</span>
-            </p>
+    <div className="flex-1 h-full bg-[#eceef2] p-3 sm:p-5 lg:p-6 overflow-y-auto select-none flex flex-col">
+      <div className="w-full max-w-[1560px] flex-1 min-h-[660px] bg-white rounded-3xl shadow-[0_12px_40px_-8px_rgba(0,0,0,0.06),0_2px_8px_-1px_rgba(0,0,0,0.03)] border border-slate-200/70 flex flex-col mx-auto overflow-hidden transition-all duration-300">
+        <div className="p-5 sm:p-7 pb-4 border-b border-slate-100 bg-white">
+          <div className="between">
+            <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
+              <div className="row-actions" style={{ gap: "4px" }}>
+                <button
+                  type="button"
+                  className="btn ghost small"
+                  onClick={() => go("chat")}
+                  title="Back to Chat (Alt+Left)"
+                  style={{ display: "inline-flex", alignItems: "center", gap: "4px" }}
+                >
+                  <ArrowLeft size={13} />
+                  <span>Back</span>
+                </button>
+                <button
+                  type="button"
+                  className="btn ghost small"
+                  onClick={() => go("chat")}
+                  title="Close Settings (Esc)"
+                  aria-label="Close"
+                  style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", padding: "6px" }}
+                >
+                  <X size={14} />
+                </button>
+              </div>
+              <div>
+                <h1 className="title text-slate-900">Settings</h1>
+                <p className="saved-line">
+                  {dirty ? <span className="pill warn">Unsaved</span> : <span className="pill ok"><i className="dot" />Saved</span>}
+                  <span className="mono">{snap.homeDir}</span>
+                </p>
+              </div>
+            </div>
+            {dirty ? <button className="btn" disabled={busy} onClick={() => void save()}>Save changes</button> : null}
           </div>
         </div>
-        {dirty ? <button className="btn" disabled={busy} onClick={() => void save()}>Save changes</button> : null}
-      </div>
-      <div className="settings-layout">
+        <div className="flex-1 overflow-y-auto p-5 sm:p-7">
+          <div className="settings-layout">
         <aside className="settings-nav">
           <label className="field">
             <span className="sr">Filter sections</span>
@@ -162,7 +248,7 @@ export function SettingsScreen() {
               {visible.filter((item) => item.group === group).map((item) => {
                 const Icon = item.icon;
                 return (
-                  <button key={item.id} type="button" className={`set-nav ${section === item.id ? "on" : ""}`} aria-current={section === item.id ? "page" : undefined} onClick={() => setSection(item.id)}>
+                  <button key={item.id} type="button" className={`set-nav ${section === item.id ? "on" : ""}`} aria-label={item.label} aria-current={section === item.id ? "page" : undefined} onClick={() => setSection(item.id)}>
                     <span className="set-ico"><Icon size={16} /></span>
                     <span><span className="set-name">{item.label}</span><span className="set-detail">{item.detail}</span></span>
                   </button>
@@ -198,7 +284,7 @@ export function SettingsScreen() {
                   <Switch on={draft.showRailLabels} />
                 </button>
                 <label className="field"><span>Project root</span>
-                  <input className="input" value={draft.projectRoot} onChange={(event) => set("projectRoot", event.target.value)} placeholder="Folder scanned for .omniworkspace/plugins" />
+                  <input className="input" value={draft.projectRoot} onChange={(event) => set("projectRoot", event.target.value)} placeholder="Folder scanned for .ronicos/plugins" />
                 </label>
                 <p className="faint">Project plugins in that folder stay off until you trust them on Capabilities.</p>
               </>
@@ -206,13 +292,22 @@ export function SettingsScreen() {
 
             {section === "account" ? (
               <>
-                <h2 className="h2">Account and vault</h2>
-                <p className="muted">Chats, provider keys, and memory stay on this machine. A Ronic account is separate and is used for the paid store.</p>
-                <AccountPanel />
+                <h2 className="h2">Data and vault</h2>
+                <p className="muted">Chats, memory, and the vault live on this machine. Account, plan, API keys, and 1-click MCP live on Plan & setup.</p>
+                <article className="card stack">
+                  <div className="between">
+                    <div>
+                      <div className="muted">License</div>
+                      <strong>{snap.license?.status === "active" ? "Cloud lease verified" : snap.license?.status === "local" ? "Registered locally (Starter)" : snap.license?.status === "unsigned_dev" ? "Development build — nothing enforced" : "Not registered (Starter)"}</strong>
+                    </div>
+                    <Pill kind={snap.license?.proEntitled ? "ok" : ""}>{snap.license?.proEntitled ? "Pro features open" : "Starter"}</Pill>
+                  </div>
+                  <button type="button" className="btn ghost small" onClick={() => go("billing")}>Open Plan & setup — plans, keys, 1-click MCP</button>
+                </article>
                 <div className="grid-3">
-                  <article className="card"><div className="muted">Plan</div><div className="kpi">{draft.plan || "Local"}</div></article>
                   <article className="card"><div className="muted">Installed</div><div className="kpi">{draft.version}</div></article>
                   <article className="card"><div className="muted">Vault</div><div>{snap.hasPassphrase ? (snap.vaultUnlocked ? "Unlocked" : "Locked") : "No passphrase"}</div></article>
+                  <article className="card"><div className="muted">Workspace</div><div className="mono" style={{ fontSize: 11 }}>{snap.homeDir}</div></article>
                 </div>
                 <div className="row-actions">
                   <button className="btn ghost" onClick={() => go("vault")}>{snap.hasPassphrase ? "Open vault" : "Set a passphrase"}</button>
@@ -345,13 +440,29 @@ export function SettingsScreen() {
                       <span>Code execution</span>
                       <Switch on={profile.allowCodeExec} />
                     </button>
-                    <p className="faint">Profile wallet cap {money(profile.dailyWalletLimitUsd)}. The workspace spend gate is under Wallet and updates.</p>
+                    <p className="faint">Profile wallet cap {money(profile.dailyWalletLimitUsd)}. The workspace spend gate is under Wallet.</p>
                   </div>
                 ) : <p className="muted">Create a profile before setting these permissions.</p>}
                 <div className="row-actions">
                   <button className="btn ghost" onClick={() => go("profiles")}>Open profiles</button>
                   <button className="btn ghost" onClick={() => go("computer")}>Open computer use</button>
                 </div>
+              </>
+            ) : null}
+
+            {section === "approvals" ? (
+              <>
+                <h2 className="h2">Approval mode</h2>
+                <p className="muted">Choose how much autonomy each bot has. Auto approve lets the bot research, plan, and execute on its own — it only pauses for critical decisions or credentials. Ask mode holds external actions and wallet spend for your approval. Manual mode holds every action.</p>
+                <label className="field"><span>Profile</span>
+                  <select className="select" value={profile?.id ?? ""} onChange={(event) => setProfileId(event.target.value)}>
+                    {snap.profiles.length === 0 ? <option value="">No profile yet</option> : null}
+                    {snap.profiles.map((item) => <option key={item.id} value={item.id}>{item.handle}</option>)}
+                  </select>
+                </label>
+                {profile ? (
+                  <ApprovalModeSelector profile={profile} />
+                ) : <p className="muted">Create a profile before setting an approval mode.</p>}
               </>
             ) : null}
 
@@ -367,6 +478,58 @@ export function SettingsScreen() {
                   <input className="input" value={draft.triageUrl} onChange={(event) => set("triageUrl", event.target.value)} placeholder="https://… optional" />
                 </label>
                 <p className="faint">{draft.triageUrl.trim() && !draft.triageUrl.startsWith("https://") ? "Only an https address is used. Anything else stays local." : "Reports are scrubbed, then saved under the workspace tickets folder. An https address also receives a copy."}</p>
+                <h2 className="h2">Privacy and telemetry</h2>
+                <div className="stack">
+                  <div className="between">
+                    <span>Sentry crash reports</span>
+                    <Pill kind={cloudConfig.sentry ? "" : "ok"}>{cloudConfig.sentry ? "key configured" : "off — no key on this build"}</Pill>
+                  </div>
+                  <div className="between">
+                    <span>PostHog product telemetry</span>
+                    <Pill kind={cloudConfig.posthog ? "" : "ok"}>{cloudConfig.posthog ? "key configured" : "off — no key on this build"}</Pill>
+                  </div>
+                  <div className="between">
+                    <span>Prompt and secret scrubbing before any report leaves</span>
+                    <Pill kind="ok">always on</Pill>
+                  </div>
+                  <div className="between">
+                    <span>Public relay (residential guard)</span>
+                    <Pill kind={tunnelNote.startsWith("A public relay") ? "warn" : "ok"}>{tunnelNote ? (tunnelNote.startsWith("A public relay") ? "relay active" : "no relay") : desktop ? "checking…" : "desktop only"}</Pill>
+                  </div>
+                </div>
+                <p className="faint">{tunnelNote || "Consumer web sessions (chatgpt.com, claude.ai, grok.com) always run from this machine's own connection. A relay, when you start one, exposes only the local MCP bus."}</p>
+              </>
+            ) : null}
+
+            {section === "storage" ? (
+              <>
+                <h2 className="h2">Storage and backups</h2>
+                <p className="muted">Live numbers from the real workspace on disk. Nothing here leaves the machine.</p>
+                {!desktop ? <p className="muted">Storage maintenance runs in the desktop app.</p> : null}
+                <div className="grid-3">
+                  <article className="card">
+                    <div className="muted">SQLite database</div>
+                    <div className="kpi">{diag ? mb(diag.db.dbBytes) : "—"}</div>
+                    <div className="faint mono">journal_mode={diag?.db.journalMode || "wal"} · WAL {diag ? mb(diag.db.walBytes) : "—"}</div>
+                  </article>
+                  <article className="card">
+                    <div className="muted">Shadow-git snapshots</div>
+                    <div className="kpi">{diag ? diag.shadowFiles : "—"}</div>
+                    <div className="faint">{diag ? `${mb(diag.shadowBytes)} of rollback points` : "File count and size"}</div>
+                  </article>
+                  <article className="card">
+                    <div className="muted">Workspace rows</div>
+                    <div className="kpi">{diag ? diag.db.memories : "—"}</div>
+                    <div className="faint">{diag ? `memories · ${diag.db.threads} threads · ${diag.db.steps} steps` : "Memories, threads, steps"}</div>
+                  </article>
+                </div>
+                <div className="row-actions">
+                  <button type="button" className="btn" disabled={!desktop || maintBusy} onClick={() => void maintenance("vacuum")}>{maintBusy ? "Working…" : "Run WAL checkpoint & VACUUM"}</button>
+                  <button type="button" className="btn ghost" disabled={!desktop || maintBusy} onClick={() => void maintenance("prune")}>Prune shadow-git older than 14 days</button>
+                  <button type="button" className="btn ghost" disabled={!desktop || maintBusy} onClick={() => void maintenance("backup")}>Export workspace backup</button>
+                </div>
+                <p className="faint">The backup copies state.db plus bots, skills, profiles, mcp, workflows, extensions, and tickets into Documents/Ronic OS backups. {diag && diag.backupCount > 0 ? `${diag.backupCount} backup file${diag.backupCount === 1 ? "" : "s"} on disk so far.` : "No backups taken from this screen yet."}</p>
+                {maintNote ? <p className="muted">{maintNote}</p> : null}
               </>
             ) : null}
 
@@ -387,10 +550,12 @@ export function SettingsScreen() {
               </>
             ) : null}
 
+            {section === "update" ? <UpdateSettings draft={draft} set={set} homeDir={snap.homeDir} /> : null}
+
             {section === "wallet" ? (
               <>
-                <h2 className="h2">Wallet gate and updates</h2>
-                <p className="muted">These amounts are the rules the wallet gate runs. Live rails refuse a charge in this build. Nothing here downloads or restarts a new binary.</p>
+                <h2 className="h2">Wallet gate</h2>
+                <p className="muted">These amounts are the rules the wallet gate runs. Live rails refuse a charge in this build.</p>
                 <div className="grid-2">
                   <label className="field"><span>Max per transaction (USD)</span>
                     <input className="input" type="number" min={0} step="0.01" value={policy.maxPerTxUsd} onChange={(event) => setGate("maxPerTxUsd", amount(event.target.value, policy.maxPerTxUsd))} />
@@ -417,20 +582,17 @@ export function SettingsScreen() {
                   <span>{draft.liveRails ? "Live rails — a charge is still refused" : "Live rails — sandbox ledger"}</span>
                   <Switch on={draft.liveRails} warn={draft.liveRails} />
                 </button>
-                <div className="grid-2">
-                  <label className="field"><span>Update channel</span>
-                    <select className="select" value={draft.updateChannel} onChange={(event) => set("updateChannel", event.target.value as Settings["updateChannel"])}>
-                      <option value="stable">Stable</option>
-                      <option value="nightly">Nightly</option>
-                    </select>
-                  </label>
-                  <article className="card"><div className="muted">Listed version</div><div>{draft.availableVersion === draft.version ? "Same as installed" : draft.availableVersion}</div><div className="faint">Channel is stored. This build does not install it.</div></article>
+                <p className="faint">Releases, auto update, and manual update are under Update.</p>
+                <div className="row-actions">
+                  <button type="button" className="btn ghost" onClick={() => setSection("update")}>Open Update</button>
+                  <button className="btn ghost" onClick={() => go("wallet")}>Open wallet</button>
                 </div>
-                <button className="btn ghost" onClick={() => go("wallet")}>Open wallet</button>
               </>
             ) : null}
           </div>
         </section>
+          </div>
+        </div>
       </div>
     </div>
   );

@@ -4,7 +4,7 @@ src-tauri/target
 src-tauri/gen
 .DS_Store
 *.log
-.omniworkspace
+.ronicos
 
 # Build artifacts synced to the repo root by scripts/desktop.mjs
 *.exe
@@ -13,6 +13,7 @@ src-tauri/gen
 # Local editor/tooling state
 .kilo
 .vite
+.opencode
 
 .env
 .env.local

@@ -17,6 +17,27 @@ pub fn settle(
     slippage_bps: Option<i64>,
     effect: &str,
 ) -> Result<String> {
+    settle_ext(conn, bot_id, rail, amount_usd, native_amount, counterparty, purpose, actor, kind, slippage_bps, effect, None)
+}
+
+/// Settlement core with an optional quant-order id. When an order id is
+/// supplied, its row is transitioned with the settlement outcome in the same
+/// transaction, so a held order leaves `WORKING` exactly when its wallet tx
+/// is decided — never before, never silently.
+pub fn settle_ext(
+    conn: &Connection,
+    bot_id: &str,
+    rail: &str,
+    amount_usd: f64,
+    native_amount: &str,
+    counterparty: &str,
+    purpose: &str,
+    actor: &str,
+    kind: &str,
+    slippage_bps: Option<i64>,
+    effect: &str,
+    order_id: Option<&str>,
+) -> Result<String> {
     let tx = conn.unchecked_transaction()?;
     let policy_row = db::load_policy(&tx)?;
     let spent = db::spent_today(&tx)?;
@@ -35,6 +56,23 @@ pub fn settle(
         kind,
     );
     let agent_spend = actor != "user" && effect != "credit";
+    // The advertised ₹400 UPI auto-sign cap: agent spend on the UPI rail above
+    // the cap is held for human review even when the USD approval line allows it.
+    if agent_spend
+        && rail == "razorpay_upi"
+        && decision == Decision::AutoSigned
+        && amount_usd * 83.0 > crate::wallet_engine::UPI_AUTO_SIGN_CAP_INR + 1e-9
+    {
+        decision = Decision::Pending;
+    }
+    if agent_spend && decision != Decision::Rejected && decision != Decision::Kill && crate::wallet_engine::is_bot_frozen(conn, bot_id)? {
+        insert_tx(&tx, bot_id, rail, amount_usd, native_amount, counterparty, purpose, "rejected_circuit_breaker", actor, "", effect)?;
+        if let Some(order_id) = order_id {
+            tx.execute("UPDATE quant_orders SET status = 'REJECTED' WHERE id = ?1", params![order_id])?;
+        }
+        tx.commit()?;
+        return Ok("rejected_circuit_breaker: this bot's wallet is frozen by the operator".into());
+    }
     if agent_spend && decision != Decision::Rejected && decision != Decision::Kill {
         match bot_daily_limit(&tx, bot_id) {
             Ok(None) => {}
@@ -46,6 +84,9 @@ pub fn settle(
             }
             Err(_) => {
                 insert_tx(&tx, bot_id, rail, amount_usd, native_amount, counterparty, purpose, Decision::Rejected.as_str(), actor, "", effect)?;
+                if let Some(order_id) = order_id {
+                    tx.execute("UPDATE quant_orders SET status = 'REJECTED' WHERE id = ?1", params![order_id])?;
+                }
                 tx.commit()?;
                 return Ok("rejected_by_policy: unknown bot".into());
             }
@@ -54,17 +95,31 @@ pub fn settle(
     if decision == Decision::Rejected || decision == Decision::Kill {
         let label = decision.as_str();
         insert_tx(&tx, bot_id, rail, amount_usd, native_amount, counterparty, purpose, label, actor, "", effect)?;
+        if let Some(order_id) = order_id {
+            tx.execute("UPDATE quant_orders SET status = 'REJECTED' WHERE id = ?1", params![order_id])?;
+        }
         tx.commit()?;
         return Ok(format!("{label}: no funds moved"));
     }
     if decision == Decision::Pending {
-        insert_tx(&tx, bot_id, rail, amount_usd, native_amount, counterparty, purpose, decision.as_str(), actor, "", effect)?;
+        let tx_id = nid("tx");
+        insert_tx_with_id(&tx, &tx_id, bot_id, rail, amount_usd, native_amount, counterparty, purpose, decision.as_str(), actor, "", effect)?;
+        if let Some(order_id) = order_id {
+            // Record the exact wallet tx on the held order so review can flip
+            // exactly this order — never a sibling's.
+            tx.execute("UPDATE quant_orders SET wallet_tx_id = ?1, status = 'WORKING' WHERE id = ?2", params![tx_id, order_id])?;
+        }
         tx.commit()?;
         return Ok("pending_approval: waiting for one-click review".into());
     }
     apply_effect(&tx, rail, amount_usd, effect)?;
     let reference = nid("sandbox");
     insert_tx(&tx, bot_id, rail, amount_usd, native_amount, counterparty, purpose, decision.as_str(), actor, &reference, effect)?;
+    if let Some(order_id) = order_id {
+        let mode = crate::wallet_engine::ledger_mode(&tx);
+        let status = if mode == "live_signer" { "FILLED" } else { "SIMULATED" };
+        tx.execute("UPDATE quant_orders SET status = ?1 WHERE id = ?2", params![status, order_id])?;
+    }
     tx.commit()?;
     Ok(format!("auto_signed_by_rust · {reference}"))
 }
@@ -89,6 +144,7 @@ pub fn review(conn: &Connection, tx_id: &str, approve: bool) -> Result<String> {
         if n == 0 {
             return Err(err("only a pending transaction can be reviewed"));
         }
+        tx.execute("UPDATE quant_orders SET status = 'REJECTED' WHERE wallet_tx_id = ?1", params![tx_id])?;
         tx.commit()?;
         return Ok("rejected_by_user".into());
     }
@@ -97,6 +153,11 @@ pub fn review(conn: &Connection, tx_id: &str, approve: bool) -> Result<String> {
         return Err(err("kill switch is on"));
     }
     let effect = if row.3 == "credit" { "credit" } else { "spend" };
+    // A frozen bot's already-pending transactions must die with the breaker:
+    // approving one would execute agent spend the freeze was meant to stop.
+    if effect == "spend" && !row.4.trim().is_empty() && crate::wallet_engine::is_bot_frozen(&tx, &row.4)? {
+        return Err(err("this bot's wallet is frozen by the operator; unfreeze it before approving"));
+    }
     if effect == "spend" {
         let spent = db::spent_today(&tx)?;
         if spent + row.1 > policy_row.daily_cap_usd + 1e-9 {
@@ -124,6 +185,8 @@ pub fn review(conn: &Connection, tx_id: &str, approve: bool) -> Result<String> {
     if n == 0 {
         return Err(err("only a pending transaction can be reviewed"));
     }
+    let order_status = if crate::wallet_engine::ledger_mode(&tx) == "live_signer" { "FILLED" } else { "SIMULATED" };
+    tx.execute("UPDATE quant_orders SET status = ?1 WHERE wallet_tx_id = ?2", params![order_status, tx_id])?;
     tx.commit()?;
     Ok(format!("approved_by_user · {reference}"))
 }
@@ -175,10 +238,14 @@ fn apply_effect(conn: &Connection, rail: &str, amount_usd: f64, effect: &str) ->
         )?;
         return Ok(());
     }
-    if rail == "crypto_x402" || rail == "stripe_card" {
+    if rail == "crypto_x402" || rail == "stripe_card" || rail == "hyperliquid_ws" {
         let have: f64 = conn.query_row("SELECT native_value FROM wallet_balances WHERE rail = ?1", params![rail], |r| r.get(0))?;
         if have + 1e-9 < amount_usd {
-            return Err(err(if rail == "stripe_card" { "sandbox card balance is too low" } else { "sandbox USDC balance is too low" }));
+            return Err(err(match rail {
+                "stripe_card" => "sandbox card balance is too low",
+                "hyperliquid_ws" => "sandbox Hyperliquid margin is too low",
+                _ => "sandbox USDC balance is too low",
+            }));
         }
         let next = have - amount_usd;
         let label = if rail == "stripe_card" { format!("${next:.2}") } else { format!("{next:.2} USDC") };
@@ -204,13 +271,31 @@ fn insert_tx(
     reference: &str,
     effect: &str,
 ) -> Result<()> {
+    let tx_id = nid("tx");
+    insert_tx_with_id(conn, &tx_id, bot_id, rail, amount_usd, native_amount, counterparty, purpose, decision, actor, reference, effect)
+}
+
+fn insert_tx_with_id(
+    conn: &Connection,
+    tx_id: &str,
+    bot_id: &str,
+    rail: &str,
+    amount_usd: f64,
+    native_amount: &str,
+    counterparty: &str,
+    purpose: &str,
+    decision: &str,
+    actor: &str,
+    reference: &str,
+    effect: &str,
+) -> Result<()> {
     let handle: String = conn
         .query_row("SELECT handle FROM bot_profiles WHERE id = ?1", params![bot_id], |r| r.get(0))
         .unwrap_or_else(|_| "you".into());
     let stored = if effect == "credit" { "credit" } else { "spend" };
     conn.execute(
         "INSERT INTO wallet_transactions (id, bot_profile_id, bot_handle, rail, amount_usd, native_amount, counterparty, purpose, policy_decision, tx_hash_or_ref, actor, effect, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
-        params![nid("tx"), bot_id, handle, rail, amount_usd, native_amount, counterparty, purpose, decision, reference, actor, stored, now_ms()],
+        params![tx_id, bot_id, handle, rail, amount_usd, native_amount, counterparty, purpose, decision, reference, actor, stored, now_ms()],
     )?;
     Ok(())
 }

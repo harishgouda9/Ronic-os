@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-mini-fs-rename"
+description = "Enables the mini_fs_rename command without any pre-configured scope."
+commands.allow = ["mini_fs_rename"]
+
+[[permission]]
+identifier = "deny-mini-fs-rename"
+description = "Denies the mini_fs_rename command without any pre-configured scope."
+commands.deny = ["mini_fs_rename"]

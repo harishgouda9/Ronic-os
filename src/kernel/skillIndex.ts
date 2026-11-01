@@ -50,6 +50,17 @@ export function enabledFor(flags: ProfileFlag[], profileId: string) {
   return flags.some((flag) => flag.profileId === profileId && flag.enabled);
 }
 
+/**
+ * For MCP servers, default to Active (true) unless explicitly turned off by the user.
+ */
+export function mcpEnabledFor(flags: ProfileFlag[] | undefined, profileId: string): boolean {
+  if (!profileId) return true;
+  if (!flags || flags.length === 0) return true;
+  const flag = flags.find((f) => f.profileId === profileId);
+  if (!flag) return true;
+  return flag.enabled;
+}
+
 export function pluginAgentOn(plugins: PluginPackage[], pluginId: string, profileId: string) {
   return plugins.some((plugin) => plugin.id === pluginId && plugin.trust === "trusted" && enabledFor(plugin.agentEnables, profileId));
 }
@@ -61,7 +72,7 @@ export function inIndex(skill: Skill, plugins: PluginPackage[], profileId: strin
   return true;
 }
 
-export function rebuildRegistry(plugins: PluginPackage[], servers: McpServer[]): RegistryTool[] {
+export function rebuildRegistry(plugins: PluginPackage[], servers: McpServer[], profileId = ""): RegistryTool[] {
   return [
     ...BUILTIN_TOOLS,
     ...plugins.flatMap((plugin) => plugin.tools.map((tool) => ({
@@ -71,13 +82,28 @@ export function rebuildRegistry(plugins: PluginPackage[], servers: McpServer[]):
       available: false,
       reason: "No agent worker is running. The tool is declared only.",
     }))),
-    ...servers.flatMap((server) => server.declaredTools.map((tool) => ({
-      name: tool.name,
-      description: tool.description,
-      source: `mcp:${server.id}`,
-      available: false,
-      reason: "MCP sessions are not open in this version.",
-    }))),
+    ...servers.flatMap((server) => {
+      const switchOff = profileId !== "" && server.enables.some((flag) => flag.profileId === profileId && !flag.enabled);
+      const http = server.url.startsWith("http://") || server.url.startsWith("https://");
+      const hasCommand = server.command.trim().length > 0;
+      let available = false;
+      let reason = "Profile switch is Active. This server has no URL or command.";
+      if (switchOff) {
+        reason = "Profile switch is Off.";
+      } else if (server.trust !== "trusted") {
+        reason = "Profile switch is Active. Trust the server before a bot can call it.";
+      } else if (http || hasCommand) {
+        available = true;
+        reason = "Profile switch is Active. A call uses the stored credential when one is saved.";
+      }
+      return server.declaredTools.map((tool) => ({
+        name: tool.name,
+        description: tool.description,
+        source: `mcp:${server.id}`,
+        available,
+        reason,
+      }));
+    }),
   ];
 }
 

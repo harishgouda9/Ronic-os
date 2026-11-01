@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-bot-circuit-toggle"
+description = "Enables the bot_circuit_toggle command without any pre-configured scope."
+commands.allow = ["bot_circuit_toggle"]
+
+[[permission]]
+identifier = "deny-bot-circuit-toggle"
+description = "Denies the bot_circuit_toggle command without any pre-configured scope."
+commands.deny = ["bot_circuit_toggle"]

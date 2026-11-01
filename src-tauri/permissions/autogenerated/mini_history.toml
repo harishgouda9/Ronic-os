@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-mini-history"
+description = "Enables the mini_history command without any pre-configured scope."
+commands.allow = ["mini_history"]
+
+[[permission]]
+identifier = "deny-mini-history"
+description = "Denies the mini_history command without any pre-configured scope."
+commands.deny = ["mini_history"]

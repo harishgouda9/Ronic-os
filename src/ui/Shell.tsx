@@ -14,6 +14,7 @@ import {
   Monitor,
   Network,
   Puzzle,
+  User,
   Zap,
   ScrollText,
   Search,
@@ -27,11 +28,13 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, Suspense, lazy, type ReactNode } from "react";
+import { UpdateNotice } from "./UpdateNotice";
 import { RAIL, type ScreenId } from "../types";
 import { useRonic } from "../store";
 import { Pill } from "./bits";
 import { isTauri } from "../api";
 import { SuperchargeControl } from "../components/Harness2Studio";
+
 import { JobClock } from "./JobClock";
 import { useDesktopChrome, WindowControls } from "./WindowChrome";
 
@@ -63,7 +66,7 @@ function writeRail(width: number) {
 }
 
 const ICONS: Record<string, LucideIcon> = {
-  chat: MessageSquare,
+  chat: Bot,
   bots: MessageSquare,
   providers: Cable,
   memory: Brain,
@@ -77,7 +80,7 @@ const ICONS: Record<string, LucideIcon> = {
   workflows: GitBranch,
   market: Store,
   wallet: Wallet,
-  extensions: Blocks,
+  extensions: User,
   repair: Wrench,
   billing: CreditCard,
   settings: Settings,
@@ -292,6 +295,7 @@ export function Shell({ children }: { children: ReactNode }) {
         <div className="spacer" {...drag} />
         <div className="header-actions">
           <SuperchargeControl />
+
           {snap.plugins.filter((plugin) => plugin.desktopEnabled && plugin.trust === "trusted").flatMap((plugin) => plugin.desktop.filter((bit) => bit.kind === "status").map((bit) => (
             <span className="quote-chip" key={`${plugin.id}-${bit.label}`}>{bit.label}</span>
           )))}
@@ -356,7 +360,7 @@ export function Shell({ children }: { children: ReactNode }) {
             <div className="resize-handle vertical rail-handle" onPointerDown={beginRailDrag} aria-label="Resize rail" role="separator" tabIndex={0} />
           </>
         )}
-        <main className={`main ${screen === "chat" || screen === "ide" ? "main-flush" : ""}`} data-nav={navDir}>{children}</main>
+        <main className={`main ${screen === "chat" || screen === "ide" || screen === "workflows" || screen === "market" || screen === "bots" || screen === "fleet" || screen === "computer" || screen === "harness2" || screen === "mesh" || screen === "wallet" || screen === "repair" || screen === "billing" || screen === "extensions" || screen === "providers" || screen === "profiles" || screen === "skills" || screen === "capabilities" || screen === "memory" || screen === "settings" ? "main-flush" : ""}`} data-nav={navDir}>{children}</main>
       </div>
       <div
         className="global-terminal-drawer"
@@ -385,6 +389,7 @@ export function Shell({ children }: { children: ReactNode }) {
           {toast}
         </button>
       ) : null}
+      <UpdateNotice />
       {palette ? <Palette onClose={() => setPalette(false)} navigate={navigate} /> : null}
       {debug ? <DebugDrawer onClose={() => setDebug(false)} /> : null}
       {bug ? <BugModal onClose={() => setBug(false)} /> : null}
@@ -393,7 +398,7 @@ export function Shell({ children }: { children: ReactNode }) {
 }
 
 function RailButton({ id, label, active, onClick, labeled }: { id: string; label: string; active: boolean; onClick: () => void; labeled: boolean }) {
-  const Icon = ICONS[id] ?? MessageSquare;
+  const Icon = ICONS[id] ?? Bot;
   return (
     <button className={active ? "active" : ""} title={label} aria-label={label} onClick={onClick}>
       <span className="glyph">

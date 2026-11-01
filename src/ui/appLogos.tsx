@@ -1,4 +1,4 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect } from "react";
 import {
   Brain,
   Clock,
@@ -11,7 +11,9 @@ import {
   Lock,
   Puzzle,
   Server,
+  ShieldCheck,
   Sparkles,
+  Terminal,
 } from "lucide-react";
 
 type Logo = { bg: string; fg: string; viewBox: string; paths: string[] };
@@ -87,7 +89,54 @@ export const BRAND_DOMAINS: Record<string, string> = {
   zoom: "zoom.us",
   whatsapp: "whatsapp.com",
   linkedin: "linkedin.com",
-  superpowers: "github.com",
+  superpowers: "superpowers.ai",
+  razorpay: "razorpay.com",
+  puppeteer: "pptr.dev",
+  exa: "exa.ai",
+  "exa ai": "exa.ai",
+  "brave search": "brave.com",
+  "google drive": "drive.google.com",
+  "google maps": "maps.google.com",
+  "google docs": "docs.google.com",
+  "google sheets": "sheets.google.com",
+  google: "google.com",
+  confluence: "atlassian.com",
+  posthog: "posthog.com",
+  firecrawl: "firecrawl.dev",
+  apify: "apify.com",
+  granola: "granola.ai",
+  apollo: "apollo.io",
+  "apollo.io": "apollo.io",
+  parallel: "parallel.ai",
+  brevo: "brevo.com",
+  mailerlite: "mailerlite.com",
+  klaviyo: "klaviyo.com",
+  shopify: "shopify.com",
+  kraken: "kraken.com",
+  phantom: "phantom.app",
+  ramp: "ramp.com",
+  "context.dev": "context.dev",
+  ahrefs: "ahrefs.com",
+  treg: "treg.dev",
+  higgsfield: "higgsfield.ai",
+  pstack: "pstack.app",
+  bulkpublish: "bulkpublish.io",
+  link: "link.com",
+  mineru: "opendatalab.org.cn",
+  prisma: "prisma.io",
+  drizzle: "orm.drizzle.team",
+  neondb: "neon.tech",
+  neon: "neon.tech",
+  upstash: "upstash.com",
+  pinecone: "pinecone.io",
+  qdrant: "qdrant.tech",
+  weaviate: "weaviate.io",
+  chromadb: "trychroma.com",
+  langchain: "langchain.com",
+  langfuse: "langfuse.com",
+  cohere: "cohere.com",
+  anthropic: "anthropic.com",
+  openai: "openai.com",
 };
 
 const LOGOS: Record<string, Logo> = {
@@ -261,35 +310,562 @@ const LOGOS: Record<string, Logo> = {
   },
 };
 
-export function normalizeBrand(id?: string, name?: string): string {
-  const raw = `${id || ""} ${name || ""}`.toLowerCase();
-  if (raw.includes("notion")) return "notion";
-  if (raw.includes("linear")) return "linear";
-  if (raw.includes("sentry")) return "sentry";
-  if (raw.includes("supabase")) return "supabase";
-  if (raw.includes("composio")) return "composio";
-  if (raw.includes("github")) return "github";
-  if (raw.includes("slack")) return "slack";
-  if (raw.includes("stripe")) return "stripe";
-  if (raw.includes("figma")) return "figma";
-  if (raw.includes("canva")) return "canva";
-  if (raw.includes("gitlab")) return "gitlab";
-  if (raw.includes("datadog")) return "datadog";
-  if (raw.includes("vercel")) return "vercel";
-  if (raw.includes("cloudflare")) return "cloudflare";
-  if (raw.includes("postman")) return "postman";
-  if (raw.includes("hugging")) return "huggingface";
-  if (raw.includes("playwright")) return "playwright";
-  if (raw.includes("docker")) return "docker";
-  if (raw.includes("postgres")) return "postgres";
-  if (raw.includes("obsidian")) return "obsidian";
-  if (raw.includes("chatgpt") || raw.includes("openai")) return "chatgpt";
-  if (raw.includes("claude")) return "claude";
-  if (raw.includes("gemini") || raw.includes("google")) return "gemini";
-  if (raw.includes("grok")) return "grok";
-  if (raw.includes("deepseek")) return "deepseek";
-  if (raw.includes("vscode")) return "vscode";
-  if (raw.includes("cursor")) return "cursor";
+export function getBrandCustomSvg(brandKey: string): React.ReactNode {
+  switch (brandKey) {
+    case "filesystem":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#0284C7" />
+          <path d="M6 9a2 2 0 0 1 2-2h5l3 3h8a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V9z" fill="#38BDF8" />
+          <path d="M6 14h20v8a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2v-8z" fill="#BAE6FD" />
+        </svg>
+      );
+    case "memory":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#7C3AED" />
+          <circle cx="16" cy="16" r="3.2" fill="#FFFFFF" />
+          <circle cx="10" cy="10" r="2.2" fill="#E9D5FF" />
+          <circle cx="22" cy="10" r="2.2" fill="#E9D5FF" />
+          <circle cx="10" cy="22" r="2.2" fill="#E9D5FF" />
+          <circle cx="22" cy="22" r="2.2" fill="#E9D5FF" />
+          <path d="M10 10l6 6M22 10l-6 6M10 22l6-6M22 22l-6-6" stroke="#DDD6FE" strokeWidth="1.8" />
+        </svg>
+      );
+    case "sequential":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#4F46E5" />
+          <path d="M9 16h3l2-4 4 8 2-4h3" stroke="#FFFFFF" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" />
+          <circle cx="16" cy="9" r="1.5" fill="#A5B4FC" />
+          <circle cx="23" cy="11" r="1.5" fill="#A5B4FC" />
+          <circle cx="9" cy="11" r="1.5" fill="#A5B4FC" />
+        </svg>
+      );
+    case "fetch":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#0891B2" />
+          <circle cx="16" cy="16" r="9" stroke="#A5F3FC" strokeWidth="1.8" fill="none" />
+          <ellipse cx="16" cy="16" rx="4.5" ry="9" stroke="#A5F3FC" strokeWidth="1.8" fill="none" />
+          <line x1="7" y1="16" x2="25" y2="16" stroke="#A5F3FC" strokeWidth="1.8" />
+          <path d="M14 9l4 4-4 4" stroke="#FFFFFF" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      );
+    case "postgres":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#336791" />
+          <path d="M19.5 7c-3 0-5.5 2-6.5 4.5C11 12 9.5 13.5 9 16c-.5 2.5 0 5 1 7l1.5-1c-.5-1.5-.5-3.5 0-5 1 2 2.5 3 4.5 3h1.5v3.5c0 1.5 1 2.5 2 2.5s2-1 2-2.5V20c1.5 0 3-1 3.5-2.5.5-2-.5-4.5-2-5.5.5-1.5.5-3.5-.5-4.5-1-.5-2-.5-3-.5z" fill="#FFFFFF" />
+        </svg>
+      );
+    case "sqlite":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#003B57" />
+          <ellipse cx="16" cy="10" rx="9" ry="3.5" fill="#00A8DE" />
+          <path d="M7 10v6c0 1.9 4 3.5 9 3.5s9-1.6 9-3.5v-6" stroke="#00A8DE" strokeWidth="2" fill="none" />
+          <path d="M7 16v6c0 1.9 4 3.5 9 3.5s9-1.6 9-3.5v-6" stroke="#00A8DE" strokeWidth="2" fill="none" />
+          <path d="M13 14l6 4M19 14l-6 4" stroke="#FFFFFF" strokeWidth="1.5" strokeLinecap="round" />
+        </svg>
+      );
+    case "chrome":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#FFFFFF" stroke="#E2E8F0" />
+          <circle cx="16" cy="16" r="12" fill="#FFFFFF" />
+          <path d="M16 4a12 12 0 0 1 10.4 6H16z" fill="#EA4335" />
+          <path d="M26.4 10A12 12 0 0 1 16 28l5.2-9z" fill="#FBBC05" />
+          <path d="M16 28A12 12 0 0 1 5.6 10H16z" fill="#34A853" />
+          <circle cx="16" cy="16" r="5" fill="#FFFFFF" />
+          <circle cx="16" cy="16" r="3.8" fill="#4285F4" />
+        </svg>
+      );
+    case "brave":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#FB542B" />
+          <path d="M9 10l3-4h8l3 4 2 8-5 8-4-3-4 3-5-8 2-8z" fill="#FFFFFF" />
+          <circle cx="13" cy="14" r="1.5" fill="#FB542B" />
+          <circle cx="19" cy="14" r="1.5" fill="#FB542B" />
+          <path d="M14 18h4l-2 3-2-3z" fill="#FB542B" />
+        </svg>
+      );
+    case "terminal":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#090D16" />
+          <path d="M9 11l5 5-5 5" stroke="#10B981" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" />
+          <line x1="17" y1="21" x2="23" y2="21" stroke="#10B981" strokeWidth="2.2" strokeLinecap="round" />
+        </svg>
+      );
+    case "mineru":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#6D28D9" />
+          <rect x="8" y="7" width="16" height="18" rx="2" stroke="#E9D5FF" strokeWidth="1.8" fill="none" />
+          <line x1="6" y1="16" x2="26" y2="16" stroke="#F43F5E" strokeWidth="2" strokeDasharray="2 2" />
+          <rect x="11" y="11" width="10" height="2" rx="1" fill="#FFFFFF" />
+          <rect x="11" y="19" width="7" height="2" rx="1" fill="#FFFFFF" />
+        </svg>
+      );
+    case "codebase-memory":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#4338CA" />
+          <circle cx="16" cy="9" r="2.5" fill="#C7D2FE" />
+          <circle cx="10" cy="22" r="2.5" fill="#C7D2FE" />
+          <circle cx="22" cy="22" r="2.5" fill="#C7D2FE" />
+          <path d="M16 11.5v4M16 15.5l-6 4M16 15.5l6 4" stroke="#E0E7FF" strokeWidth="1.8" />
+        </svg>
+      );
+    case "github-actions":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#1F2937" />
+          <path d="M16 6c3 0 7 2 7 8 0 3-1 5-3 7l-4-4-4 4c-2-2-3-4-3-7 0-6 4-8 7-8z" fill="#3B82F6" />
+          <circle cx="16" cy="13" r="2.5" fill="#FFFFFF" />
+          <path d="M12 21l-3 4M20 21l3 4" stroke="#F59E0B" strokeWidth="2" strokeLinecap="round" />
+        </svg>
+      );
+    case "superpowers":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#111111" />
+          <circle cx="16" cy="16" r="10" stroke="#FFFFFF" strokeWidth="2" strokeDasharray="3 2" />
+          <path d="M16 10v6l4 2" stroke="#FFFFFF" strokeWidth="2" strokeLinecap="round" />
+          <circle cx="16" cy="16" r="2" fill="#FFFFFF" />
+        </svg>
+      );
+    case "datadog":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#632CA6" />
+          <path d="M9 13c0-3 2-6 7-6s7 3 7 6c0 2-1 3.5-2 4.5l2 5.5h-3.5l-1-3h-5l-1 3H9l2-5.5C10 16.5 9 15 9 13z" fill="#FFFFFF" />
+          <circle cx="13.5" cy="12" r="1.2" fill="#632CA6" />
+          <circle cx="18.5" cy="12" r="1.2" fill="#632CA6" />
+        </svg>
+      );
+    case "firecrawl":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#FFF7ED" stroke="#FED7AA" />
+          <path d="M16 4c0 4.5-3 6.5-3 10 0 3.3 2.7 6 6 6s6-2.7 6-6c0-6-7-8-7-10z" fill="#EA580C" />
+          <path d="M16 16c0 2-1.5 3-1.5 4.5 0 1.4 1.1 2.5 2.5 2.5s2.5-1.1 2.5-2.5c0-2.5-3-3.5-3-4.5z" fill="#F97316" />
+        </svg>
+      );
+    case "parallel":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#111111" />
+          <circle cx="16" cy="16" r="10" stroke="#FFFFFF" strokeWidth="1.5" fill="none" />
+          <line x1="8" y1="12" x2="24" y2="12" stroke="#FFFFFF" strokeWidth="1.5" />
+          <line x1="6" y1="16" x2="26" y2="16" stroke="#FFFFFF" strokeWidth="1.5" />
+          <line x1="8" y1="20" x2="24" y2="20" stroke="#FFFFFF" strokeWidth="1.5" />
+        </svg>
+      );
+    case "apify":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#FFFFFF" stroke="#E2E8F0" />
+          <path d="M16 6l9 16H7l9-16z" fill="#00A699" />
+          <path d="M16 6l9 16-9-5V6z" fill="#FF5A5F" />
+          <path d="M16 17l9 5H7l9-5z" fill="#FC642D" />
+        </svg>
+      );
+    case "posthog":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#FEF08A" />
+          <path d="M7 16c0-4 4-8 9-8s9 4 9 8-4 8-9 8-9-4-9-8z" fill="#F97316" />
+          <circle cx="13" cy="15" r="2" fill="#1E293B" />
+          <circle cx="19" cy="15" r="2" fill="#1E293B" />
+          <ellipse cx="16" cy="19" rx="2" ry="1.2" fill="#1E293B" />
+          <path d="M10 9l-2-3M16 8V4M22 9l2-3" stroke="#F97316" strokeWidth="2" strokeLinecap="round" />
+        </svg>
+      );
+    case "granola":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#143424" />
+          <path d="M16 7a9 9 0 1 0 9 9 6.5 6.5 0 1 0-6.5-6.5 4 4 0 1 0 4 4" stroke="#34D399" strokeWidth="2.2" strokeLinecap="round" fill="none" />
+        </svg>
+      );
+    case "apollo":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#FACC15" />
+          <path d="M16 6v20M6 16h20M9 9l14 14M23 9L9 23" stroke="#000000" strokeWidth="3" strokeLinecap="round" />
+        </svg>
+      );
+    case "google-docs":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#FFFFFF" stroke="#E2E8F0" />
+          <path d="M8 5h11l6 6v14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2z" fill="#4285F4" />
+          <path d="M19 5l6 6h-6V5z" fill="#A1C2FA" />
+          <rect x="10" y="14" width="12" height="1.8" rx="0.9" fill="#FFFFFF" />
+          <rect x="10" y="18" width="12" height="1.8" rx="0.9" fill="#FFFFFF" />
+          <rect x="10" y="22" width="7" height="1.8" rx="0.9" fill="#FFFFFF" />
+        </svg>
+      );
+    case "google-sheets":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#FFFFFF" stroke="#E2E8F0" />
+          <path d="M8 5h11l6 6v14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2z" fill="#0F9D58" />
+          <path d="M19 5l6 6h-6V5z" fill="#87CEAC" />
+          <rect x="10" y="13" width="12" height="10" rx="1" fill="#FFFFFF" fillOpacity="0.2" stroke="#FFFFFF" strokeWidth="1.2" />
+          <path d="M10 18h12M16 13v10" stroke="#FFFFFF" strokeWidth="1.2" />
+        </svg>
+      );
+    case "google-slides":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#FFFFFF" stroke="#E2E8F0" />
+          <path d="M8 5h11l6 6v14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2z" fill="#F4B400" />
+          <path d="M19 5l6 6h-6V5z" fill="#FCE293" />
+          <rect x="11" y="14" width="10" height="8" rx="1" fill="#FFFFFF" />
+        </svg>
+      );
+    case "google-calendar":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#FFFFFF" stroke="#E2E8F0" />
+          <rect x="6" y="8" width="20" height="17" rx="3" fill="#FFFFFF" stroke="#4285F4" strokeWidth="1.8" />
+          <rect x="6" y="8" width="20" height="5.5" rx="1.5" fill="#4285F4" />
+          <text x="16" y="21" textAnchor="middle" fontSize="8.5" fontWeight="bold" fill="#4285F4" fontFamily="sans-serif">31</text>
+        </svg>
+      );
+    case "gmail":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#FFFFFF" stroke="#E2E8F0" />
+          <path d="M6 10v14a2 2 0 0 0 2 2h2v-9.5l6 4.5 6-4.5V26h2a2 2 0 0 0 2-2V10l-10 7.5L6 10z" fill="#EA4335" />
+          <path d="M6 10l10 7.5V26H8a2 2 0 0 1-2-2V10z" fill="#4285F4" />
+          <path d="M26 10l-10 7.5V26h8a2 2 0 0 0 2-2V10z" fill="#34A853" />
+          <path d="M6 10l4 3v-5l-2-1.5A2 2 0 0 0 6 8v2z" fill="#C5221F" />
+          <path d="M26 10l-4 3v-5l2-1.5a2 2 0 0 1 2 1.5v2z" fill="#FBBC04" />
+        </svg>
+      );
+    case "onedrive":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#FFFFFF" stroke="#E2E8F0" />
+          <path d="M12 21h12a4 4 0 0 0 0-8 6 6 0 0 0-11-2 5 5 0 0 0-5 6 4 4 0 0 0 4 4z" fill="#0078D4" />
+        </svg>
+      );
+    case "email":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#E11D48" />
+          <rect x="6" y="9" width="20" height="14" rx="2" fill="#FFFFFF" />
+          <path d="M6 10l10 7 10-7" stroke="#E11D48" strokeWidth="1.8" fill="none" />
+        </svg>
+      );
+    case "outlook":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#0072C6" />
+          <rect x="13" y="9" width="13" height="14" rx="2" fill="#FFFFFF" fillOpacity="0.3" />
+          <path d="M13 11l6.5 5 6.5-5" stroke="#FFFFFF" strokeWidth="1.5" fill="none" />
+          <rect x="6" y="8" width="13" height="16" rx="2.5" fill="#005A9E" />
+          <circle cx="12.5" cy="16" r="4" stroke="#FFFFFF" strokeWidth="2" fill="none" />
+        </svg>
+      );
+    case "x":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#000000" />
+          <path d="M19.8 8h3.2l-7 8 8.2 10.9h-6.4l-5-6.6-5.8 6.6H3.8l7.5-8.6L3.4 8h6.6l4.6 6 5.2-6zm-1.1 17h1.8L9.2 9.8H7.3l11.4 15.2z" fill="#FFFFFF" />
+        </svg>
+      );
+    case "canva":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#00C4CC" />
+          <path d="M21 12c-2-2-5-2-7 0-3 3-3 8 0 11 2 2 5 2 7 0" stroke="#FFFFFF" strokeWidth="3" strokeLinecap="round" fill="none" />
+        </svg>
+      );
+    case "docs-canvas":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#334155" />
+          <circle cx="10" cy="12" r="1.5" fill="#FFFFFF" />
+          <line x1="14" y1="12" x2="23" y2="12" stroke="#FFFFFF" strokeWidth="1.8" strokeLinecap="round" />
+          <circle cx="10" cy="16" r="1.5" fill="#FFFFFF" />
+          <line x1="14" y1="16" x2="23" y2="16" stroke="#FFFFFF" strokeWidth="1.8" strokeLinecap="round" />
+          <circle cx="10" cy="20" r="1.5" fill="#FFFFFF" />
+          <line x1="14" y1="20" x2="23" y2="20" stroke="#FFFFFF" strokeWidth="1.8" strokeLinecap="round" />
+        </svg>
+      );
+    case "pr-review":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#1E293B" />
+          <rect x="7" y="7" width="18" height="18" rx="2" stroke="#FFFFFF" strokeWidth="1.5" fill="none" />
+          <path d="M11 13l2 2 4-4M11 19l2 2 4-4" stroke="#10B981" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      );
+    case "mobbin":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#000000" />
+          <path d="M7 23V9l5 7 5-7v14M17 23V9l4 6 4-6v14" stroke="#FFFFFF" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" fill="none" />
+        </svg>
+      );
+    case "1password":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#0A85EA" />
+          <circle cx="16" cy="16" r="9" stroke="#FFFFFF" strokeWidth="2" fill="none" />
+          <path d="M16 11a3 3 0 0 0-1.5 5.6V19a1.5 1.5 0 0 0 3 0v-2.4A3 3 0 0 0 16 11z" fill="#FFFFFF" />
+        </svg>
+      );
+    case "atlassian":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#0052CC" />
+          <path d="M15.5 15.5c-2.5 3-4 6.5-4 10.5h8c0-4-1.5-7.5-4-10.5z" fill="#FFFFFF" fillOpacity="0.6" />
+          <path d="M16.5 6c-3 4.5-5 10-5 16h10c0-6-2-11.5-5-16z" fill="#FFFFFF" />
+        </svg>
+      );
+    case "klaviyo":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#111111" />
+          <rect x="7" y="10" width="18" height="12" rx="2" fill="#FFFFFF" />
+          <path d="M12 10l5 12" stroke="#111111" strokeWidth="2" />
+        </svg>
+      );
+    case "brevo":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#008060" />
+          <circle cx="16" cy="16" r="9" stroke="#FFFFFF" strokeWidth="2" fill="none" />
+          <text x="16" y="20.5" textAnchor="middle" fontSize="12" fontWeight="bold" fill="#FFFFFF" fontFamily="sans-serif">B</text>
+        </svg>
+      );
+    case "mailerlite":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#00A15D" />
+          <rect x="6" y="10" width="20" height="12" rx="3" fill="#FFFFFF" />
+          <text x="16" y="19" textAnchor="middle" fontSize="7.5" fontWeight="900" fill="#00A15D" fontFamily="sans-serif">lite</text>
+        </svg>
+      );
+    case "bulkpublish":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#F97316" />
+          <text x="16" y="21" textAnchor="middle" fontSize="11" fontWeight="bold" fill="#FFFFFF" fontFamily="sans-serif">BP</text>
+        </svg>
+      );
+    case "shopify":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#95BF47" />
+          <path d="M20 9c0-2.2-1.8-4-4-4s-4 1.8-4 4h-3l2 17h14l2-17h-7zm-4-2c1.1 0 2 .9 2 2h-4c0-1.1.9-2 2-2z" fill="#5E8E3E" />
+          <path d="M11 9l2 17h10l2-17h-14z" fill="#FFFFFF" />
+          <text x="16" y="21" textAnchor="middle" fontSize="10" fontWeight="bold" fill="#5E8E3E" fontFamily="sans-serif">S</text>
+        </svg>
+      );
+    case "kraken":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#5741D9" />
+          <path d="M16 6c-5 0-8 3.5-8 8v9c0 1.5 1 2 2 1s2-2 2-2 1 2 2 2 2-1 2-2 1 2 2 2 2-1 2-2 1 2 2 2 2-.5 2-2v-9c0-4.5-3-8-8-8z" fill="#FFFFFF" />
+          <circle cx="13" cy="14" r="1.5" fill="#5741D9" />
+          <circle cx="19" cy="14" r="1.5" fill="#5741D9" />
+        </svg>
+      );
+    case "phantom":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#8B5CF6" />
+          <path d="M8 17c0-5 3.5-9 8-9s8 4 8 9c0 6-3 9-8 9s-8-3-8-9z" fill="#FFFFFF" />
+          <circle cx="13.5" cy="16" r="1.8" fill="#8B5CF6" />
+          <circle cx="18.5" cy="16" r="1.8" fill="#8B5CF6" />
+        </svg>
+      );
+    case "ramp":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#FACC15" />
+          <path d="M10 24c0-7.7 6.3-14 14-14v5c-5 0-9 4-9 9h-5z" fill="#111111" />
+        </svg>
+      );
+    case "context.dev":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#2563EB" />
+          <path d="M12 11l-4 5 4 5M20 11l4 5-4 5" stroke="#FFFFFF" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" />
+          <circle cx="16" cy="16" r="2" fill="#93C5FD" />
+        </svg>
+      );
+    case "ahrefs":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#0066FF" />
+          <rect x="8" y="18" width="3" height="7" rx="1" fill="#FFFFFF" />
+          <rect x="13" y="13" width="3" height="12" rx="1" fill="#FFFFFF" />
+          <rect x="18" y="9" width="3" height="16" rx="1" fill="#FFFFFF" />
+          <rect x="23" y="15" width="3" height="10" rx="1" fill="#FFFFFF" />
+        </svg>
+      );
+    case "treg":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#0F172A" />
+          <circle cx="12" cy="12" r="2.5" fill="#FFFFFF" />
+          <circle cx="20" cy="12" r="2.5" fill="#FFFFFF" />
+          <circle cx="12" cy="20" r="2.5" fill="#FFFFFF" />
+          <circle cx="20" cy="20" r="2.5" fill="#FFFFFF" />
+        </svg>
+      );
+    case "higgsfield":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#A3E635" />
+          <path d="M8 20c4-8 8 8 12 0s4-8 4-8" stroke="#1F2937" strokeWidth="3" strokeLinecap="round" fill="none" />
+        </svg>
+      );
+    case "pstack":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#4F46E5" />
+          <circle cx="16" cy="13" r="4.5" fill="#FDE047" />
+          <path d="M9 25c0-4 3-6.5 7-6.5s7 2.5 7 6.5" fill="#FDE047" />
+          <circle cx="14.5" cy="12.5" r="1" fill="#1E1B4B" />
+          <circle cx="17.5" cy="12.5" r="1" fill="#1E1B4B" />
+        </svg>
+      );
+    case "finance":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#059669" />
+          <path d="M6 11l10-5 10 5v2H6v-2zm3 4h2v8H9v-8zm5 0h2v8h-2v-8zm5 0h2v8h-2v-8zm-14 9h20v2H5v-2z" fill="#FFFFFF" />
+        </svg>
+      );
+    case "link":
+      return (
+        <svg viewBox="0 0 32 32" className="w-full h-full p-1.5" fill="none">
+          <rect width="32" height="32" rx="8" fill="#10B981" />
+          <path d="M13 10l6 6-6 6" stroke="#FFFFFF" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      );
+    default:
+      return null;
+  }
+}
+
+export function normalizeBrand(id?: string, name?: string, command?: string, url?: string): string {
+  const n = (name || "").toLowerCase();
+  const i = (id || "").toLowerCase();
+  const c = (command || "").toLowerCase();
+  const u = (url || "").toLowerCase();
+
+  // 1. Precise name & id checks FIRST
+  if (n.includes("filesystem") || i.includes("filesystem") || c.includes("server-filesystem")) return "filesystem";
+  if (n.includes("sequential") || i.includes("sequential") || c.includes("sequential-thinking")) return "sequential";
+  if (n.includes("codebase memory") || i.includes("codebase-memory")) return "codebase-memory";
+  if (n === "memory" || n.includes("memory mcp") || i.includes("memory") || c.includes("server-memory")) return "memory";
+  if (n.includes("fetch") || i.includes("fetch") || c.includes("server-fetch")) return "fetch";
+  if (n.includes("terminal") || i.includes("terminal") || n.includes("sandbox") || i.includes("sandbox")) return "terminal";
+  if (n.includes("mineru") || i.includes("mineru")) return "mineru";
+  if (n.includes("superpowers") || i.includes("superpowers")) return "superpowers";
+  if (n.includes("firecrawl") || i.includes("firecrawl")) return "firecrawl";
+  if (n.includes("posthog") || i.includes("posthog")) return "posthog";
+  if (n.includes("apify") || i.includes("apify")) return "apify";
+  if (n.includes("datadog") || i.includes("datadog")) return "datadog";
+  if (n.includes("granola") || i.includes("granola")) return "granola";
+  if (n.includes("apollo") || i.includes("apollo")) return "apollo";
+  if (n.includes("parallel") || i.includes("parallel")) return "parallel";
+  if (n.includes("bulkpublish") || i.includes("bulkpublish")) return "bulkpublish";
+  if (n.includes("brevo") || i.includes("brevo")) return "brevo";
+  if (n.includes("mailerlite") || i.includes("mailerlite")) return "mailerlite";
+  if (n.includes("klaviyo") || i.includes("klaviyo")) return "klaviyo";
+  if (n.includes("shopify") || i.includes("shopify")) return "shopify";
+  if (n.includes("kraken") || i.includes("kraken")) return "kraken";
+  if (n.includes("phantom") || i.includes("phantom")) return "phantom";
+  if (n.includes("ramp") || i.includes("ramp")) return "ramp";
+  if (n.includes("context.dev") || i.includes("context.dev") || n.includes("context-dev") || i.includes("context-dev")) return "context.dev";
+  if (n.includes("ahrefs") || i.includes("ahrefs")) return "ahrefs";
+  if (n.includes("treg") || i.includes("treg")) return "treg";
+  if (n.includes("higgsfield") || i.includes("higgsfield")) return "higgsfield";
+  if (n.includes("pstack") || i.includes("pstack")) return "pstack";
+  if (n.includes("x money") || n.includes("finance") || i.includes("finance") || i.includes("x-money")) return "finance";
+  if (n === "link" || i === "mcp-link") return "link";
+  if (n === "x" || i === "mcp-x" || n.includes("twitter") || i.includes("twitter")) return "x";
+  if (n.includes("docs canvas") || i.includes("docs-canvas")) return "docs-canvas";
+  if (n.includes("pr review") || i.includes("pr-review")) return "pr-review";
+  if (n.includes("google docs") || i.includes("google-docs")) return "google-docs";
+  if (n.includes("google sheets") || i.includes("google-sheets")) return "google-sheets";
+  if (n.includes("google slides") || i.includes("google-slides")) return "google-slides";
+  if (n.includes("google calendar") || i.includes("google-calendar")) return "google-calendar";
+  if (n.includes("gmail") || i.includes("gmail")) return "gmail";
+  if (n.includes("outlook") || i.includes("outlook")) return "outlook";
+  if (n === "email" || i === "mcp-email" || n.includes("email (imap")) return "email";
+  if (n.includes("onedrive") || i.includes("onedrive")) return "onedrive";
+  if (n.includes("mobbin") || i.includes("mobbin")) return "mobbin";
+  if (n.includes("canva") || i.includes("canva")) return "canva";
+  if (n.includes("1password") || i.includes("1password")) return "1password";
+  if (n.includes("bitwarden") || i.includes("bitwarden")) return "bitwarden";
+  if (n.includes("atlassian") || i.includes("atlassian") || n.includes("jira") || n.includes("confluence")) return "atlassian";
+  if (n.includes("postgres") || i.includes("postgres") || c.includes("server-postgres")) return "postgres";
+  if (n.includes("sqlite") || i.includes("sqlite") || c.includes("server-sqlite")) return "sqlite";
+  if (n.includes("chrome") || i.includes("chrome") || c.includes("chrome-devtools")) return "chrome";
+  if (n.includes("brave") || i.includes("brave") || c.includes("server-brave-search")) return "brave";
+  if (n.includes("github actions") || i.includes("github-actions")) return "github-actions";
+  if (n.includes("notion") || i.includes("notion")) return "notion";
+  if (n.includes("linear") || i.includes("linear")) return "linear";
+  if (n.includes("sentry") || i.includes("sentry")) return "sentry";
+  if (n.includes("supabase") || i.includes("supabase")) return "supabase";
+  if (n.includes("composio") || i.includes("composio")) return "composio";
+  if (n.includes("slack") || i.includes("slack")) return "slack";
+  if (n.includes("stripe") || i.includes("stripe")) return "stripe";
+  if (n.includes("figma") || i.includes("figma")) return "figma";
+  if (n.includes("vercel") || i.includes("vercel")) return "vercel";
+  if (n.includes("cloudflare") || i.includes("cloudflare")) return "cloudflare";
+  if (n.includes("postman") || i.includes("postman")) return "postman";
+  if (n.includes("hugging") || i.includes("hugging")) return "huggingface";
+  if (n.includes("playwright") || i.includes("playwright")) return "playwright";
+  if (n.includes("puppeteer") || i.includes("puppeteer")) return "puppeteer";
+  if (n.includes("docker") || i.includes("docker")) return "docker";
+  if (n.includes("redis") || i.includes("redis")) return "redis";
+  if (n.includes("mongo") || i.includes("mongo")) return "mongodb";
+  if (n.includes("qdrant") || i.includes("qdrant")) return "qdrant";
+  if (n.includes("pinecone") || i.includes("pinecone")) return "pinecone";
+  if (n.includes("weaviate") || i.includes("weaviate")) return "weaviate";
+  if (n.includes("exa") || i.includes("exa")) return "exa";
+  if (n.includes("perplexity") || i.includes("perplexity")) return "perplexity";
+  if (n.includes("cursor") || i.includes("cursor")) return "cursor";
+  if (n.includes("vscode") || i.includes("vscode")) return "vscode";
+  if (n.includes("gravitas") || i.includes("gravitas")) return "gravitas";
+  if (n.includes("openapi") || i.includes("openapi")) return "openapi";
+  if (n.includes("security") || i.includes("security")) return "security";
+  if (n.includes("modern-web") || i.includes("modern-web")) return "chrome";
+
+  // Match "github" ONLY if name or id explicitly refers to GitHub itself!
+  if (n.includes("github") || (i.includes("github") && !i.includes("actions"))) return "github";
+
+  // URL matching (excluding git hostings)
+  if (u && !u.includes("github.com") && !u.includes("gitlab.com")) {
+    if (u.includes("notion.so") || u.includes("notion.com")) return "notion";
+    if (u.includes("linear.app")) return "linear";
+    if (u.includes("sentry.io") || u.includes("sentry.dev")) return "sentry";
+    if (u.includes("supabase.com")) return "supabase";
+    if (u.includes("slack.com")) return "slack";
+    if (u.includes("stripe.com")) return "stripe";
+    if (u.includes("postman.com")) return "postman";
+    if (u.includes("datadoghq.com")) return "datadog";
+    if (u.includes("firecrawl.dev")) return "firecrawl";
+    if (u.includes("posthog.com")) return "posthog";
+    if (u.includes("apify.com")) return "apify";
+    if (u.includes("apollo.io")) return "apollo";
+    if (u.includes("granola.ai")) return "granola";
+  }
+
   return "";
 }
 
@@ -300,17 +876,55 @@ export function extractDomain(urlOrName?: string): string {
     try {
       const u = new URL(cleaned);
       const host = u.hostname.toLowerCase();
-      // Remove mcp. or api. subdomain if present
-      return host.replace(/^(mcp|api|connect|docs|dashboard)\./, "");
+      // Generic git hosting is not the service brand
+      if (host === "github.com" || host === "www.github.com" || host === "gitlab.com") {
+        return "";
+      }
+      // Remove mcp. or api. or connect. or docs. subdomain if present
+      return host.replace(/^(mcp|api|connect|docs|dashboard|cdn)\./, "");
     } catch {}
   }
+
+  // Handle local executable paths e.g. C:\Program Files\Notion\Notion.exe or /usr/bin/docker
+  if (cleaned.includes("/") || cleaned.includes("\\") || cleaned.toLowerCase().endsWith(".exe")) {
+    const filename = cleaned.split(/[\\/]/).pop()?.replace(/\.exe$/i, "").toLowerCase() || "";
+    if (filename) {
+      if (BRAND_DOMAINS[filename]) return BRAND_DOMAINS[filename];
+      const matchKey = Object.keys(BRAND_DOMAINS).find((k) => filename.includes(k));
+      if (matchKey) return BRAND_DOMAINS[matchKey];
+    }
+  }
+
+  // Handle CLI package commands e.g. npx -y @modelcontextprotocol/server-postgres or docker run
+  if (cleaned.startsWith("npx") || cleaned.startsWith("node") || cleaned.startsWith("python") || cleaned.startsWith("docker")) {
+    const pkgMatch = /@?[a-zA-Z0-9_-]+\/(?:server-)?([a-zA-Z0-9_-]+)/.exec(cleaned);
+    if (pkgMatch && pkgMatch[1]) {
+      const pkgName = pkgMatch[1].toLowerCase().replace(/^server-/, "");
+      if (BRAND_DOMAINS[pkgName]) return BRAND_DOMAINS[pkgName];
+      const matchKey = Object.keys(BRAND_DOMAINS).find((k) => pkgName.includes(k));
+      if (matchKey) return BRAND_DOMAINS[matchKey];
+    }
+  }
+
+  // Handle GitHub author/repo e.g. "microsoft/playwright" or "razorpay/razorpay-mcp"
+  if (/^[a-zA-Z0-9_-]+\/[a-zA-Z0-9_.-]+$/.test(cleaned)) {
+    const repoPart = cleaned.split("/")[1].toLowerCase().replace(/-(?:mcp|server|plugin)$/, "");
+    if (BRAND_DOMAINS[repoPart]) return BRAND_DOMAINS[repoPart];
+    const matchKey = Object.keys(BRAND_DOMAINS).find((k) => repoPart.includes(k));
+    if (matchKey) return BRAND_DOMAINS[matchKey];
+  }
+
   // Check if string contains a domain like xxx.com, xxx.app, xxx.io
   const domainMatch = /(?:https?:\/\/)?(?:www\.)?([a-zA-Z0-9-]+\.[a-zA-Z]{2,})(?:\/.*)?/i.exec(cleaned);
   if (domainMatch) return domainMatch[1].toLowerCase();
 
-  // Check brand dictionary
+  // Check brand dictionary exact match
   const key = cleaned.toLowerCase();
   if (BRAND_DOMAINS[key]) return BRAND_DOMAINS[key];
+
+  // Check brand dictionary substring match
+  const brandSub = Object.keys(BRAND_DOMAINS).find((k) => key.includes(k));
+  if (brandSub) return BRAND_DOMAINS[brandSub];
 
   return "";
 }
@@ -353,6 +967,7 @@ export function AppLogo({
   url,
   command,
   size = 32,
+  className = "",
 }: {
   id?: string;
   name?: string;
@@ -360,19 +975,31 @@ export function AppLogo({
   url?: string;
   command?: string;
   size?: number;
+  className?: string;
 }) {
   const safeName = name || id || "App";
-  const brandKey = normalizeBrand(id, name);
+  const brandKey = normalizeBrand(id, name, command, url);
   const logo = brandKey ? LOGOS[brandKey] : undefined;
 
   // Domain & Remote icon sources
-  const domain = extractDomain(url) || BRAND_DOMAINS[safeName.toLowerCase()] || (brandKey ? BRAND_DOMAINS[brandKey] : "");
+  const domain =
+    extractDomain(url) ||
+    extractDomain(command) ||
+    BRAND_DOMAINS[safeName.toLowerCase()] ||
+    extractDomain(safeName) ||
+    (brandKey ? BRAND_DOMAINS[brandKey] : "");
+
   const remoteSources = useMemo(() => {
-    return getFaviconSources(domain || url || safeName);
-  }, [domain, url, safeName]);
+    return getFaviconSources(domain || url || command || safeName);
+  }, [domain, url, command, safeName]);
 
   const [srcIndex, setSrcIndex] = useState(0);
   const [imgFailed, setImgFailed] = useState(false);
+
+  useEffect(() => {
+    setSrcIndex(0);
+    setImgFailed(false);
+  }, [domain, url, command, safeName]);
 
   // If local/system tool
   const lowerName = safeName.toLowerCase();
@@ -385,6 +1012,39 @@ export function AppLogo({
   const isGit = lowerName === "git" || lowerCmd.includes("git") || lowerId.includes("git");
   const isTime = lowerName === "time" || lowerCmd.includes("time") || lowerId.includes("time");
   const isSkillPack = lowerName.includes("prebuilt") || lowerId.includes("prebuilt");
+  const isDb =
+    lowerName.includes("database") ||
+    lowerCmd.includes("database") ||
+    lowerId.includes("database") ||
+    lowerName.includes("sqlite") ||
+    lowerCmd.includes("sqlite") ||
+    lowerName.includes("redis") ||
+    lowerCmd.includes("redis") ||
+    lowerName.includes("mysql") ||
+    lowerName.includes("mongo");
+  const isTerminal =
+    lowerName.includes("terminal") ||
+    lowerCmd.includes("terminal") ||
+    lowerId.includes("terminal") ||
+    lowerName.includes("sandbox") ||
+    lowerCmd.includes("sandbox") ||
+    lowerName.includes("shell") ||
+    lowerCmd.includes("shell");
+  const isSecurity =
+    lowerName.includes("security") ||
+    lowerId.includes("security") ||
+    lowerName.includes("vulnerability") ||
+    lowerName.includes("audit") ||
+    lowerName.includes("vault") ||
+    lowerId.includes("vault");
+  const isGravitas = lowerName.includes("gravitas") || lowerId.includes("gravitas");
+  const isSearch =
+    lowerName.includes("search") ||
+    lowerCmd.includes("search") ||
+    lowerName.includes("fetch") ||
+    lowerCmd.includes("fetch") ||
+    lowerName.includes("browse") ||
+    lowerCmd.includes("browse");
 
   const containerStyle = {
     width: size,
@@ -392,19 +1052,33 @@ export function AppLogo({
     borderRadius: Math.max(6, Math.round(size * 0.25)),
   };
 
+  // 0. High-fidelity Authentic Vector Brand SVGs
+  const customSvg = brandKey ? getBrandCustomSvg(brandKey) : null;
+  if (customSvg) {
+    return (
+      <span
+        className={`mark logo shrink-0 inline-flex items-center justify-center overflow-hidden select-none border border-black/5 shadow-2xs ${className}`}
+        style={containerStyle}
+        title={safeName}
+      >
+        {customSvg}
+      </span>
+    );
+  }
+
   // 1. Built-in Vector Logo
   if (logo) {
-    const fill = brandKey === "gemini" ? "url(#omni-gemini)" : logo.fg;
+    const fill = brandKey === "gemini" ? "url(#ronic-gemini)" : logo.fg;
     return (
       <span
         className="mark logo shrink-0 inline-flex items-center justify-center border border-black/5 shadow-2xs overflow-hidden"
         style={{ ...containerStyle, background: logo.bg }}
         title={safeName}
       >
-        <svg viewBox={logo.viewBox} fillRule="evenodd" aria-hidden="true" style={{ width: "68%", height: "68%" }}>
+        <svg viewBox={logo.viewBox} fillRule="evenodd" aria-hidden="true" style={{ width: "100%", height: "100%" }}>
           {brandKey === "gemini" && (
             <defs>
-              <linearGradient id="omni-gemini" x1="0" y1="24" x2="24" y2="0" gradientUnits="userSpaceOnUse">
+              <linearGradient id="ronic-gemini" x1="0" y1="24" x2="24" y2="0" gradientUnits="userSpaceOnUse">
                 <stop offset="0" stopColor="#1A73E8" />
                 <stop offset="0.45" stopColor="#9B72CB" />
                 <stop offset="1" stopColor="#D96570" />
@@ -427,7 +1101,7 @@ export function AppLogo({
         style={containerStyle}
         title={safeName}
       >
-        <Folder size={size * 0.55} />
+        <Folder size={size * 0.75} />
       </span>
     );
   }
@@ -438,7 +1112,7 @@ export function AppLogo({
         style={containerStyle}
         title={safeName}
       >
-        <Brain size={size * 0.55} />
+        <Brain size={size * 0.75} />
       </span>
     );
   }
@@ -449,7 +1123,7 @@ export function AppLogo({
         style={containerStyle}
         title={safeName}
       >
-        <Sparkles size={size * 0.55} />
+        <Sparkles size={size * 0.75} />
       </span>
     );
   }
@@ -460,7 +1134,7 @@ export function AppLogo({
         style={containerStyle}
         title={safeName}
       >
-        <GitBranch size={size * 0.55} />
+        <GitBranch size={size * 0.75} />
       </span>
     );
   }
@@ -471,7 +1145,7 @@ export function AppLogo({
         style={containerStyle}
         title={safeName}
       >
-        <Clock size={size * 0.55} />
+        <Clock size={size * 0.75} />
       </span>
     );
   }
@@ -482,7 +1156,7 @@ export function AppLogo({
         style={containerStyle}
         title={safeName}
       >
-        <Layers size={size * 0.55} />
+        <Layers size={size * 0.75} />
       </span>
     );
   }
@@ -499,7 +1173,7 @@ export function AppLogo({
           src={remoteSources[srcIndex]}
           alt={safeName}
           referrerPolicy="no-referrer"
-          className="w-full h-full object-contain p-1"
+          className="w-full h-full object-cover"
           onError={() => {
             if (srcIndex + 1 < remoteSources.length) {
               setSrcIndex((prev) => prev + 1);
@@ -512,7 +1186,64 @@ export function AppLogo({
     );
   }
 
-  // 4. Elegant Brand Monogram Badge
+  // 4. Extended Tool Category Fallbacks
+  if (isDb) {
+    return (
+      <span
+        className="mark shrink-0 inline-flex items-center justify-center bg-blue-50 text-blue-700 border border-blue-200 shadow-2xs"
+        style={containerStyle}
+        title={safeName}
+      >
+        <Database size={size * 0.75} />
+      </span>
+    );
+  }
+  if (isTerminal) {
+    return (
+      <span
+        className="mark shrink-0 inline-flex items-center justify-center bg-slate-900 text-emerald-400 border border-slate-700 shadow-2xs"
+        style={containerStyle}
+        title={safeName}
+      >
+        <Terminal size={size * 0.75} />
+      </span>
+    );
+  }
+  if (isGravitas) {
+    return (
+      <span
+        className="mark shrink-0 inline-flex items-center justify-center bg-emerald-50 text-emerald-700 border border-emerald-300 shadow-2xs"
+        style={containerStyle}
+        title={safeName}
+      >
+        <ShieldCheck size={size * 0.75} />
+      </span>
+    );
+  }
+  if (isSecurity) {
+    return (
+      <span
+        className="mark shrink-0 inline-flex items-center justify-center bg-rose-50 text-rose-700 border border-rose-200 shadow-2xs"
+        style={containerStyle}
+        title={safeName}
+      >
+        <Lock size={size * 0.75} />
+      </span>
+    );
+  }
+  if (isSearch) {
+    return (
+      <span
+        className="mark shrink-0 inline-flex items-center justify-center bg-sky-50 text-sky-700 border border-sky-200 shadow-2xs"
+        style={containerStyle}
+        title={safeName}
+      >
+        <Globe size={size * 0.75} />
+      </span>
+    );
+  }
+
+  // 5. Elegant Brand Monogram Badge
   const letters = lettersFor(safeName, mark);
   const bgColor = stringToColor(safeName);
 

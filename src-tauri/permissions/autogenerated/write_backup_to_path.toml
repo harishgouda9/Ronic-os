@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-write-backup-to-path"
+description = "Enables the write_backup_to_path command without any pre-configured scope."
+commands.allow = ["write_backup_to_path"]
+
+[[permission]]
+identifier = "deny-write-backup-to-path"
+description = "Denies the write_backup_to_path command without any pre-configured scope."
+commands.deny = ["write_backup_to_path"]

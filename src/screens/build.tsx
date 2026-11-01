@@ -1,9 +1,9 @@
 import { CodingAgentsWorkspace } from "./CodingAgentsWorkspace";
-import ComputerBrowserStudio from "../components/ComputerBrowserStudio";
+import BotComputerSubsystemStudio from "../components/BotComputerSubsystemStudio";
 import WorkflowsStudio from "../components/WorkflowsStudio";
 
 export { CodingAgentsWorkspace as Ide, CodingAgentsWorkspace };
-export { ComputerBrowserStudio as Computer, ComputerBrowserStudio };
+export { BotComputerSubsystemStudio as Computer, BotComputerSubsystemStudio };
 export { WorkflowsStudio as Workflows, WorkflowsStudio };
 
 

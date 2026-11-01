@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-mini-fs-write-bytes"
+description = "Enables the mini_fs_write_bytes command without any pre-configured scope."
+commands.allow = ["mini_fs_write_bytes"]
+
+[[permission]]
+identifier = "deny-mini-fs-write-bytes"
+description = "Denies the mini_fs_write_bytes command without any pre-configured scope."
+commands.deny = ["mini_fs_write_bytes"]

@@ -1,7 +1,7 @@
 //! In-workspace web apps and the desktop apps launched from the chat dock.
 //!
 //! Web apps are child webviews of the main window. Each one keeps its own
-//! WebView2 profile under ~/.omniworkspace/webapps/browser so a login survives
+//! WebView2 profile under ~/.ronicos/webapps/browser so a login survives
 //! and a second site does not share cookies. On Windows a webview that sets
 //! its own user agent is blank unless that profile directory is unique.
 //! Google and Apple sign-in closes that panel and opens Chrome or Edge on
@@ -20,7 +20,7 @@ use std::process::Command;
 use std::sync::Mutex;
 use std::time::Duration;
 use std::sync::OnceLock;
-use tauri::{AppHandle, LogicalPosition, LogicalSize, Manager, Runtime, WebviewUrl};
+use tauri::{AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, Runtime, WebviewUrl};
 use tauri::webview::{Color, NewWindowResponse, PageLoadEvent, WebviewBuilder};
 
 const INSTALLED_KEY: &str = "installed_webapps";
@@ -99,6 +99,98 @@ pub fn panel_wanted(label: &str) -> bool {
 
 fn clear_wanted() {
     wanted_set().clear();
+}
+
+static ACTIVE_WEBAPP: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn active_webapp() -> Option<String> {
+    ACTIVE_WEBAPP.lock().unwrap_or_else(|poison| poison.into_inner()).clone()
+}
+
+pub fn set_active_webapp(id: Option<String>) {
+    *ACTIVE_WEBAPP.lock().unwrap_or_else(|poison| poison.into_inner()) = id;
+}
+
+pub fn list_available_webapps(conn: Option<&Connection>) -> Vec<serde_json::Value> {
+    let active = active_webapp();
+    let installed = conn.map(installed_ids).unwrap_or_default();
+    let specs = [
+        ("chatgpt", "ChatGPT", "https://chatgpt.com"),
+        ("claude", "Claude", "https://claude.ai"),
+        ("gemini", "Gemini", "https://gemini.google.com"),
+        ("grok", "Grok", "https://grok.com"),
+        ("openrouter", "OpenRouter", "https://openrouter.ai/keys"),
+        ("deepseek", "DeepSeek", "https://chat.deepseek.com"),
+        ("qwen", "Qwen", "https://chat.qwen.ai"),
+        ("tokenrouter", "TokenRouter", "https://tokenrouter.io"),
+        ("bedrock", "Bedrock", "https://console.aws.amazon.com/bedrock"),
+        ("nvidia", "NVIDIA", "https://build.nvidia.com"),
+        ("meta", "Meta AI", "https://meta.ai"),
+        ("mistral", "Mistral", "https://chat.mistral.ai"),
+        ("perplexity", "Perplexity", "https://www.perplexity.ai"),
+        ("groq", "Groq", "https://console.groq.com/keys"),
+        ("together", "Together", "https://api.together.ai/settings/api-keys"),
+        ("cohere", "Cohere", "https://dashboard.cohere.com/api-keys"),
+        ("copilot", "Copilot", "https://copilot.microsoft.com"),
+    ];
+    let mut list = Vec::new();
+    for (id, name, url) in specs {
+        let is_active = active.as_deref() == Some(id);
+        let is_installed = installed.iter().any(|item| item == id);
+        list.push(serde_json::json!({
+            "id": id,
+            "name": name,
+            "url": url,
+            "active": is_active,
+            "installed": is_installed,
+        }));
+    }
+    list
+}
+
+pub fn list_available_desktop_apps() -> Vec<serde_json::Value> {
+    let specs = [
+        ("ollama", "Ollama", "ollama"),
+        ("claude-code", "Claude Code", "claude"),
+        ("cursor", "Cursor", "cursor"),
+        ("vscode", "VS Code", "code"),
+        ("obsidian", "Obsidian", "obsidian"),
+    ];
+    let mut list = Vec::new();
+    for (id, name, cmd) in specs {
+        let found = crate::util::which(cmd).is_some();
+        list.push(serde_json::json!({
+            "id": id,
+            "name": name,
+            "command": cmd,
+            "installed": found
+        }));
+    }
+    list
+}
+
+pub fn open_workspace_webapp_by_bot<R: Runtime>(
+    app: &AppHandle<R>,
+    id: &str,
+    url: Option<&str>,
+    name: Option<&str>,
+) -> Result<String> {
+    let (app_id, app_name, app_url) = resolve_web(id, url, name)?;
+    let _ = app.emit("ronic://open-workspace-webapp", serde_json::json!({
+        "id": app_id,
+        "name": app_name,
+        "url": app_url,
+    }));
+    let label = label_for(&app_id);
+    let bounds = stored_bounds(&label).unwrap_or(WebAppBounds {
+        x: 640.0,
+        y: 40.0,
+        width: 600.0,
+        height: 700.0,
+    });
+    let home = crate::util::product_home();
+    let shown = show(app, &home, &app_id, bounds, true, Some(&app_url), Some(&app_name))?;
+    Ok(format!("Opened {} beside you in the workspace stage ({})", shown.name, app_url))
 }
 
 fn web_spec(id: &str) -> Option<WebSpec> {
@@ -239,6 +331,7 @@ pub fn show<R: Runtime>(app: &AppHandle<R>, home: &Path, id: &str, bounds: WebAp
     let bounds = bounds.clamped();
     let label = label_for(&app_id);
     remember_bounds(&label, bounds);
+    set_active_webapp(Some(app_id.clone()));
     if let Some(message) = crate::site_window::browser_sign_in_message(&label) {
         return Ok(ShownWebApp { name: app_name, signing_in: Some(message) });
     }
@@ -317,6 +410,7 @@ fn move_view<R: Runtime>(view: &tauri::Webview<R>, bounds: WebAppBounds) -> Resu
 
 pub fn hide_all(app: &AppHandle) {
     clear_wanted();
+    set_active_webapp(None);
     let Some(window) = app.get_window("main") else { return };
     for view in window.webviews() {
         if view.label().starts_with("webapp_") {
@@ -353,8 +447,9 @@ pub fn launch_desktop(app: &AppHandle, id: &str, kind: Option<&str>, path: Optio
         return Ok(outcome);
     }
     let spec = desk_spec(id).ok_or_else(|| err("unknown desktop app"))?;
-    // Built-in apps keep their own executable. A caller-supplied path cannot redirect them.
-    let _ = (path, name);
+    // Built-in apps keep their own executable. A directory is the project to open, not a replacement program.
+    let folder = directory_arg(path);
+    let _ = name;
     let kind = match kind {
         None => None,
         Some("desktop") | Some("terminal") => kind,
@@ -375,18 +470,18 @@ pub fn launch_desktop(app: &AppHandle, id: &str, kind: Option<&str>, path: Optio
         None => {
             if let Some(path) = editions.desktop.clone().or(editions.terminal.clone()) {
                 let console = editions.desktop.is_none();
-                return open_outcome(app, &spec, &path, console, false);
+                return open_outcome(app, &spec, &path, console, false, folder.as_deref());
             }
             Ok(ask_choice(&spec))
         }
         Some(wanted) => {
             let requested = if wanted == "desktop" { editions.desktop.clone() } else { editions.terminal.clone() };
             if let Some(path) = requested {
-                return open_outcome(app, &spec, &path, wanted == "terminal", false);
+                return open_outcome(app, &spec, &path, wanted == "terminal", false, folder.as_deref());
             }
             if let Some(path) = editions.desktop.clone().or(editions.terminal.clone()) {
                 let console = editions.desktop.is_none();
-                return open_outcome(app, &spec, &path, console, false);
+                return open_outcome(app, &spec, &path, console, false, folder.as_deref());
             }
             install_and_open(app, &spec, wanted)
         }
@@ -402,9 +497,14 @@ fn ask_choice(spec: &DeskSpec) -> LaunchOutcome {
     LaunchOutcome { note, install_choice: Some(spec.id.to_string()) }
 }
 
-fn open_outcome(app: &AppHandle, spec: &DeskSpec, path: &Path, console: bool, fresh: bool) -> Result<LaunchOutcome> {
+fn open_outcome(app: &AppHandle, spec: &DeskSpec, path: &Path, console: bool, fresh: bool, folder: Option<&Path>) -> Result<LaunchOutcome> {
     close_harness_windows(app);
-    let pid = launch_file(path, console)?;
+    let open_folder = folder.filter(|_| matches!(spec.id, "cursor" | "vscode"));
+    let pid = if open_folder.is_some() {
+        open_program_at(path, open_folder)?
+    } else {
+        launch_file(path, console)?
+    };
     remember(app, spec, path, pid)?;
     let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("").to_ascii_lowercase();
     if spec.id == "ollama" && file_name == "ollama.exe" {
@@ -425,6 +525,9 @@ fn open_outcome(app: &AppHandle, spec: &DeskSpec, path: &Path, console: bool, fr
     if matches!(spec.id, "claude-code" | "cursor" | "vscode") {
         note = format!("{note} It can use Ronic OS skills, plugins, and memory through the local MCP server. Restart it if it was already open.");
     }
+    if let Some(folder) = open_folder {
+        note = format!("{note} Project folder: {}.", folder.display());
+    }
     Ok(LaunchOutcome { note, install_choice: None })
 }
 
@@ -435,7 +538,7 @@ fn install_and_open(app: &AppHandle, spec: &DeskSpec, kind: &str) -> Result<Laun
             return Err(err(format!("Claude's desktop app could not be installed. {}", error.0)));
         }
         if let Some(path) = detected_editions(spec.id, true).desktop {
-            return open_outcome(app, spec, &path, false, true);
+            return open_outcome(app, spec, &path, false, true, None);
         }
         return Err(err("Claude's desktop app installer finished, but Claude.exe was not found. The terminal app was not installed."));
     }
@@ -451,7 +554,7 @@ fn install_and_open(app: &AppHandle, spec: &DeskSpec, kind: &str) -> Result<Laun
             editions = detected_editions(spec.id, true);
         }
         if let Some(path) = editions.terminal {
-            return open_outcome(app, spec, &path, true, true);
+            return open_outcome(app, spec, &path, true, true, None);
         }
         let detail = why.into_iter().find(|line| !line.is_empty()).unwrap_or_else(|| "no installer ran".into());
         return Err(err(format!("Claude Code could not be installed. {detail}")));
@@ -467,7 +570,7 @@ fn install_and_open(app: &AppHandle, spec: &DeskSpec, kind: &str) -> Result<Laun
     };
     if let Some(path) = chosen {
         let console = edition_of(&path) == "terminal";
-        return open_outcome(app, spec, &path, console, true);
+        return open_outcome(app, spec, &path, console, true, None);
     }
     if let Some(url) = installer_url(spec)? {
         let dest = installer_file(app, spec)?;
@@ -893,6 +996,40 @@ fn launch_added_program(path: &str, name: &str) -> Result<LaunchOutcome> {
     Ok(LaunchOutcome { note: format!("Opened {label}."), install_choice: None })
 }
 
+fn directory_arg(raw: Option<&str>) -> Option<PathBuf> {
+    let raw = raw?.trim();
+    if raw.is_empty() || raw.len() > 1024 || raw.chars().any(|ch| ch.is_control()) {
+        return None;
+    }
+    let path = PathBuf::from(raw);
+    if path.is_dir() { Some(path) } else { None }
+}
+
+/// Start an editor outside this process's job and, when a folder is given, open that folder.
+pub(crate) fn open_program_at(path: &Path, folder: Option<&Path>) -> Result<u32> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let mut cmd = Command::new("cmd.exe");
+        // The empty argument is the window title. start treats the first quoted string as a title.
+        cmd.arg("/d").arg("/c").arg("start").arg("").arg(path);
+        if let Some(folder) = folder {
+            cmd.arg(folder);
+        }
+        cmd.creation_flags(0x08000000);
+        cmd.spawn().map_err(|error| err(format!("could not open {}: {error}", path.display())))?;
+        return Ok(0);
+    }
+    #[cfg(not(windows))]
+    {
+        let mut cmd = Command::new(path);
+        if let Some(folder) = folder {
+            cmd.arg(folder);
+        }
+        return Ok(cmd.spawn().map_err(|error| err(error.to_string()))?.id());
+    }
+}
+
 fn launch_file(path: &Path, console: bool) -> Result<u32> {
     let text = path.display().to_string();
     #[cfg(windows)]
@@ -993,7 +1130,7 @@ pub(crate) fn local_port_open(url: &url::Url) -> bool {
 fn tell_page(app: &AppHandle, url: &str) {
     let Some(window) = app.get_webview_window("main") else { return };
     let text = serde_json::to_string(url).unwrap_or_else(|_| "\"\"".into());
-    let _ = window.eval(format!("window.dispatchEvent(new CustomEvent('omni-page', {{ detail: {{ url: {text} }} }}))"));
+    let _ = window.eval(format!("window.dispatchEvent(new CustomEvent('ronic-page', {{ detail: {{ url: {text} }} }}))"));
 }
 
 pub fn show_page(app: &AppHandle, home: &Path, bounds: WebAppBounds, url: &str, focus: bool) -> Result<PageView> {
@@ -1188,14 +1325,27 @@ mod tests {
         assert_eq!(failure(launch_added_program("", "Notes")), "choose a program file on this computer");
         assert_eq!(failure(launch_added_program("wsl:notepad", "Notes")), "choose a program file on this computer");
         assert_eq!(failure(launch_added_program("C:\\\u{1}bad.exe", "Notes")), "choose a program file on this computer");
-        assert_eq!(failure(launch_added_program(r"C:\no\such\omni-missing.exe", "Notes")), "that program file was not found");
+        assert_eq!(failure(launch_added_program(r"C:\no\such\ronic-missing.exe", "Notes")), "that program file was not found");
         assert_eq!(failure(launch_added_program(r"C:\Windows", "Win")), "that program file was not found");
-        assert_eq!(failure(route_added_desktop("custom_d1", Some(r"C:\no\such\omni-missing.exe"), Some("Notes"))), "that program file was not found");
+        assert_eq!(failure(route_added_desktop("custom_d1", Some(r"C:\no\such\ronic-missing.exe"), Some("Notes"))), "that program file was not found");
         assert_eq!(failure(route_added_desktop("chatgpt", None, None)), "unknown desktop app");
-        match route_added_desktop("cursor", Some(r"C:\no\such\omni-missing.exe"), Some("Nope")) {
+        match route_added_desktop("cursor", Some(r"C:\no\such\ronic-missing.exe"), Some("Nope")) {
             Ok(None) => {}
             Ok(Some(_)) => panic!("a built-in desktop app must ignore a caller path"),
             Err(error) => panic!("{}", error.0),
         }
+    }
+
+    #[test]
+    fn active_webapp_tracking_and_listing() {
+        set_active_webapp(Some("chatgpt".into()));
+        assert_eq!(active_webapp().as_deref(), Some("chatgpt"));
+        set_active_webapp(Some("claude".into()));
+        assert_eq!(active_webapp().as_deref(), Some("claude"));
+        set_active_webapp(None);
+        assert_eq!(active_webapp(), None);
+
+        let desk_apps = list_available_desktop_apps();
+        assert!(desk_apps.iter().any(|a| a["id"] == "vscode" || a["id"] == "cursor"));
     }
 }

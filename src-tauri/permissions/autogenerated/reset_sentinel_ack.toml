@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-reset-sentinel-ack"
+description = "Enables the reset_sentinel_ack command without any pre-configured scope."
+commands.allow = ["reset_sentinel_ack"]
+
+[[permission]]
+identifier = "deny-reset-sentinel-ack"
+description = "Denies the reset_sentinel_ack command without any pre-configured scope."
+commands.deny = ["reset_sentinel_ack"]

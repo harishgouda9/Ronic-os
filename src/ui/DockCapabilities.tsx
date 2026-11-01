@@ -1,13 +1,14 @@
 import { useEffect, useState } from "react";
-import { enabledFor, skillTemplate } from "../kernel/skillIndex";
-import { useOmni } from "../store";
+import { enabledFor, mcpEnabledFor, skillTemplate } from "../kernel/skillIndex";
+import { useRonic } from "../store";
 import { Pill } from "./bits";
+import { AppLogo } from "./appLogos";
 
 type Part = "skills" | "plugins" | "mcp";
 
 export function DockCapabilities({ onUseSkill }: { onUseSkill: (slash: string) => void }) {
-  const snap = useOmni((s) => s.snap)!;
-  const busy = useOmni((s) => s.busy);
+  const snap = useRonic((s) => s.snap)!;
+  const busy = useRonic((s) => s.busy);
   const [part, setPart] = useState<Part>("skills");
   const profile = snap.profiles.find((item) => item.id === snap.activeProfileId) ?? snap.profiles[0];
   const profileId = profile?.id ?? "";
@@ -28,8 +29,8 @@ export function DockCapabilities({ onUseSkill }: { onUseSkill: (slash: string) =
 }
 
 function SkillsPart({ profileId, busy, onUseSkill }: { profileId: string; busy: boolean; onUseSkill: (slash: string) => void }) {
-  const snap = useOmni((s) => s.snap)!;
-  const run = useOmni((s) => s.run);
+  const snap = useRonic((s) => s.snap)!;
+  const run = useRonic((s) => s.run);
   const [slug, setSlug] = useState("");
   const [openId, setOpenId] = useState("");
   const [filter, setFilter] = useState("");
@@ -81,8 +82,8 @@ function SkillsPart({ profileId, busy, onUseSkill }: { profileId: string; busy: 
 }
 
 function PluginsPart({ profileId, busy }: { profileId: string; busy: boolean }) {
-  const snap = useOmni((s) => s.snap)!;
-  const run = useOmni((s) => s.run);
+  const snap = useRonic((s) => s.snap)!;
+  const run = useRonic((s) => s.run);
   const [slug, setSlug] = useState("");
   const [name, setName] = useState("");
   return (
@@ -105,7 +106,10 @@ function PluginsPart({ profileId, busy }: { profileId: string; busy: boolean }) 
         return (
           <article key={plugin.id} className="dock-card stack">
             <div className="between">
-              <strong>{plugin.name}</strong>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <AppLogo id={plugin.id} name={plugin.name} size={22} />
+                <strong>{plugin.name}</strong>
+              </div>
               <Pill>{plugin.trust}</Pill>
             </div>
             <p className="muted">{plugin.tools.length} tools · {plugin.source}</p>
@@ -122,8 +126,8 @@ function PluginsPart({ profileId, busy }: { profileId: string; busy: boolean }) 
 }
 
 function McpPart({ profileId, busy }: { profileId: string; busy: boolean }) {
-  const snap = useOmni((s) => s.snap)!;
-  const run = useOmni((s) => s.run);
+  const snap = useRonic((s) => s.snap)!;
+  const run = useRonic((s) => s.run);
   const [name, setName] = useState("");
   const [url, setUrl] = useState("");
   return (
@@ -143,11 +147,14 @@ function McpPart({ profileId, busy }: { profileId: string; busy: boolean }) {
       <p className="muted">A server can be enabled for this profile. Connecting a session stays off.</p>
       {snap.mcpServers.length === 0 ? <p className="muted">No MCP servers yet.</p> : null}
       {snap.mcpServers.map((server) => {
-        const on = enabledFor(server.enables, profileId);
+        const on = mcpEnabledFor(server.enables, profileId);
         return (
           <article key={server.id} className="dock-card stack">
             <div className="between">
-              <strong>{server.name}</strong>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <AppLogo id={server.id} name={server.name} url={server.url} command={server.command} size={22} />
+                <strong>{server.name}</strong>
+              </div>
               <Pill>{server.transport}</Pill>
             </div>
             <p className="mono">{server.url || server.command || "No command yet"}</p>

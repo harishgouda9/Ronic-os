@@ -15,7 +15,7 @@ import { existsSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 const args = process.argv.slice(2);
-const targetDir = process.env.CARGO_TARGET_DIR || join(process.env.LOCALAPPDATA || "", "omniworkspace-target");
+const targetDir = process.env.CARGO_TARGET_DIR || join(process.env.LOCALAPPDATA || "", "ronicos-target");
 const root = join(import.meta.dirname, "..");
 const tauriDir = join(root, "src-tauri");
 
@@ -131,14 +131,33 @@ if (process.platform !== "win32") {
     console.error("Install the Windows SDK, or run the tests from a machine profile that has mt.exe on PATH.");
     process.exit(1);
   }
-  const testExe = newest(/^omniworkspace_lib-[\da-f]+\.exe$/);
+  const testExe = newest(/^ronicos_lib-[\da-f]+\.exe$/);
   if (!testExe) {
     console.error("The lib test executable was not found after building.");
     process.exit(1);
   }
   const manifestFile = join(targetDir, "comctl6.manifest");
   writeFileSync(manifestFile, manifest, "utf8");
-  run(mt, ["-manifest", manifestFile, `-outputresource:${testExe};#1`]);
+  // mt.exe rewrites the freshly linked exe in place; a real-time scanner
+  // routinely holds that file for a few seconds right after the link. The
+  // test-run backoff below covers the same race on the load side — this one
+  // covers the manifest-write side.
+  const mtDelays = [0, 3000, 8000, 15000, 25000, 40000];
+  let mtError;
+  for (const delay of mtDelays) {
+    if (delay) {
+      console.log(`mt.exe could not rewrite the test binary (scanner hold); retrying in ${delay / 1000}s…`);
+      await sleep(delay);
+    }
+    try {
+      run(mt, ["-manifest", manifestFile, `-outputresource:${testExe};#1`]);
+      mtError = null;
+      break;
+    } catch (error) {
+      mtError = error;
+    }
+  }
+  if (mtError) throw mtError;
   // No cwd: the repo path contains spaces and the MinGW loader fails to
   // resolve its api-set imports when the working directory has spaces.
   await runTestExe(testExe, args.filter((item) => item !== "--lib"), {});

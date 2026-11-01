@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-resolve-delegation-friction"
+description = "Enables the resolve_delegation_friction command without any pre-configured scope."
+commands.allow = ["resolve_delegation_friction"]
+
+[[permission]]
+identifier = "deny-resolve-delegation-friction"
+description = "Denies the resolve_delegation_friction command without any pre-configured scope."
+commands.deny = ["resolve_delegation_friction"]

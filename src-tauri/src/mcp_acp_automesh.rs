@@ -2,7 +2,7 @@
 //!
 //! MCP stays the tool and memory bus (the existing authenticated bridge).
 //! ACP is a local JSON-RPC inbox for peer tasks. Neither port is opened
-//! without the bridge bearer token. Config writes merge `omni-workspace`
+//! without the bridge bearer token. Config writes merge `ronic-os`
 //! and leave every other server in place.
 
 use crate::capabilities::{self, in_index};
@@ -415,7 +415,7 @@ pub fn open_connector_setup(app: &AppHandle, app_id: &str) -> Result<String, Str
 
 fn open_webapp_at(app: &AppHandle, app_id: &str, title: &str, url: &str, note: String) -> Result<String, String> {
     let safe: String = app_id.chars().map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' }).collect();
-    let label = format!("omni_webapp_{safe}");
+    let label = format!("ronic_webapp_{safe}");
     if let Some(existing) = app.get_webview_window(&label) {
         let _ = existing.show();
         let _ = existing.set_focus();
@@ -476,8 +476,8 @@ fn ticket_line(ticket: &Value) -> String {
 
 fn webapp_status(home: &Path, id: &str, url: &str) -> (bool, String, String) {
     let p1 = crate::site_window::profile_dir(home, &format!("webapp_{id}"));
-    let p2 = crate::site_window::profile_dir(home, &format!("omni_webapp_{id}"));
-    let p3 = crate::site_window::profile_dir(home, &format!("omni_webapp_{id}_web"));
+    let p2 = crate::site_window::profile_dir(home, &format!("ronic_webapp_{id}"));
+    let p3 = crate::site_window::profile_dir(home, &format!("ronic_webapp_{id}_web"));
     let active = p1.exists() || p2.exists() || p3.exists();
     // The page script reports a real sign-in signal from the site's own DOM.
     // A profile folder only proves the window was opened once. A web app that
@@ -528,7 +528,7 @@ fn locate(id: &str, settings: &crate::models::Settings, home: &Path) -> (bool, S
                 let grok_dir = user_home().join(".grok");
                 let grokbot_dir = user_home().join(".grokbot");
                 let web_dir = crate::site_window::profile_dir(home, "webapp_grok");
-                let web_dir2 = crate::site_window::profile_dir(home, "omni_webapp_grok_web");
+                let web_dir2 = crate::site_window::profile_dir(home, "ronic_webapp_grok_web");
                 if grokbot_dir.is_dir() || grok_dir.is_dir() {
                     (true, (if grokbot_dir.is_dir() { grokbot_dir } else { grok_dir }).display().to_string(), "MCP & ACP Connected · ~/.grokbot".into())
                 } else if web_dir.exists() || web_dir2.exists() {
@@ -607,7 +607,7 @@ fn client_paths() -> Vec<PathBuf> {
         home.join(".gemini").join("settings.json"),
         home.join(".codex").join("config.toml"),
         home.join(".config").join("opencode").join("opencode.json"),
-        home.join(".omniworkspace").join("mcp-hub.json"),
+        home.join(".ronicos").join("mcp-hub.json"),
     ];
     if let Some(appdata) = appdata() {
         paths.push(appdata.join("Code").join("User").join("mcp.json"));
@@ -621,7 +621,7 @@ fn write_hub(home: &Path) -> Result<String, String> {
     let entry = hub_entry()?;
     let path = home.join("mcp-hub.json");
     backup(home, &path);
-    let payload = json!({ "mcpServers": { "omni-workspace": entry } });
+    let payload = json!({ "mcpServers": { "ronic-os": entry } });
     fs::write(&path, serde_json::to_vec_pretty(&payload).map_err(|error| error.to_string())?).map_err(|error| error.to_string())?;
     Ok(format!("Master CLI hub ({})", path.display()))
 }
@@ -676,7 +676,7 @@ fn extra_configs(conn: &Connection, home: &Path) -> Result<Vec<String>, String> 
     }
     notes.push(append_codex(&entry)?);
     notes.push(merge_opencode(&entry)?);
-    notes.push("Aider and OpenCode read ~/.omniworkspace/mcp-hub.json when they are started with that MCP config. Their own config files were left alone unless OpenCode's JSON was already present.".into());
+    notes.push("Aider and OpenCode read ~/.ronicos/mcp-hub.json when they are started with that MCP config. Their own config files were left alone unless OpenCode's JSON was already present.".into());
     Ok(notes)
 }
 
@@ -686,7 +686,7 @@ fn append_codex(entry: &Value) -> Result<String, String> {
         return Ok(format!("Codex config was left absent ({})", path.display()));
     }
     let text = fs::read_to_string(&path).map_err(|error| error.to_string())?;
-    if text.contains("omniworkspace-mcp-hub") {
+    if text.contains("ronicos-mcp-hub") {
         return Ok(format!("Codex already has the Ronic hub marker ({})", path.display()));
     }
     let url = entry.get("url").and_then(|value| value.as_str()).unwrap_or("");
@@ -700,7 +700,7 @@ fn append_codex(entry: &Value) -> Result<String, String> {
     let mut file = fs::OpenOptions::new().append(true).open(&path).map_err(|error| error.to_string())?;
     writeln!(
         file,
-        "\n# omniworkspace-mcp-hub\n[mcp_servers.omni-workspace]\nurl = \"{url}\"\n\n[mcp_servers.omni-workspace.http_headers]\nAuthorization = \"Bearer {token}\"\n"
+        "\n# ronicos-mcp-hub\n[mcp_servers.ronic-os]\nurl = \"{url}\"\n\n[mcp_servers.ronic-os.http_headers]\nAuthorization = \"Bearer {token}\"\n"
     )
     .map_err(|error| error.to_string())?;
     Ok(format!("Codex config appended ({})", path.display()))
@@ -722,7 +722,7 @@ fn merge_opencode(entry: &Value) -> Result<String, String> {
     }
     backup(&crate::util::product_home(), &path);
     mcp.as_object_mut().unwrap().insert(
-        "omni-workspace".into(),
+        "ronic-os".into(),
         json!({
             "type": "remote",
             "url": entry.get("url").cloned().unwrap_or(Value::Null),
@@ -879,10 +879,10 @@ fn acp_rpc(app: &AppHandle, body: &[u8]) -> Vec<u8> {
     let result = match method {
         "initialize" | "ping" => Ok(json!({
             "protocol": "acp-jsonrpc-2.0",
-            "methods": ["initialize", "ping", "session/prompt", "omni/askPeer"],
+            "methods": ["initialize", "ping", "session/prompt", "ronic/askPeer"],
             "note": "session/prompt stores a peer ticket. It does not stream a diff or start a PTY."
         })),
-        "session/prompt" | "omni/askPeer" => {
+        "session/prompt" | "ronic/askPeer" => {
             let params = parsed.get("params").cloned().unwrap_or_else(|| json!({}));
             let target = params.get("target").and_then(|value| value.as_str()).unwrap_or("claude_cli");
             let task = params.get("prompt").or_else(|| params.get("task")).and_then(|value| value.as_str()).unwrap_or("");
@@ -976,7 +976,7 @@ pub async fn get_webapp_mcp_context_bundle(state: State<'_, AppState>, origin: S
 }
 
 #[tauri::command]
-pub async fn omni_ask_peer_app(state: State<'_, AppState>, source: String, target: String, task: String) -> Result<Value, String> {
+pub async fn ronic_ask_peer_app(state: State<'_, AppState>, source: String, target: String, task: String) -> Result<Value, String> {
     let conn = state.conn.lock().unwrap_or_else(|poison| poison.into_inner());
     ask_peer(&conn, &state.home, source.trim(), target.trim(), task.trim())
 }
@@ -988,7 +988,7 @@ mod tests {
 
     #[test]
     fn peer_ticket_is_stored_and_does_not_claim_a_launch() {
-        let dir = std::env::temp_dir().join(format!("omni-mesh-peer-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ronic-mesh-peer-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let conn = Connection::open_in_memory().unwrap();
@@ -1003,7 +1003,7 @@ mod tests {
 
     #[test]
     fn unknown_peer_is_rejected() {
-        let dir = std::env::temp_dir().join(format!("omni-mesh-unknown-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ronic-mesh-unknown-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let conn = Connection::open_in_memory().unwrap();
@@ -1014,7 +1014,7 @@ mod tests {
 
     #[test]
     fn code_mode_defaults_on() {
-        let dir = std::env::temp_dir().join(format!("omni-mesh-flags-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ronic-mesh-flags-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         assert!(code_mode_enabled(&dir));
@@ -1025,14 +1025,14 @@ mod tests {
 
     #[test]
     fn webapp_status_never_claims_mcp_from_a_profile_folder() {
-        let dir = std::env::temp_dir().join(format!("omni-mesh-webapp-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ronic-mesh-webapp-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         // A folder that only proves the window was once opened must not read
         // as an MCP connection.
         let (_, _, never_opened) = webapp_status(&dir, "chatgpt", "https://chatgpt.com");
         assert_eq!(never_opened, "Not opened yet");
-        let profile = crate::site_window::profile_dir(&dir, "omni_webapp_chatgpt");
+        let profile = crate::site_window::profile_dir(&dir, "ronic_webapp_chatgpt");
         fs::create_dir_all(profile.join("EBWebView")).unwrap();
         let (_, _, opened) = webapp_status(&dir, "chatgpt", "https://chatgpt.com");
         assert!(opened.contains("no sign-in signal"), "got: {opened}");

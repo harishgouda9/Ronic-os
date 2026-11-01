@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-attest-delegation-contract"
+description = "Enables the attest_delegation_contract command without any pre-configured scope."
+commands.allow = ["attest_delegation_contract"]
+
+[[permission]]
+identifier = "deny-attest-delegation-contract"
+description = "Denies the attest_delegation_contract command without any pre-configured scope."
+commands.deny = ["attest_delegation_contract"]

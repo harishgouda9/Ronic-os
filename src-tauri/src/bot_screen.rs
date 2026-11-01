@@ -1,7 +1,7 @@
 //! Each bot's private browser and workspace.
 //!
-//! The browser profile is ~/.omniworkspace/bots/<id>/browser.
-//! The shell cwd is ~/.omniworkspace/bots/<id>/workspace.
+//! The browser profile is ~/.ronicos/bots/<id>/browser.
+//! The shell cwd is ~/.ronicos/bots/<id>/workspace.
 //! One webview is shown. The others stay hidden and keep their own pages.
 
 use crate::db::kv_set;
@@ -117,7 +117,6 @@ struct RawNode {
 
 enum Present {
     Show { bounds: WebAppBounds, focus: bool },
-    Drive,
 }
 
 pub fn browser_dir(home: &Path, id: &str) -> Result<PathBuf> {
@@ -210,55 +209,11 @@ pub fn hide_column(app: &AppHandle) {
     hide_labels(app, "");
 }
 
-pub fn open_and_read(app: &AppHandle, home: &Path, id: &str, url: &str) -> Result<ScreenHit> {
-    let status = prepare(app, home, id, url, Present::Drive)?;
-    if status.refused {
-        return Err(err("That local server is not running."));
-    }
-    read_bot(app, id, Some(&status.url))
-}
-
 pub fn read_bot(app: &AppHandle, id: &str, expected: Option<&str>) -> Result<ScreenHit> {
     let view = view_for(app, id)?;
     let started = Instant::now();
     let page = wait_read(&view, expected)?;
     finish_hit(page, expected.unwrap_or(""), started)
-}
-
-pub fn click_bot(app: &AppHandle, id: &str, node: i64) -> Result<ScreenHit> {
-    if !(1..=40).contains(&node) {
-        return Err(err("that control is not on this page"));
-    }
-    let view = view_for(app, id)?;
-    let value = eval_value(&view, &click_js(node))?;
-    if !value.get("ok").and_then(|item| item.as_bool()).unwrap_or(false) {
-        let message = value.get("error").and_then(|item| item.as_str()).unwrap_or("could not click");
-        return Err(err(message));
-    }
-    thread::sleep(Duration::from_millis(300));
-    let started = Instant::now();
-    let page = wait_read(&view, None)?;
-    finish_hit(page, "", started)
-}
-
-pub fn type_bot(app: &AppHandle, id: &str, node: i64, text: &str) -> Result<ScreenHit> {
-    if !(1..=40).contains(&node) {
-        return Err(err("that control is not on this page"));
-    }
-    let text = prefix_utf8(text, 2000);
-    if text.is_empty() {
-        return Err(err("type the text to enter"));
-    }
-    let view = view_for(app, id)?;
-    let value = eval_value(&view, &type_js(node, text))?;
-    if !value.get("ok").and_then(|item| item.as_bool()).unwrap_or(false) {
-        let message = value.get("error").and_then(|item| item.as_str()).unwrap_or("could not type");
-        return Err(err(message));
-    }
-    thread::sleep(Duration::from_millis(300));
-    let started = Instant::now();
-    let page = wait_read(&view, None)?;
-    finish_hit(page, "", started)
 }
 
 fn finish_hit(page: RawRead, expected: &str, started: Instant) -> Result<ScreenHit> {
@@ -280,7 +235,7 @@ fn prepare(app: &AppHandle, home: &Path, id: &str, url: &str, present: Present) 
         if let Some(view) = app.get_webview(&label) {
             let _ = view.hide();
         }
-        clear_shown_if(&id, matches!(present, Present::Show { .. }));
+        clear_shown_if(&id, true);
         return Ok(BotScreenStatus { showing: false, refused: false, url: String::new() });
     }
     let parsed = page_url(trimmed)?;
@@ -289,14 +244,13 @@ fn prepare(app: &AppHandle, home: &Path, id: &str, url: &str, present: Present) 
         if let Some(view) = app.get_webview(&label) {
             let _ = view.hide();
         }
-        clear_shown_if(&id, matches!(present, Present::Show { .. }));
+        clear_shown_if(&id, true);
         return Ok(BotScreenStatus { showing: false, refused: true, url: parsed.to_string() });
     }
     let _guard = screen_lock();
     let window = app.get_window("main").ok_or_else(|| err("main window is not open"))?;
     let bounds = match present {
         Present::Show { bounds, .. } => Some(bounds.clamped()),
-        Present::Drive => None,
     };
     if app.get_webview(&label).is_none() {
         create_view(app, &window, home, &id, &label, parsed.clone(), bounds)?;
@@ -316,15 +270,6 @@ fn prepare(app: &AppHandle, home: &Path, id: &str, url: &str, present: Present) 
                 let _ = view.set_focus();
             }
             Ok(BotScreenStatus { showing: true, refused: false, url: parsed.to_string() })
-        }
-        Present::Drive => {
-            let visible = shown_id().as_str() == id;
-            if visible {
-                view.show().map_err(|error| err(error.to_string()))?;
-            } else {
-                let _ = view.hide();
-            }
-            Ok(BotScreenStatus { showing: visible, refused: false, url: parsed.to_string() })
         }
     }
 }
@@ -372,7 +317,7 @@ fn note_page(app: &AppHandle, id: &str, url: &str) {
     }
     if let Some(window) = app.get_webview_window("main") {
         let detail = serde_json::json!({ "id": id, "url": url });
-        let _ = window.eval(format!("window.dispatchEvent(new CustomEvent('omni-bot-screen', {{ detail: {detail} }}))"));
+        let _ = window.eval(format!("window.dispatchEvent(new CustomEvent('ronic-bot-screen', {{ detail: {detail} }}))"));
     }
     let state = app.state::<AppState>();
     let conn = state.conn.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -434,7 +379,7 @@ fn wait_read(view: &tauri::Webview, expected: Option<&str>) -> Result<RawRead> {
         if started.elapsed() >= Duration::from_secs(8) {
             break;
         }
-        thread::sleep(Duration::from_millis(250));
+        thread::sleep(Duration::from_millis(120));
     }
     last.ok_or_else(|| err("the page did not answer"))
 }
@@ -475,53 +420,12 @@ fn parse_eval(raw: &str) -> Result<Value> {
     Ok(value)
 }
 
-fn click_js(id: i64) -> String {
-    let index = id - 1;
-    format!(
-        r#"(function(){{
-  try {{
-    var list = document.querySelectorAll("a,button,input,select,textarea");
-    var el = list[{index}];
-    if (!el) return {{ ok: false, error: "no control" }};
-    el.click();
-    return {{ ok: true, error: "" }};
-  }} catch (error) {{
-    return {{ ok: false, error: String(error) }};
-  }}
-}})()"#
-    )
-}
-
-fn type_js(id: i64, text: &str) -> String {
-    let index = id - 1;
-    let encoded = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".into());
-    format!(
-        r#"(function(){{
-  try {{
-    var list = document.querySelectorAll("a,button,input,select,textarea");
-    var el = list[{index}];
-    if (!el) return {{ ok: false, error: "no control" }};
-    var tag = String(el.tagName || "").toLowerCase();
-    if (tag !== "input" && tag !== "textarea") return {{ ok: false, error: "not a text field" }};
-    var text = {encoded};
-    el.focus();
-    el.value = text;
-    el.dispatchEvent(new Event("input", {{ bubbles: true }}));
-    el.dispatchEvent(new Event("change", {{ bubbles: true }}));
-    return {{ ok: true, error: "" }};
-  }} catch (error) {{
-    return {{ ok: false, error: String(error) }};
-  }}
-}})()"#
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn home() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("omni-bot-screen-{}-{}", std::process::id(), crate::util::now_ms()));
+        let dir = std::env::temp_dir().join(format!("ronic-bot-screen-{}-{}", std::process::id(), crate::util::now_ms()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir

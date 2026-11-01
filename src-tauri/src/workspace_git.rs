@@ -7,7 +7,6 @@ use rusqlite::params;
 use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
 pub fn perform(state: &AppState, action: &str, path: &str, agent: &str, prompt: &str) -> Result<(String, Value)> {
@@ -143,6 +142,9 @@ fn stage(cwd: &Path, path: &str, state: &AppState) -> Result<(String, Value)> {
 
 fn restore(cwd: &Path, path: &str, state: &AppState) -> Result<(String, Value)> {
     let rel = safe_rel(path)?;
+    if working_tree_entries(cwd)?.into_iter().any(|entry| same_rel(&entry.path, &rel) && entry.untracked) {
+        return Err(err("This file is new. Restore only puts a tracked file back. It was left on disk."));
+    }
     let (code, output) = run_capture(
         git_bin().as_str(),
         &["restore", "--source=HEAD", "--worktree", "--staged", "--", &rel],
@@ -170,37 +172,43 @@ fn dispatch(state: &AppState, cwd: &Path, agent: &str, prompt: &str, binary: &st
         if path.is_empty() || !Path::new(path).is_file() {
             return Err(err(format!("{agent} is not installed. Scan this computer, or set the program path.")));
         }
-        let mut cmd = Command::new(path);
-        cmd.arg(cwd);
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x08000000);
+        if agent == "cursor" {
+            if let Some(agent_bin) = cursor_agent_program(path) {
+                let program = agent_bin.display().to_string();
+                return run_cli(state, cwd, agent, &program, vec!["-p".into(), prompt_for_program(&program, prompt)?]);
+            }
         }
-        match cmd.spawn() {
-            Ok(child) => Ok((format!("Opened {agent} at pid {} on {}.", child.id(), cwd.display()), json!({ "files": [] }))),
-            Err(error) => Err(err(format!("could not open {agent}: {error}"))),
-        }
+        crate::workspace_apps::open_program_at(Path::new(path), Some(cwd))
+            .map_err(|error| err(format!("could not open {agent}: {}", error.0)))?;
+        let files = working_tree(cwd).unwrap_or_default();
+        Ok((
+            format!("Opened {agent} in {}. The task is in the run log. Paste it into the editor chat.", cwd.display()),
+            json!({ "files": files, "output": prompt, "opened": true }),
+        ))
     } else {
         let program = resolve_cli(binary)?;
-        let args = agent_args(agent, prompt)?;
-        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        announce(state, &format!("$ {program} {}", args.join(" ")));
-        let app = state.app_handle.lock().ok().and_then(|g| g.clone());
-        let app_stream = app.clone();
-        let (code, output) = run_capture_stream(&program, &arg_refs, Some(cwd), Duration::from_secs(180), move |chunk| {
-            if let Some(app) = &app_stream {
-                broadcast_to_terminal(app, chunk);
-            }
-        })?;
-        let files = working_tree(cwd).unwrap_or_default();
-        let toast = if code == 0 {
-            format!("{agent} finished. The working tree is refreshed.")
-        } else {
-            format!("{agent} exited {code}. The working tree is refreshed.")
-        };
-        Ok((toast, json!({ "files": files, "output": clip_block(&output), "exitCode": code })))
+        let args = agent_args(agent, &prompt_for_program(&program, prompt)?)?;
+        run_cli(state, cwd, agent, &program, args)
     }
+}
+
+fn run_cli(state: &AppState, cwd: &Path, agent: &str, program: &str, args: Vec<String>) -> Result<(String, Value)> {
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    announce(state, &format!("$ {program} {}", args.join(" ")));
+    let app = state.app_handle.lock().ok().and_then(|guard| guard.clone());
+    let app_stream = app.clone();
+    let (code, output) = run_capture_stream(program, &arg_refs, Some(cwd), Duration::from_secs(480), move |chunk| {
+        if let Some(app) = &app_stream {
+            broadcast_to_terminal(app, chunk);
+        }
+    })?;
+    let files = working_tree(cwd).unwrap_or_default();
+    let toast = if code == 0 {
+        format!("{agent} finished. The working tree is refreshed.")
+    } else {
+        format!("{agent} exited {code}. The working tree is refreshed.")
+    };
+    Ok((toast, json!({ "files": files, "output": clip_block(&output), "exitCode": code, "program": program })))
 }
 
 fn working_tree(cwd: &Path) -> Result<Vec<Value>> {
@@ -213,7 +221,10 @@ fn working_tree(cwd: &Path) -> Result<Vec<Value>> {
     }
     let entries = parse_porcelain_z(&output);
     let mut files = Vec::new();
-    for (path, staged) in entries.into_iter().take(40) {
+    for entry in entries.into_iter().take(40) {
+        let path = entry.path;
+        let staged = entry.staged;
+        let untracked = entry.untracked;
         if secret_path(&path) {
             files.push(json!({
                 "path": path,
@@ -237,7 +248,11 @@ fn working_tree(cwd: &Path) -> Result<Vec<Value>> {
             diff.push_str(&unstaged);
         }
         if diff.trim().is_empty() {
-            diff = "(no text diff — binary, untracked, or already matching HEAD)".into();
+            diff = if untracked {
+                untracked_preview(cwd, &path)
+            } else {
+                "(no text diff — binary, or already matching HEAD)".into()
+            };
         }
         let (additions, deletions) = count_diff(&diff);
         files.push(json!({
@@ -259,7 +274,24 @@ fn git_diff(cwd: &Path, args: &[&str]) -> Result<String> {
     Ok(output)
 }
 
-fn parse_porcelain_z(text: &str) -> Vec<(String, bool)> {
+struct GitEntry {
+    path: String,
+    staged: bool,
+    untracked: bool,
+}
+
+fn working_tree_entries(cwd: &Path) -> Result<Vec<GitEntry>> {
+    if !cwd.join(".git").exists() {
+        return Err(err(format!("{} is not a git checkout", cwd.display())));
+    }
+    let (code, output) = run_capture(git_bin().as_str(), &["status", "--porcelain", "-z"], Some(cwd), Duration::from_secs(20))?;
+    if code != 0 {
+        return Err(err(clip_line(&output)));
+    }
+    Ok(parse_porcelain_z(&output))
+}
+
+fn parse_porcelain_z(text: &str) -> Vec<GitEntry> {
     let mut out = Vec::new();
     let parts: Vec<&str> = text.split('\0').filter(|part| !part.is_empty()).collect();
     let mut index = 0;
@@ -276,9 +308,10 @@ fn parse_porcelain_z(text: &str) -> Vec<(String, bool)> {
             index += 1;
             path = parts[index].to_string();
         }
+        let untracked = xy[0] == b'?' && xy[1] == b'?';
         let staged = xy[0] != b' ' && xy[0] != b'?';
         if !path.is_empty() {
-            out.push((path, staged));
+            out.push(GitEntry { path, staged, untracked });
         }
         index += 1;
     }
@@ -294,6 +327,117 @@ fn agent_args(agent: &str, prompt: &str) -> Result<Vec<String>> {
         "opencode" => Ok(vec!["run".into(), prompt.into()]),
         _ => Err(err("that agent cannot be dispatched from this screen")),
     }
+}
+
+fn prompt_for_program(program: &str, prompt: &str) -> Result<String> {
+    let lower = program.to_ascii_lowercase();
+    let script = lower.ends_with(".cmd") || lower.ends_with(".bat");
+    if !script || !prompt_needs_file(prompt) {
+        return Ok(prompt.to_string());
+    }
+    let path = write_task_file(prompt)?;
+    Ok(format!("Read the task in {} and carry it out in this project.", path.display()))
+}
+
+fn prompt_needs_file(prompt: &str) -> bool {
+    prompt.chars().any(|ch| matches!(ch, '"' | '%' | '&' | '|' | '<' | '>' | '^' | '!' | '\n' | '\r'))
+}
+
+fn write_task_file(prompt: &str) -> Result<PathBuf> {
+    let dir = std::env::temp_dir();
+    if let Ok(entries) = fs::read_dir(&dir) {
+        let cutoff = std::time::SystemTime::now() - Duration::from_secs(86_400);
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !(name.starts_with("ronic-task-") && name.ends_with(".txt")) {
+                continue;
+            }
+            let old = entry.metadata().ok().and_then(|meta| meta.modified().ok());
+            if old.is_some_and(|stamp| stamp < cutoff) {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+    let path = dir.join(format!("ronic-task-{}.txt", crate::util::now_ms()));
+    let text = path.display().to_string();
+    if text.chars().any(|ch| matches!(ch, '"' | '%' | '&' | '|' | '<' | '>' | '^' | '!' | '\n' | '\r')) {
+        return Err(err("the temp folder path cannot be passed to a Windows script"));
+    }
+    fs::write(&path, prompt).map_err(|error| err(error.to_string()))?;
+    Ok(path)
+}
+
+fn cursor_agent_program(cursor_binary: &str) -> Option<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(parent) = Path::new(cursor_binary).parent() {
+        dirs.push(parent.to_path_buf());
+        dirs.push(parent.join("resources").join("app").join("bin"));
+    }
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        let base = PathBuf::from(local);
+        dirs.push(base.join("cursor-agent"));
+        dirs.push(base.join("Programs").join("cursor-agent"));
+    }
+    if let Some(profile) = std::env::var_os("USERPROFILE") {
+        let home = PathBuf::from(profile);
+        dirs.push(home.join(".cursor").join("bin"));
+        dirs.push(home.join(".local").join("bin"));
+    }
+    for dir in dirs {
+        for name in ["cursor-agent.exe", "cursor-agent.cmd", "agent.exe", "agent.cmd"] {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+fn untracked_preview(cwd: &Path, rel: &str) -> String {
+    let full = cwd.join(rel);
+    let Ok(root) = cwd.canonicalize() else {
+        return "(project folder is not readable)".into();
+    };
+    let Ok(full) = full.canonicalize() else {
+        return "(untracked file is not readable)".into();
+    };
+    if !full.starts_with(&root) {
+        return "(path is outside the project)".into();
+    }
+    let Ok(meta) = fs::metadata(&full) else {
+        return "(untracked file is not readable)".into();
+    };
+    if meta.is_dir() {
+        return "(untracked directory)".into();
+    }
+    if meta.len() > 200_000 {
+        return format!("(untracked, {} bytes — contents not shown)", meta.len());
+    }
+    let Ok(bytes) = fs::read(&full) else {
+        return "(untracked file is not readable)".into();
+    };
+    if bytes.contains(&0) {
+        return "(untracked binary — contents not shown)".into();
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    if text.trim().is_empty() {
+        return "(empty new file)".into();
+    }
+    let mut out = String::from("--- untracked\n+++ untracked\n");
+    let mut shown = 0usize;
+    for line in text.lines() {
+        if shown == 180 {
+            out.push_str("+… truncated\n");
+            break;
+        }
+        out.push('+');
+        out.push_str(line);
+        out.push('\n');
+        shown += 1;
+    }
+    out
 }
 
 fn resolve_cli(binary: &str) -> Result<String> {
@@ -332,6 +476,10 @@ fn app_path(conn: &rusqlite::Connection, id: &str) -> String {
 
 fn git_bin() -> String {
     which("git").or_else(|| which("git.exe")).unwrap_or_else(|| "git".into())
+}
+
+fn same_rel(left: &str, right: &str) -> bool {
+    left.replace('\\', "/") == right.replace('\\', "/")
 }
 
 fn safe_rel(raw: &str) -> Result<String> {
@@ -459,4 +607,30 @@ fn clip_block(text: &str) -> String {
 
 fn guard(state: &AppState) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
     state.conn.lock().unwrap_or_else(|error| error.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn porcelain_keeps_the_new_name_and_marks_untracked() {
+        let entries = parse_porcelain_z(" M src/a.ts\0?? new file.ts\0R  old.ts\0src/new.ts\0");
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].path, "src/a.ts");
+        assert!(!entries[0].staged);
+        assert!(!entries[0].untracked);
+        assert_eq!(entries[1].path, "new file.ts");
+        assert!(entries[1].untracked);
+        assert!(!entries[1].staged);
+        assert_eq!(entries[2].path, "src/new.ts");
+        assert!(entries[2].staged);
+    }
+
+    #[test]
+    fn a_plain_prompt_stays_on_the_command_line() {
+        assert!(!prompt_needs_file("fix the login button"));
+        assert!(prompt_needs_file("use \"strict\" & tests"));
+        assert!(prompt_needs_file("line\ntwo"));
+    }
 }

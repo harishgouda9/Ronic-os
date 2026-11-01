@@ -1,14 +1,15 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { ArrowLeft, Play, RefreshCw, CheckCircle2, Search, Zap, Shield, Sparkles, Sliders, BookOpen, Terminal } from "lucide-react";
 import type { Step } from "../types";
 import { isTauri } from "../api";
-import { useOmni } from "../store";
+import { useRonic } from "../store";
 
 const COMPONENTS: [string, string][] = [
   ["system_prompt", "System prompt (SOUL.md)"],
   ["guardrails", "Soft guardrails"],
   ["memory", "Memory"],
-  ["tool_guidance", "Tool guidance (omni.d.ts)"],
+  ["tool_guidance", "Tool guidance (ronic.d.ts)"],
   ["subagents", "Subagents (#squad)"],
   ["skills", "Skills (SKILL.md)"],
   ["scripts", "Scripts"],
@@ -76,35 +77,30 @@ type LibraryEntry = {
   sourceRunId: string;
 };
 
-const FLAG_EVENT = "omni-harness2-flags";
-
-function publish(status: HarnessStatus) {
-  window.dispatchEvent(new CustomEvent(FLAG_EVENT, { detail: status }));
-}
+const FLAG_EVENT = "ronic-harness2-flags";
 
 async function saveFlags(patch: Record<string, unknown>): Promise<HarnessStatus> {
-  const next = await invoke<HarnessStatus>("harness2_set_flags", { patch });
-  publish(next);
-  return next;
+  const status = await invoke<HarnessStatus>("harness2_set_flags", { patch });
+  window.dispatchEvent(new CustomEvent(FLAG_EVENT, { detail: status }));
+  return status;
 }
 
-export function SuperchargeControl({ compact = false }: { compact?: boolean }) {
+export function SuperchargeControl({ compact }: { compact?: boolean } = {}) {
   const desktop = isTauri();
-  const steps = useOmni((s) => s.snap?.steps ?? []);
   const [status, setStatus] = useState<HarnessStatus | null>(null);
   const [busy, setBusy] = useState(false);
-  const latest = [...steps].reverse().find((step) => step.actionType === "harness2_pipeline");
-  const card = latest ? (latest.actionPayload as Partial<RunCard>) : null;
 
   useEffect(() => {
     if (!desktop) return;
     let alive = true;
-    invoke<HarnessStatus>("harness2_status")
-      .then((next) => { if (alive) setStatus(next); })
-      .catch(() => { if (alive) setStatus(null); });
+    void invoke<HarnessStatus>("harness2_status")
+      .then((s) => {
+        if (alive) setStatus(s);
+      })
+      .catch(() => {});
     const onFlags = (event: Event) => {
       const detail = (event as CustomEvent<HarnessStatus>).detail;
-      if (detail) setStatus(detail);
+      if (detail && alive) setStatus(detail);
     };
     window.addEventListener(FLAG_EVENT, onFlags);
     return () => {
@@ -113,36 +109,41 @@ export function SuperchargeControl({ compact = false }: { compact?: boolean }) {
     };
   }, [desktop]);
 
-  const mode = status?.flags.mode ?? "auto";
-  const label = mode === "force" ? "Force ON" : mode === "off" ? "Off" : "Auto";
-  const live = card && mode !== "off" ? `Score ${card.score ?? 0}/100 · k=${card.budgetK ?? status?.flags.budgetK ?? 1}` : "";
+  const flags = status?.flags;
+  const mode = flags?.mode ?? "off";
 
   async function setMode(next: string) {
-    if (!desktop) return;
+    if (!desktop || busy) return;
     setBusy(true);
     try {
-      setStatus(await saveFlags({ mode: next }));
+      const saved = await saveFlags({ mode: next });
+      setStatus(saved);
     } finally {
       setBusy(false);
     }
   }
 
+  if (!desktop) return null;
+
   return (
-    <label className={`flex items-center gap-1 rounded-[6px] border border-[#E5E5E5] bg-white px-2 py-1 text-[11px] font-semibold text-[#111111] ${compact ? "" : ""}`} title={desktop ? "Supercharge records a local plan. It does not start a model probe." : "Supercharge runs in the desktop app."}>
-      <span>Supercharge</span>
-      <select
-        aria-label="Supercharge mode"
-        className="bg-transparent text-[11px] font-semibold"
-        value={mode}
-        disabled={!desktop || busy}
-        onChange={(event) => void setMode(event.target.value)}
-      >
-        <option value="auto">Auto</option>
-        <option value="force">Force ON</option>
-        <option value="off">Off</option>
-      </select>
-      {compact ? null : <span className="font-normal text-[#64748B]">{label}{live ? ` · ${live}` : ""}</span>}
-    </label>
+    <div className={`flex items-center ${compact ? "gap-1 shrink-0" : "gap-1.5"}`} title="Harness² Supercharge self-supervision">
+      <span className={`${compact ? "text-[10px]" : "text-[11px]"} font-semibold text-slate-500`}>Supercharge:</span>
+      {(["off", "auto", "force"] as const).map((m) => (
+        <button
+          key={m}
+          type="button"
+          disabled={busy}
+          onClick={() => void setMode(m)}
+          className={`${compact ? "px-2 py-0.5 text-[10px]" : "px-2.5 py-1 text-[11px]"} font-semibold rounded-full border transition cursor-pointer ${
+            mode === m
+              ? "bg-zinc-800 text-white border-zinc-700 shadow-xs"
+              : "bg-slate-100 text-slate-600 border-slate-200 hover:bg-slate-200/80"
+          }`}
+        >
+          {m.toUpperCase()}
+        </button>
+      ))}
+    </div>
   );
 }
 
@@ -172,43 +173,68 @@ export function Harness2PipelineCard({ step }: { step: Step }) {
 
   const components = card.components ?? [];
   return (
-    <article className="step tool-card">
-      <div className="between">
-        <strong>Supercharge (Harness²)</strong>
-        <span className="faint">{card.trigger || "plan"}</span>
+    <article className="rounded-2xl border border-slate-200/90 bg-white p-5 shadow-xs space-y-3">
+      <div className="flex items-center justify-between border-b border-slate-100 pb-2.5">
+        <div className="flex items-center gap-2">
+          <Zap size={15} className="text-violet-600" />
+          <strong className="text-slate-900 font-bold text-xs">Supercharge (Harness²)</strong>
+        </div>
+        <span className="text-[11px] font-mono text-slate-400">{card.trigger || "plan"}</span>
       </div>
-      <p className="step-copy">
+      <p className="text-xs text-slate-600 leading-relaxed">
         {card.trigger === "auto_mid_run_error"
           ? "Mid-run error recorded. No second model was started."
           : `Local score ${card.score ?? 0}/100. ${card.recursion || "parallel"} · k=${card.budgetK ?? 1}.`}
         {" "}Editor: {card.editor || "Local plan only"}. Executor: {card.executor || "not started"}.
       </p>
-      <div className="grid gap-2 md:grid-cols-3">
-        <section className="rounded-[6px] border border-[#E5E5E5] bg-[#FAFAFA] p-2">
-          <h3 className="text-xs font-semibold">1. Propose</h3>
-          <p className="mt-1 text-xs text-[#64748B]">{components.length ? components.join(", ") : "No components recorded."}</p>
+      <div className="grid gap-2.5 md:grid-cols-3">
+        <section className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+          <h4 className="text-xs font-bold text-slate-800">1. Propose</h4>
+          <p className="mt-1 text-[11px] text-slate-500">{components.length ? components.join(", ") : "No components recorded."}</p>
         </section>
-        <section className="rounded-[6px] border border-[#E5E5E5] bg-[#FAFAFA] p-2">
-          <h3 className="text-xs font-semibold">2. Contrastive probe</h3>
-          <p className="mt-1 text-xs text-[#64748B]">{card.probesExecuted ? "A local process exited 0." : "Probes were not executed."}</p>
+        <section className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+          <h4 className="text-xs font-bold text-slate-800">2. Contrastive probe</h4>
+          <p className="mt-1 text-[11px] text-slate-500">{card.probesExecuted ? "A local process exited 0." : "Probes were not executed."}</p>
         </section>
-        <section className="rounded-[6px] border border-[#E5E5E5] bg-[#FAFAFA] p-2">
-          <h3 className="text-xs font-semibold">3. Compose and reflect</h3>
-          <p className="mt-1 text-xs text-[#64748B]">{card.soulUntouched === false ? "The plan was appended to the base soul." : "Base soul was not modified."} {card.adopted ? "Library updated." : "Library not updated yet."}</p>
+        <section className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+          <h4 className="text-xs font-bold text-slate-800">3. Compose &amp; reflect</h4>
+          <p className="mt-1 text-[11px] text-slate-500">{card.soulUntouched === false ? "The plan was appended to the base soul." : "Base soul was not modified."} {card.adopted ? "Library updated." : "Library not updated yet."}</p>
         </section>
       </div>
-      {card.probeNote ? <p className="mt-2 text-xs text-[#64748B]">{card.probeNote}</p> : null}
-      <div className="mt-2 flex flex-wrap gap-2">
-        <button type="button" className="btn small" disabled={!desktop || busy || !card.runId || card.adopted} onClick={() => void act("harness2_keep")}>{card.adopted ? "In the library" : "Keep in library"}</button>
-        <button type="button" className="btn ghost small" disabled={!desktop || busy || !card.runId || card.promoted} onClick={() => void act("harness2_promote")}>{card.promoted ? "On the base soul" : "Promote plan to base soul"}</button>
-        <button type="button" className="btn ghost small" disabled={!desktop || busy || !card.runId || card.soulUntouched !== false} onClick={() => void act("harness2_revert")}>Restore base soul</button>
+      {card.probeNote ? <p className="mt-2 text-xs text-slate-500">{card.probeNote}</p> : null}
+      <div className="mt-3 flex flex-wrap gap-2 pt-2 border-t border-slate-100">
+        <button
+          type="button"
+          disabled={!desktop || busy || !card.runId || card.adopted}
+          onClick={() => void act("harness2_keep")}
+          className="px-3.5 py-1.5 text-xs font-semibold bg-zinc-800 hover:bg-zinc-700 text-white rounded-full transition-all cursor-pointer shadow-xs disabled:opacity-40 border border-zinc-700/50"
+        >
+          {card.adopted ? "In the library" : "Keep in library"}
+        </button>
+        <button
+          type="button"
+          disabled={!desktop || busy || !card.runId || card.promoted}
+          onClick={() => void act("harness2_promote")}
+          className="px-3.5 py-1.5 text-xs font-semibold bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-full transition-all cursor-pointer border border-slate-200 disabled:opacity-40"
+        >
+          {card.promoted ? "On the base soul" : "Promote plan to base soul"}
+        </button>
+        <button
+          type="button"
+          disabled={!desktop || busy || !card.runId || card.soulUntouched !== false}
+          onClick={() => void act("harness2_revert")}
+          className="px-3.5 py-1.5 text-xs font-semibold bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-full transition-all cursor-pointer border border-slate-200 disabled:opacity-40"
+        >
+          Restore base soul
+        </button>
       </div>
-      {note ? <p className="mt-2 text-xs text-red-700">{note}</p> : null}
+      {note ? <p className="mt-2 text-xs text-rose-600">{note}</p> : null}
     </article>
   );
 }
 
 export default function Harness2Studio() {
+  const go = useRonic((s) => s.go);
   const desktop = isTauri();
   const [status, setStatus] = useState<HarnessStatus | null>(null);
   const [banner, setBanner] = useState(desktop ? "Loading Harness²." : "Install, the demo, and chat plans run in the desktop app.");
@@ -341,113 +367,308 @@ export default function Harness2Studio() {
   });
 
   return (
-    <div className="flex h-full min-h-0 flex-col gap-4 overflow-y-auto bg-[#FAFAFA] p-6 font-sans text-[#0F172A]">
-      <div className="rounded-[6px] border border-[#E5E5E5] bg-white p-4">
-        <div className="flex flex-wrap items-center gap-2">
-          <h1 className="text-lg font-bold tracking-tight">Harness²</h1>
-          <span className="rounded-full border border-[#E5E5E5] bg-[#F8FAFC] px-2 py-0.5 font-mono text-[11px] font-semibold">{badge}</span>
-        </div>
-        <p className="mt-2 max-w-3xl text-xs text-[#64748B]">
-          Supercharge scores a task on this machine and writes a plan into an empty sandbox. It does not start OpenCode, Codex, or Claude, and it does not copy the open project. The base soul changes only after Promote.
-        </p>
-        <p className="mt-2 font-mono text-xs text-emerald-800">{banner}</p>
-      </div>
+    <div className="flex-1 h-full bg-[#eceef2] p-3 sm:p-5 lg:p-6 overflow-y-auto select-none flex flex-col">
+      {/* ─── MODAL CONTAINER (MARKETPLACE DESIGN SYSTEM) ─── */}
+      <div className="w-full max-w-[1560px] flex-1 min-h-[660px] bg-white rounded-3xl shadow-[0_12px_40px_-8px_rgba(0,0,0,0.06),0_2px_8px_-1px_rgba(0,0,0,0.03)] border border-slate-200/70 flex flex-col mx-auto overflow-hidden transition-all duration-300">
+        
+        {/* ─── TOP HEADER ─── */}
+        <div className="p-5 sm:p-7 pb-4 space-y-4 border-b border-slate-100 bg-white">
+          <div className="flex items-center justify-between gap-4 flex-wrap">
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                onClick={() => go("chat")}
+                className="text-slate-500 hover:text-slate-800 hover:bg-slate-100 px-3 py-1.5 rounded-xl transition-colors cursor-pointer flex items-center gap-1.5 text-xs font-semibold"
+                title="Back to Chat (Alt+Left)"
+              >
+                <ArrowLeft size={15} />
+                <span>Back</span>
+              </button>
+              <div>
+                <div className="flex items-center gap-2.5 flex-wrap">
+                  <h1 className="text-lg sm:text-xl font-bold text-slate-900 tracking-tight">Harness² self-supervision studio</h1>
+                  <span className="inline-flex items-center gap-1.5 px-3 py-1 text-xs font-semibold rounded-full border bg-emerald-50 text-emerald-800 border-emerald-300 shadow-xs">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+                    {badge}
+                  </span>
+                  {banner && (
+                    <span className="inline-flex items-center gap-1.5 px-3 py-1 text-xs font-mono rounded-full border bg-slate-100 text-slate-700 border-slate-200 truncate max-w-md">
+                      {banner}
+                    </span>
+                  )}
+                </div>
+                <p className="text-xs text-slate-500 mt-1 max-w-2xl leading-relaxed">
+                  Supercharge scores task complexity on this machine and writes self-verifying execution plans into a local sandbox. Base souls are updated only after promotion.
+                </p>
+              </div>
+            </div>
 
-      <section className="rounded-[6px] border border-[#E5E5E5] bg-white p-4">
-        <h2 className="text-sm font-semibold">Engine</h2>
-        <p className="mt-1 text-xs text-[#64748B]">{status?.repoDir || "The checkout is created under the Ronic OS home when you install."}</p>
-        <div className="mt-3 flex flex-wrap gap-2">
-          <button type="button" className="rounded-[6px] bg-[#111111] px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-40" disabled={!desktop || busy} onClick={() => void install()}>Install or verify harness2</button>
-          <button type="button" className="rounded-[6px] border border-[#E5E5E5] px-3 py-1.5 text-xs font-semibold disabled:opacity-40" disabled={!desktop || busy || !status?.demoPresent} onClick={() => void check()}>Benchmark readiness (jb)</button>
-          <button type="button" className="rounded-[6px] border border-[#E5E5E5] px-3 py-1.5 text-xs font-semibold disabled:opacity-40" disabled={!desktop || busy || !status?.demoPresent} onClick={() => void runDemo()}>Run harness2-demo (--k 2)</button>
-        </div>
-        <p className="mt-2 text-xs text-[#64748B]">The demo button runs the upstream local demo only after install. It does not call a model API from Ronic OS.</p>
-        {log ? <pre className="pre mt-3 max-h-64 overflow-auto whitespace-pre-wrap">{log}</pre> : null}
-        {demo ? (
-          <div className="mt-3 rounded-[6px] border border-[#E5E5E5] bg-[#FAFAFA] p-3 text-xs">
-            <p>Exit evidence: {demo.probesExecuted ? "process exited 0" : "process did not exit 0"}.</p>
-            <p className="mt-1">{demo.probeNote}</p>
-            {demo.outputFiles.length ? <p className="mt-1 font-mono">Files: {demo.outputFiles.join(", ")}</p> : <p className="mt-1">No output files were listed.</p>}
+            {/* Quick Actions (Matte Black & Secondary) */}
+            <div className="flex items-center gap-2 flex-wrap">
+              <button
+                type="button"
+                disabled={!desktop || busy}
+                onClick={() => void install()}
+                className="px-4 py-2 text-xs font-semibold bg-zinc-800 hover:bg-zinc-700 text-white rounded-full transition-all cursor-pointer shadow-xs active:scale-95 disabled:opacity-40 border border-zinc-700/50"
+              >
+                Install / Verify engine
+              </button>
+              <button
+                type="button"
+                disabled={!desktop || busy || !status?.demoPresent}
+                onClick={() => void check()}
+                className="px-4 py-2 text-xs font-semibold bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-full transition-all cursor-pointer border border-slate-200/80 disabled:opacity-40"
+              >
+                Benchmark readiness
+              </button>
+              <button
+                type="button"
+                disabled={!desktop || busy || !status?.demoPresent}
+                onClick={() => void runDemo()}
+                className="px-4 py-2 text-xs font-semibold bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-full transition-all cursor-pointer border border-slate-200/80 disabled:opacity-40"
+              >
+                Run demo (--k 2)
+              </button>
+            </div>
           </div>
-        ) : null}
-      </section>
+        </div>
 
-      <section className="rounded-[6px] border border-[#E5E5E5] bg-white p-4">
-        <h2 className="text-sm font-semibold">When it arms</h2>
-        <div className="mt-3 flex flex-wrap items-center gap-3 text-xs">
-          <label className="flex items-center gap-2">Recursion
-            <select aria-label="Recursion mode" disabled={!desktop || busy} value={flags?.recursion ?? "parallel"} onChange={(event) => void patch({ recursion: event.target.value })}>
-              <option value="parallel">Parallel</option>
-              <option value="sequential">Sequential</option>
-            </select>
-          </label>
-          <label className="flex items-center gap-2">Budget
-            <select aria-label="Budget k" disabled={!desktop || busy} value={String(flags?.budgetK ?? 1)} onChange={(event) => void patch({ budgetK: Number(event.target.value) })}>
-              <option value="1">k=1</option>
-              <option value="2">k=2</option>
-            </select>
-          </label>
-          <label className="flex items-center gap-2">Threshold {flags?.threshold ?? 65}
-            <input aria-label="Complexity threshold" type="range" min={0} max={100} disabled={!desktop || busy} value={flags?.threshold ?? 65} onChange={(event) => void patch({ threshold: Number(event.target.value) })} />
-          </label>
-          <label className="flex items-center gap-2">
-            <input type="checkbox" disabled={!desktop || busy} checked={flags?.escalate ?? true} onChange={(event) => void patch({ escalate: event.target.checked })} />
-            Note a failed terminal command
-          </label>
-        </div>
-        <div className="mt-3 flex flex-wrap gap-3 text-xs">
-          <label>Editor label
-            <input className="ml-2 rounded-[6px] border border-[#E5E5E5] px-2 py-1" disabled={!desktop || busy} value={flags?.editorLabel ?? "Local plan only"} onChange={(event) => void patch({ editorLabel: event.target.value })} />
-          </label>
-          <label>Substrate label
-            <select className="ml-2" aria-label="Executor substrate" disabled={!desktop || busy} value={flags?.substrate ?? "opencode"} onChange={(event) => void patch({ substrate: event.target.value })}>
-              <option value="opencode">OpenCode (not started)</option>
-              <option value="codex_cx">Codex (not started)</option>
-              <option value="claude_acp">Claude ACP (not started)</option>
-            </select>
-          </label>
-        </div>
-        <div className="mt-4 flex gap-2">
-          <textarea className="min-h-20 flex-1 rounded-[6px] border border-[#E5E5E5] p-2 font-mono text-xs" value={sample} onChange={(event) => setSample(event.target.value)} />
-          <button type="button" className="rounded-[6px] border border-[#111111] px-3 py-1.5 text-xs font-semibold disabled:opacity-40" disabled={!desktop || busy} onClick={() => void scoreSample()}>Score</button>
-        </div>
-        {score ? (
-          <p className="mt-2 text-xs">Score {score.value}/100. Auto would {score.armed ? "arm a plan" : "leave this in normal chat"}. {score.reasons.join(" ")}</p>
-        ) : null}
-      </section>
+        {/* ─── BODY (MULTI-SECTION CARDS) ─── */}
+        <div className="flex-1 overflow-y-auto p-5 sm:p-7 space-y-6 bg-white">
+          
+          {/* Card 1: Engine Execution & Logs */}
+          <div className="rounded-2xl border border-slate-200/90 bg-white p-5 sm:p-6 shadow-xs space-y-4">
+            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+              <div>
+                <h3 className="text-sm font-bold text-slate-900">Engine Environment &amp; Diagnostics</h3>
+                <p className="text-xs text-slate-500 mt-0.5 font-mono">
+                  {status?.repoDir || "Checkout location managed in local OS workspace."}
+                </p>
+              </div>
+              <span className="text-xs font-mono text-slate-500 bg-slate-50 px-2.5 py-0.5 rounded-full border border-slate-200">
+                uv sandbox
+              </span>
+            </div>
 
-      <section className="rounded-[6px] border border-[#E5E5E5] bg-white p-4">
-        <h2 className="text-sm font-semibold">Eight editable fields</h2>
-        <p className="mt-1 rounded-[6px] border border-[#E5E5E5] bg-[#F8FAFC] px-3 py-2 text-xs">Wallet caps and fail-closed gateway rules stay in the compiled kernel. This screen cannot change them.</p>
-        <div className="mt-3 grid gap-2 sm:grid-cols-2">
-          {COMPONENTS.map(([id, label]) => (
-            <label key={id} className="flex items-center gap-2 rounded-[6px] border border-[#E5E5E5] px-3 py-2 text-xs">
-              <input type="checkbox" disabled={!desktop || busy} checked={flags?.components?.includes(id) ?? true} onChange={() => toggleComponent(id)} />
-              {label}
-            </label>
-          ))}
-        </div>
-      </section>
+            {log && (
+              <div className="space-y-1">
+                <div className="text-xs font-semibold text-slate-500">Output Stream:</div>
+                <pre className="p-4 bg-[#1e2025] text-slate-200 rounded-2xl font-mono text-xs max-h-64 overflow-auto whitespace-pre-wrap shadow-inner">
+                  {log}
+                </pre>
+              </div>
+            )}
 
-      <section className="rounded-[6px] border border-[#E5E5E5] bg-white p-4">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <h2 className="text-sm font-semibold">Experience library ({status?.libraryCount ?? 0})</h2>
-          <input aria-label="Search library" className="rounded-[6px] border border-[#E5E5E5] px-2 py-1 text-xs" placeholder="Search lessons" value={query} onChange={(event) => setQuery(event.target.value)} />
+            {demo && (
+              <div className="p-4 bg-slate-50 border border-slate-200/90 rounded-2xl text-xs space-y-1.5">
+                <div className="font-bold text-slate-900 flex items-center gap-1.5">
+                  <CheckCircle2 size={14} className={demo.probesExecuted ? "text-emerald-600" : "text-amber-500"} />
+                  <span>Exit evidence: {demo.probesExecuted ? "Process exited 0 (Success)" : "Process exited with non-zero exit code"}</span>
+                </div>
+                <p className="text-slate-600">{demo.probeNote}</p>
+                {demo.outputFiles.length ? (
+                  <p className="font-mono text-[11px] text-slate-500">Output files: {demo.outputFiles.join(", ")}</p>
+                ) : (
+                  <p className="text-slate-400">No output files listed.</p>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Card 2: Arming Triggers & Evaluator */}
+          <div className="rounded-2xl border border-slate-200/90 bg-white p-5 sm:p-6 shadow-xs space-y-5">
+            <div className="border-b border-slate-100 pb-3">
+              <h3 className="text-sm font-bold text-slate-900">Trigger Conditions &amp; Live Evaluator</h3>
+              <p className="text-xs text-slate-500 mt-0.5">
+                Configure auto-supercharge arming criteria, complexity scoring thresholds, and executor substrates.
+              </p>
+            </div>
+
+            {/* Controls Bar */}
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-4 text-xs">
+              <div className="space-y-1">
+                <label className="font-semibold text-slate-700">Recursion</label>
+                <select
+                  aria-label="Recursion mode"
+                  disabled={!desktop || busy}
+                  value={flags?.recursion ?? "parallel"}
+                  onChange={(event) => void patch({ recursion: event.target.value })}
+                  className="w-full px-3 py-2 text-xs border border-slate-200 rounded-xl bg-slate-50 outline-none focus:ring-2 focus:ring-slate-200"
+                >
+                  <option value="parallel">Parallel</option>
+                  <option value="sequential">Sequential</option>
+                </select>
+              </div>
+
+              <div className="space-y-1">
+                <label className="font-semibold text-slate-700">Budget (k)</label>
+                <select
+                  aria-label="Budget k"
+                  disabled={!desktop || busy}
+                  value={String(flags?.budgetK ?? 1)}
+                  onChange={(event) => void patch({ budgetK: Number(event.target.value) })}
+                  className="w-full px-3 py-2 text-xs border border-slate-200 rounded-xl bg-slate-50 outline-none focus:ring-2 focus:ring-slate-200"
+                >
+                  <option value="1">k=1</option>
+                  <option value="2">k=2</option>
+                </select>
+              </div>
+
+              <div className="space-y-1">
+                <div className="flex justify-between font-semibold text-slate-700">
+                  <span>Threshold</span>
+                  <span className="font-mono">{flags?.threshold ?? 65}/100</span>
+                </div>
+                <input
+                  aria-label="Complexity threshold"
+                  type="range"
+                  min={0}
+                  max={100}
+                  disabled={!desktop || busy}
+                  value={flags?.threshold ?? 65}
+                  onChange={(event) => void patch({ threshold: Number(event.target.value) })}
+                  className="w-full mt-2"
+                />
+              </div>
+
+              <div className="space-y-1">
+                <label className="font-semibold text-slate-700">Substrate</label>
+                <select
+                  aria-label="Executor substrate"
+                  disabled={!desktop || busy}
+                  value={flags?.substrate ?? "opencode"}
+                  onChange={(event) => void patch({ substrate: event.target.value })}
+                  className="w-full px-3 py-2 text-xs border border-slate-200 rounded-xl bg-slate-50 outline-none focus:ring-2 focus:ring-slate-200"
+                >
+                  <option value="opencode">OpenCode (Local Plan)</option>
+                  <option value="codex_cx">Codex (CLI)</option>
+                  <option value="claude_acp">Claude ACP (Local)</option>
+                </select>
+              </div>
+            </div>
+
+            {/* Prompt Tester */}
+            <div className="space-y-2 pt-2 border-t border-slate-100">
+              <label className="block text-xs font-semibold text-slate-700">
+                Live Complexity Scoring Probe:
+              </label>
+              <div className="flex gap-2">
+                <textarea
+                  className="min-h-20 flex-1 rounded-2xl border border-slate-200 bg-slate-50 p-3 font-mono text-xs outline-none focus:bg-white focus:ring-2 focus:ring-slate-200 transition"
+                  value={sample}
+                  onChange={(event) => setSample(event.target.value)}
+                  placeholder="Enter a prompt to simulate complexity scoring..."
+                />
+                <button
+                  type="button"
+                  disabled={!desktop || busy}
+                  onClick={() => void scoreSample()}
+                  className="px-5 py-2 font-semibold text-xs bg-zinc-800 hover:bg-zinc-700 text-white rounded-2xl transition-all cursor-pointer shadow-xs active:scale-95 disabled:opacity-40 self-end border border-zinc-700/50"
+                >
+                  Score Prompt
+                </button>
+              </div>
+              {score && (
+                <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl text-xs flex items-center gap-2">
+                  <span className={`px-2.5 py-0.5 rounded-full font-mono font-bold text-xs ${score.armed ? "bg-emerald-50 text-emerald-800 border border-emerald-300" : "bg-slate-200 text-slate-700"}`}>
+                    Score {score.value}/100
+                  </span>
+                  <span className="text-slate-700">
+                    Auto-supercharge would {score.armed ? "arm a plan" : "leave this in normal chat"}. {score.reasons.join(" ")}
+                  </span>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Card 3: Scoped Components */}
+          <div className="rounded-2xl border border-slate-200/90 bg-white p-5 sm:p-6 shadow-xs space-y-4">
+            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+              <div>
+                <h3 className="text-sm font-bold text-slate-900">Scoped Evolutionary Components</h3>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Select which architectural layers are eligible for autonomous adaptation.
+                </p>
+              </div>
+              <span className="text-xs font-mono text-slate-500 bg-slate-50 px-2.5 py-0.5 rounded-full border border-slate-200">
+                8 Subsystems
+              </span>
+            </div>
+
+            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+              {COMPONENTS.map(([id, label]) => {
+                const active = flags?.components?.includes(id) ?? true;
+                return (
+                  <label
+                    key={id}
+                    className={`flex items-center gap-3 rounded-2xl border p-3 text-xs cursor-pointer transition select-none ${
+                      active
+                        ? "bg-slate-50/80 border-slate-300 text-slate-900 shadow-xs"
+                        : "bg-white border-slate-200 text-slate-500 hover:bg-slate-50"
+                    }`}
+                  >
+                    <input
+                      type="checkbox"
+                      disabled={!desktop || busy}
+                      checked={active}
+                      onChange={() => toggleComponent(id)}
+                      className="rounded"
+                    />
+                    <span className="font-semibold">{label}</span>
+                  </label>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Card 4: Experience Library */}
+          <div className="rounded-2xl border border-slate-200/90 bg-white p-5 sm:p-6 shadow-xs space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 pb-3">
+              <div>
+                <h3 className="text-sm font-bold text-slate-900">Experience Library ({status?.libraryCount ?? 0})</h3>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Learned reflection notes, domain adaptations, and verifiable behavioral evidence.
+                </p>
+              </div>
+              <div className="relative min-w-[220px]">
+                <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400" size={13} />
+                <input
+                  type="text"
+                  aria-label="Search library"
+                  value={query}
+                  onChange={(event) => setQuery(event.target.value)}
+                  placeholder="Search lessons…"
+                  className="w-full bg-slate-50 border border-slate-200 rounded-full pl-9 pr-3.5 py-1.5 text-xs text-slate-800 placeholder-slate-400 outline-none focus:bg-white focus:ring-2 focus:ring-slate-200 transition"
+                />
+              </div>
+            </div>
+
+            {visible.length === 0 ? (
+              <div className="py-12 text-center text-slate-400 text-xs">
+                No library entries found. Keep a plan to append EXPERIENCE.md and persistent memory notes.
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {visible.map((entry) => (
+                  <div key={entry.id} className="rounded-2xl border border-slate-200/80 bg-slate-50/60 p-4 text-xs space-y-1.5 hover:bg-slate-50 transition">
+                    <div className="flex items-center justify-between">
+                      <strong className="text-slate-900 font-bold">{entry.title}</strong>
+                      <span className="text-[11px] font-mono text-slate-500 bg-white px-2 py-0.5 rounded-full border border-slate-200">
+                        {entry.componentType} · {entry.domainTag}
+                      </span>
+                    </div>
+                    <p className="text-slate-700">{entry.whenToApplyRule}</p>
+                    <p className="text-slate-500">{entry.behavioralEvidence}</p>
+                    <p className="font-mono text-[11px] text-slate-400 truncate">{entry.artifactPathOrContent}</p>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
         </div>
-        {visible.length === 0 ? <p className="mt-3 text-xs text-[#64748B]">No library entries yet. Keep a plan to append EXPERIENCE.md and a Mem0 note.</p> : (
-          <ul className="mt-3 space-y-2">
-            {visible.map((entry) => (
-              <li key={entry.id} className="rounded-[6px] border border-[#E5E5E5] p-3 text-xs">
-                <strong>{entry.title}</strong>
-                <p className="text-[#64748B]">{entry.componentType} · {entry.domainTag}</p>
-                <p>{entry.whenToApplyRule}</p>
-                <p className="text-[#64748B]">{entry.behavioralEvidence}</p>
-                <p className="font-mono">{entry.artifactPathOrContent}</p>
-              </li>
-            ))}
-          </ul>
-        )}
-      </section>
+
+      </div>
     </div>
   );
 }

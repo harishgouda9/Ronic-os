@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-read-update-feed"
+description = "Enables the read_update_feed command without any pre-configured scope."
+commands.allow = ["read_update_feed"]
+
+[[permission]]
+identifier = "deny-read-update-feed"
+description = "Denies the read_update_feed command without any pre-configured scope."
+commands.deny = ["read_update_feed"]

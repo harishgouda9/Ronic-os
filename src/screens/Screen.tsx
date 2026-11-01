@@ -21,7 +21,7 @@ const Computer = lazy(() => import("./build").then((m) => ({ default: m.Computer
 const Workflows = lazy(() => import("./build").then((m) => ({ default: m.Workflows })));
 const Market = lazy(() => import("./market").then((m) => ({ default: m.Market })));
 const Wallet = lazy(() => import("../components/RonicWalletAndQuantTerminal"));
-const Extensions = lazy(() => import("./ops").then((m) => ({ default: m.Extensions })));
+const ProfileScreen = lazy(() => import("./ops").then((m) => ({ default: m.ProfileScreen })));
 const Repair = lazy(() => import("../components/RonicSelfRepairAndSentinels"));
 const Billing = lazy(() => import("./plan").then((m) => ({ default: m.PlanHub })));
 const SettingsScreen = lazy(() => import("./settings").then((m) => ({ default: m.SettingsScreen })));
@@ -83,7 +83,7 @@ function render(screen: string) {
     case "wallet":
       return <Wallet />;
     case "extensions":
-      return <Extensions />;
+      return <ProfileScreen />;
     case "repair":
       return <Repair />;
     case "billing":

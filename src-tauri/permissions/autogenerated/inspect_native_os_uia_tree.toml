@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-inspect-native-os-uia-tree"
+description = "Enables the inspect_native_os_uia_tree command without any pre-configured scope."
+commands.allow = ["inspect_native_os_uia_tree"]
+
+[[permission]]
+identifier = "deny-inspect-native-os-uia-tree"
+description = "Denies the inspect_native_os_uia_tree command without any pre-configured scope."
+commands.deny = ["inspect_native_os_uia_tree"]

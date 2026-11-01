@@ -29,6 +29,7 @@ pub fn load(conn: &Connection, meta: &Meta) -> Result<Snapshot> {
         None => Vec::new(),
     };
     let caps = crate::capabilities::view(conn, Path::new(&meta.home), &active_profile)?;
+    let delegation = crate::chief_delegation::load_view(conn)?;
     let mut market = catalog();
     for item in &mut market {
         let clean_slug = item.slug.trim_start_matches('/');
@@ -43,6 +44,16 @@ pub fn load(conn: &Connection, meta: &Meta) -> Result<Snapshot> {
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
     let dom_latency_ms = db::kv_get(conn, "dom_latency_ms")?.and_then(|s| s.parse().ok()).unwrap_or(0);
+    let turn_activity: String = match &active_thread {
+        Some(id) => conn
+            .query_row(
+                "SELECT content_markdown FROM execution_steps WHERE thread_id = ?1 AND action_type = 'turn_activity' AND created_at >= ?2 ORDER BY created_at DESC LIMIT 1",
+                params![id, now_ms() - 60_000],
+                |r| r.get(0),
+            )
+            .unwrap_or_default(),
+        None => String::new(),
+    };
     Ok(Snapshot {
         home_dir: meta.home.clone(),
         onboarding_complete: db::kv_get(conn, "onboarding_complete")?.as_deref() == Some("1"),
@@ -52,10 +63,14 @@ pub fn load(conn: &Connection, meta: &Meta) -> Result<Snapshot> {
         kernel: "rust".into(),
         active_profile_id: active_profile,
         active_thread_id: active_thread,
+        turn_activity,
         profiles,
         threads,
         steps,
         bot_groups: bot_groups(conn)?,
+        chief_bot_id: delegation.0,
+        delegation_contracts: delegation.1,
+        delegation_reports: delegation.2,
         gateway_audits: gateway_audits(conn)?,
         providers: providers(conn)?,
         apps: apps(conn)?,
@@ -72,9 +87,18 @@ pub fn load(conn: &Connection, meta: &Meta) -> Result<Snapshot> {
         workflows: workflows(conn)?,
         policy: db::load_policy(conn)?,
         balances: balances(conn)?,
+        connected_wallets: crate::wallet_live::list(conn)?,
+        wallet_pin_set: crate::wallet_live::pin_is_set(conn),
         transactions: transactions(conn)?,
         positions: positions(conn)?,
+        quant_orders: quant_orders(conn)?,
+        bot_allowances: crate::wallet_engine::bot_allowances(conn)?,
+        ledger_mode: crate::wallet_engine::ledger_mode(conn),
+        sentinels: crate::remediation_core::sentinels(conn)?,
+        sentinel_events: crate::remediation_core::sentinel_events(conn)?,
+        tier_status: crate::remediation_core::tier_status(conn, Path::new(&meta.home), meta.heartbeat_ms)?,
         remediation: remediation(conn)?,
+        shadow_backups: crate::remediation_core::shadow_backups(Path::new(&meta.home))?,
         processes: processes(conn, port)?,
         fleet_logs: fleet_logs(conn)?,
         extensions: extensions(conn)?,
@@ -102,7 +126,7 @@ fn flag(v: i64) -> bool {
 }
 
 fn profiles(conn: &Connection) -> Result<Vec<BotProfile>> {
-    let mut stmt = conn.prepare("SELECT id, handle, display_name, avatar, soul_markdown, primary_account_id, long_context_account_id, fallback_account_id, allow_computer_use, allow_browser_use, allow_code_exec, scoped_obsidian_folder, daily_wallet_limit_usd, is_pinned, role, engine, command_or_url, run_status, active_pid, status_line, harness_lane_id, ag_ui_endpoint_url, browser_partition, workspace_dir, allow_file_write, require_approval_external, require_approval_wallet, stall_timeout_ms, avatar_color FROM bot_profiles ORDER BY is_pinned DESC, handle")?;
+    let mut stmt = conn.prepare("SELECT id, handle, display_name, avatar, soul_markdown, primary_account_id, long_context_account_id, fallback_account_id, allow_computer_use, allow_browser_use, allow_code_exec, scoped_obsidian_folder, daily_wallet_limit_usd, is_pinned, role, engine, command_or_url, run_status, active_pid, status_line, harness_lane_id, ag_ui_endpoint_url, browser_partition, workspace_dir, allow_file_write, require_approval_external, require_approval_wallet, stall_timeout_ms, avatar_color, engine_kind, api_base, api_model, COALESCE(wallet_frozen, 0), approval_mode FROM bot_profiles ORDER BY is_pinned DESC, handle")?;
     let rows = stmt.query_map([], |r| {
         Ok(BotProfile {
             id: r.get(0)?,
@@ -134,6 +158,11 @@ fn profiles(conn: &Connection) -> Result<Vec<BotProfile>> {
             require_approval_wallet: flag(r.get(26)?),
             stall_timeout_ms: r.get(27)?,
             avatar_color: r.get(28)?,
+            engine_kind: r.get(29)?,
+            api_base: r.get(30)?,
+            api_model: r.get(31)?,
+            wallet_frozen: flag(r.get(32)?),
+            approval_mode: r.get(33)?,
             workspace_files: Vec::new(),
             takeover: false,
             screen_url: String::new(),
@@ -394,6 +423,28 @@ fn transactions(conn: &Connection) -> Result<Vec<WalletTx>> {
 fn positions(conn: &Connection) -> Result<Vec<Position>> {
     let mut stmt = conn.prepare("SELECT symbol, venue, side, pnl_usd, open FROM positions")?;
     let rows = stmt.query_map([], |r| Ok(Position { symbol: r.get(0)?, venue: r.get(1)?, side: r.get(2)?, pnl_usd: r.get(3)?, open: flag(r.get(4)?) }))?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+fn quant_orders(conn: &Connection) -> Result<Vec<QuantOrder>> {
+    let mut stmt = conn.prepare("SELECT id, created_at, pair, analyst, thesis, side, size_usd, ws_latency_ms, rebate_usd, status, mode, bot_handle, reference FROM quant_orders ORDER BY created_at DESC LIMIT 50")?;
+    let rows = stmt.query_map([], |r| {
+        Ok(QuantOrder {
+            id: r.get(0)?,
+            created_at: r.get(1)?,
+            pair: r.get(2)?,
+            analyst: r.get(3)?,
+            thesis: r.get(4)?,
+            side: r.get(5)?,
+            size_usd: r.get(6)?,
+            ws_latency_ms: r.get(7)?,
+            rebate_usd: r.get(8)?,
+            status: r.get(9)?,
+            mode: r.get(10)?,
+            bot_handle: r.get(11)?,
+            reference: r.get(12)?,
+        })
+    })?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 

@@ -1,10 +1,15 @@
 import { useEffect, useRef, useState } from "react";
+import { Plus, Search } from "lucide-react";
+import { ChiefDelegationPanel } from "./ChiefDelegation";
+import { createPortal } from "react-dom";
 import type { BotProfile, Provider, Step } from "../types";
-import { useOmni } from "../store";
+import { useRonic } from "../store";
 import { effortFor } from "../kernel/modelPrefs";
 import type { ChatModel, ChatProviderLink } from "../kernel/liveChat";
 import { ago, forgetSchedule, isUnread, lastLine, rememberSchedule, safePageUrl } from "../kernel/workspaceChrome";
 import { hideBotScreens, isTauriRuntime, placeBotScreen, revealBotScreen, type WebAppBounds } from "../lib/tauriBridge";
+import { MiniComputerPanel } from "../mini-shell/MiniComputerPanel";
+import "../mini-shell/shell.css";
 import { ProviderAuth, ProviderState } from "./ProviderAuth";
 
 const HARNESSES = [
@@ -157,14 +162,15 @@ export function botPresence(bot: BotProfile): "" | "work" | "wait" {
 }
 
 export function CoworkerSidebar({ onInspect, onEditProfile }: { onInspect: (id: string) => void; onEditProfile: (id: string) => void }) {
-  const snap = useOmni((s) => s.snap)!;
-  const run = useOmni((s) => s.run);
-  const go = useOmni((s) => s.go);
+  const snap = useRonic((s) => s.snap)!;
+  const run = useRonic((s) => s.run);
+  const go = useRonic((s) => s.go);
   const [query, setQuery] = useState("");
   const [menu, setMenu] = useState(false);
   const [botOpen, setBotOpen] = useState(false);
   const [groupOpen, setGroupOpen] = useState(false);
-  const [lane, setLane] = useState<"sessions" | "bots" | "harness">("bots");
+  const [chiefOpen, setChiefOpen] = useState(false);
+  const [lane, setLane] = useState<"sessions" | "bots">("bots");
   const [seenTick, setSeenTick] = useState(0);
   const thread = snap.threads.find((item) => item.id === snap.activeThreadId);
   const activeGroup = thread?.targetType === "bot_group" ? snap.botGroups.find((item) => item.id === thread.groupId) : undefined;
@@ -172,8 +178,8 @@ export function CoworkerSidebar({ onInspect, onEditProfile }: { onInspect: (id: 
 
   useEffect(() => {
     const onSeen = () => setSeenTick((value) => value + 1);
-    window.addEventListener("omni-seen", onSeen);
-    return () => window.removeEventListener("omni-seen", onSeen);
+    window.addEventListener("ronic-seen", onSeen);
+    return () => window.removeEventListener("ronic-seen", onSeen);
   }, []);
 
   const threadIdsFor = (match: (id: string) => boolean) => snap.threads.filter((item) => match(item.id) || match(item.botProfileId) || match(item.groupId)).map((item) => item.id);
@@ -239,26 +245,30 @@ export function CoworkerSidebar({ onInspect, onEditProfile }: { onInspect: (id: 
     .filter((row) => !needle || `${row.title} ${row.preview}`.toLowerCase().includes(needle))
     .sort((a, b) => b.when - a.when);
 
-  const programs = snap.apps.filter((app) => app.executablePath.trim().length > 0 || (app.status !== "missing" && app.status !== ""));
-  const harnessBots = snap.profiles.filter((bot) => !needle || `${botName(bot)} ${harnessLabel(bot)}`.toLowerCase().includes(needle));
 
-  const placeholder = lane === "sessions" ? "Search sessions" : lane === "harness" ? "Search harnesses" : "Search bots and group chats";
+
+
+  const placeholder = lane === "sessions" ? "Search sessions" : "Search bots and group chats";
 
   return (
     <section className="pane roster" data-seen={seenTick}>
       <div className="roster-lanes" role="tablist" aria-label="Roster">
         <button type="button" role="tab" aria-selected={lane === "bots"} className={lane === "bots" ? "on" : ""} onClick={() => setLane("bots")}>Bots</button>
         <button type="button" role="tab" aria-selected={lane === "sessions"} className={lane === "sessions" ? "on" : ""} onClick={() => setLane("sessions")}>Sessions</button>
-        <button type="button" role="tab" aria-selected={lane === "harness"} className={lane === "harness" ? "on" : ""} onClick={() => setLane("harness")}>Harness</button>
+
       </div>
       <div className="roster-bar">
-        <input className="roster-search" value={query} placeholder={placeholder} onChange={(event) => setQuery(event.target.value)} />
-        <button type="button" className="roster-plus" aria-label="New bot or group" aria-expanded={menu} onClick={() => setMenu((open) => !open)}>+</button>
+        <div className="roster-search-wrap">
+          <Search size={14} className="roster-search-icon" />
+          <input className="roster-search" value={query} placeholder={placeholder} onChange={(event) => setQuery(event.target.value)} />
+        </div>
+        <button type="button" className="roster-plus" aria-label="New bot or group" aria-expanded={menu} onClick={() => setMenu((open) => !open)}><Plus size={15} /></button>
       </div>
       {menu ? (
         <div className="roster-menu">
           <button type="button" onClick={() => { setMenu(false); setBotOpen(true); }}>New bot</button>
           <button type="button" onClick={() => { setMenu(false); setGroupOpen(true); }}>New group</button>
+          <button type="button" onClick={() => { setMenu(false); setChiefOpen(true); }}>Chief officer</button>
         </div>
       ) : null}
       <div className="roster-list">
@@ -328,44 +338,7 @@ export function CoworkerSidebar({ onInspect, onEditProfile }: { onInspect: (id: 
             ))}
           </>
         ) : null}
-        {lane === "harness" ? (
-          <>
-            {programs.length === 0 && harnessBots.length === 0 ? <p className="roster-empty">{needle ? "No match." : "No harness is on this computer yet."}</p> : null}
-            {programs.filter((app) => !needle || `${app.appName} ${app.detail}`.toLowerCase().includes(needle)).map((app) => (
-              <button
-                key={app.id}
-                type="button"
-                className="roster-row harness-row"
-                onClick={() => {
-                  if (!app.executablePath.trim()) {
-                    go("providers");
-                    return;
-                  }
-                  void run("launch_local_app", { executablePath: app.executablePath });
-                }}
-              >
-                <span className="roster-copy">
-                  <span className="roster-top"><strong>{app.appName}</strong><time>{app.status}</time></span>
-                  <span className="preview">{app.detail || app.executablePath || "Not found yet"}</span>
-                </span>
-              </button>
-            ))}
-            {harnessBots.map((bot) => (
-              <div key={bot.id} className={`roster-row ${bot.id === snap.activeProfileId ? "on" : ""}`}>
-                <button type="button" className="face-btn" aria-label={`Edit ${botName(bot)}`} onClick={() => onEditProfile(bot.id)}>
-                  <BotFace seed={bot.id} mark={bot.avatar} state={botPresence(bot)} color={bot.avatarColor} />
-                </button>
-                <button type="button" className="roster-hit" onClick={() => { onInspect(bot.id); void run("switch_profile", { profileId: bot.id }); setLane("bots"); }}>
-                  <span className="roster-copy">
-                    <span className="roster-top"><strong>{botName(bot)}</strong></span>
-                    <span className="preview">{harnessLabel(bot)}</span>
-                  </span>
-                </button>
-              </div>
-            ))}
-            <button type="button" className="btn ghost small" onClick={() => void run("scan_environment")}>Scan this computer</button>
-          </>
-        ) : null}
+
       </div>
       <div className="roster-foot">
         <button type="button" onClick={() => go("capabilities")}>Plugins</button>
@@ -374,13 +347,14 @@ export function CoworkerSidebar({ onInspect, onEditProfile }: { onInspect: (id: 
       </div>
       {botOpen ? <NewBot onClose={() => setBotOpen(false)} onInspect={onInspect} /> : null}
       {groupOpen ? <NewGroup onClose={() => setGroupOpen(false)} onInspect={onInspect} /> : null}
+      {chiefOpen ? <ChiefDelegationPanel onClose={() => setChiefOpen(false)} /> : null}
     </section>
   );
 }
 
 function NewBot({ onClose, onInspect }: { onClose: () => void; onInspect: (id: string) => void }) {
-  const run = useOmni((s) => s.run);
-  const busy = useOmni((s) => s.busy);
+  const run = useRonic((s) => s.run);
+  const busy = useRonic((s) => s.busy);
   const [name, setName] = useState("");
   const [mark, setMark] = useState("");
   const [color, setColor] = useState("");
@@ -404,7 +378,7 @@ function NewBot({ onClose, onInspect }: { onClose: () => void; onInspect: (id: s
         return;
       }
       onClose();
-      const created = useOmni.getState().snap?.activeProfileId;
+      const created = useRonic.getState().snap?.activeProfileId;
       if (created) onInspect(created);
     } finally {
       setCreating(false);
@@ -449,9 +423,9 @@ function NewBot({ onClose, onInspect }: { onClose: () => void; onInspect: (id: s
 }
 
 function NewGroup({ onClose, onInspect }: { onClose: () => void; onInspect: (id: string) => void }) {
-  const snap = useOmni((s) => s.snap)!;
-  const run = useOmni((s) => s.run);
-  const busy = useOmni((s) => s.busy);
+  const snap = useRonic((s) => s.snap)!;
+  const run = useRonic((s) => s.run);
+  const busy = useRonic((s) => s.busy);
   const [title, setTitle] = useState("");
   const [purpose, setPurpose] = useState("");
   const [mode, setMode] = useState<(typeof MODES)[number][0]>("autonomous_handoff");
@@ -503,8 +477,8 @@ function NewGroup({ onClose, onInspect }: { onClose: () => void; onInspect: (id:
 }
 
 export function ProfileSlide({ bot, providers, links, onClose, onSignIn, onOpenKeys, onContinueChatGpt, onSaveKey }: { bot: BotProfile; providers: Provider[]; links: ChatProviderLink[]; onClose: () => void; onSignIn: (siteId: string) => void; onOpenKeys: (url: string) => void; onContinueChatGpt: () => void; onSaveKey: (id: string, secret: string) => void }) {
-  const run = useOmni((s) => s.run);
-  const busy = useOmni((s) => s.busy);
+  const run = useRonic((s) => s.run);
+  const busy = useRonic((s) => s.busy);
   const [draft, setDraft] = useState(bot);
   const [openGroup, setOpenGroup] = useState("");
   const [note, setNote] = useState("");
@@ -576,6 +550,9 @@ export function ProfileSlide({ bot, providers, links, onClose, onSignIn, onOpenK
           <Toggle label="Browser use" on={draft.allowBrowserUse} onClick={() => edit({ ...draft, allowBrowserUse: !draft.allowBrowserUse })} />
           <Toggle label="Code exec" on={draft.allowCodeExec} onClick={() => edit({ ...draft, allowCodeExec: !draft.allowCodeExec })} />
         </div>
+        <div className="stack">
+          <p className="muted">Approval mode: <strong>{draft.approvalMode === "auto" ? "Auto approve — acts autonomously" : draft.approvalMode === "manual" ? "Manual — every action is held" : "Ask — external actions and wallet spend held"}</strong>. Change it under Settings → Approvals.</p>
+        </div>
         <AccountPick label="Primary" value={draft.primaryAccountId} providers={providers} onChange={(primaryAccountId) => edit({ ...draft, primaryAccountId })} />
         <AccountPick label="Long context" value={draft.longContextAccountId} providers={providers} onChange={(longContextAccountId) => edit({ ...draft, longContextAccountId })} />
         <AccountPick label="Fallback" value={draft.fallbackAccountId} providers={providers} onChange={(fallbackAccountId) => edit({ ...draft, fallbackAccountId })} />
@@ -610,24 +587,26 @@ function AccountPick({ label, value, providers, onChange }: { label: string; val
   );
 }
 
-function screenBounds(el: HTMLElement): WebAppBounds | null {
+function screenBounds(el: HTMLElement, coverAll = false): WebAppBounds | null {
   const rect = el.getBoundingClientRect();
   let x = Math.max(0, rect.left);
   let y = Math.max(0, rect.top);
   let right = Math.min(rect.right, window.innerWidth);
   let bottom = Math.min(rect.bottom, window.innerHeight);
-  if (!el.closest("[data-pane=thread]")) {
-    const thread = document.querySelector("[data-pane=thread]");
-    if (thread) {
-      const edge = thread.getBoundingClientRect().right + 8;
-      if (x < edge) x = edge;
+  if (!coverAll) {
+    if (!el.closest("[data-pane=thread]")) {
+      const thread = document.querySelector("[data-pane=thread]");
+      if (thread) {
+        const edge = thread.getBoundingClientRect().right + 8;
+        if (x < edge) x = edge;
+      }
     }
-  }
-  for (const selector of [".page-col", "[data-edge-rail]", "[data-jobs-panel]", ".chat-side", ".preview-col"]) {
-    const neighbor = document.querySelector(selector);
-    if (!neighbor || neighbor.contains(el)) continue;
-    const edge = neighbor.getBoundingClientRect().left;
-    if (edge > x + 8 && right > edge) right = edge;
+    for (const selector of [".page-col", "[data-edge-rail]", "[data-jobs-panel]", ".chat-side", ".preview-col"]) {
+      const neighbor = document.querySelector(selector);
+      if (!neighbor || neighbor.contains(el)) continue;
+      const edge = neighbor.getBoundingClientRect().left;
+      if (edge > x + 8 && right > edge) right = edge;
+    }
   }
   const width = right - x;
   const height = bottom - y;
@@ -639,12 +618,15 @@ function boundsKey(bounds: WebAppBounds) {
   return `${Math.round(bounds.x)}|${Math.round(bounds.y)}|${Math.round(bounds.width)}|${Math.round(bounds.height)}`;
 }
 
-export function ComputerDock({ inspectedId, onInspect, onClose, onCover, onRunRoutine }: { inspectedId: string; onInspect: (id: string) => void; onClose?: () => void; onCover?: (on: boolean) => void; onRunRoutine?: () => void }) {
-  const snap = useOmni((s) => s.snap)!;
-  const run = useOmni((s) => s.run);
-  const busy = useOmni((s) => s.busy);
+export function ComputerDock({ inspectedId, onInspect, onClose, onCover, onRunRoutine, initialTab }: { inspectedId: string; onInspect: (id: string) => void; onClose?: () => void; onCover?: (on: boolean) => void; onRunRoutine?: () => void; initialTab?: "computer" | "browser" }) {
+  const snap = useRonic((s) => s.snap)!;
+  const run = useRonic((s) => s.run);
+  const busy = useRonic((s) => s.busy);
   const bot = snap.profiles.find((item) => item.id === inspectedId) ?? snap.profiles.find((item) => item.id === snap.activeProfileId) ?? snap.profiles[0];
-  const [tab, setTab] = useState<"browser" | "shell" | "access" | "audit">("browser");
+  const [tab, setTab] = useState<"computer" | "browser" | "shell" | "access" | "audit">("browser");
+  useEffect(() => {
+    if (initialTab) setTab(initialTab);
+  }, [initialTab]);
   const [teaching, setTeaching] = useState(false);
   const [notes, setNotes] = useState("");
   const [draft, setDraft] = useState(bot?.screenUrl ?? "");
@@ -652,6 +634,9 @@ export function ComputerDock({ inspectedId, onInspect, onClose, onCover, onRunRo
   const [note, setNote] = useState("");
   const [refused, setRefused] = useState("");
   const [shell, setShell] = useState("");
+  const [maximized, setMaximized] = useState(false);
+  const maxRef = useRef(false);
+  maxRef.current = maximized;
   const frameRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const opening = useRef(false);
@@ -662,6 +647,15 @@ export function ComputerDock({ inspectedId, onInspect, onClose, onCover, onRunRo
   const botIdRef = useRef(bot?.id ?? "");
   if (!opening.current) liveUrl.current = url;
   botIdRef.current = bot?.id ?? "";
+
+  useEffect(() => {
+    if (!maximized) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setMaximized(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [maximized]);
 
   useEffect(() => {
     const next = bot?.screenUrl ?? "";
@@ -691,8 +685,8 @@ export function ComputerDock({ inspectedId, onInspect, onClose, onCover, onRunRo
       setUrl((current) => current === next ? current : next);
       if (document.activeElement !== inputRef.current) setDraft(next);
     };
-    window.addEventListener("omni-bot-screen", onScreen);
-    return () => window.removeEventListener("omni-bot-screen", onScreen);
+    window.addEventListener("ronic-bot-screen", onScreen);
+    return () => window.removeEventListener("ronic-bot-screen", onScreen);
   }, []);
 
   useEffect(() => () => { void hideBotScreens(); }, []);
@@ -710,7 +704,7 @@ export function ComputerDock({ inspectedId, onInspect, onClose, onCover, onRunRo
       if (!alive) return;
       const slot = frameRef.current;
       if (!slot) return;
-      const bounds = screenBounds(slot);
+      const bounds = screenBounds(slot, maxRef.current);
       if (!bounds) return;
       if (opening.current) {
         if (openingFor.current !== bot.id) return;
@@ -773,7 +767,7 @@ export function ComputerDock({ inspectedId, onInspect, onClose, onCover, onRunRo
       window.removeEventListener("resize", tick);
       scroller?.removeEventListener("scroll", tick);
     };
-  }, [bot?.id, tab, url, refused]);
+  }, [bot?.id, tab, url, refused, maximized]);
 
   if (!bot) {
     return (
@@ -799,7 +793,7 @@ export function ComputerDock({ inspectedId, onInspect, onClose, onCover, onRunRo
       setNote("This preview cannot open the bot's computer. Use the desktop app.");
       return;
     }
-    const bounds = frameRef.current ? screenBounds(frameRef.current) : null;
+    const bounds = frameRef.current ? screenBounds(frameRef.current, maxRef.current) : null;
     if (!bounds) return;
     const requested = bot.id;
     const previous = liveUrl.current;
@@ -810,7 +804,7 @@ export function ComputerDock({ inspectedId, onInspect, onClose, onCover, onRunRo
     try {
       const res = await run("show_bot_screen", { botId: requested, bounds, url: next });
       if (botIdRef.current !== requested) {
-        const stay = useOmni.getState().snap?.profiles.find((item) => item.id === botIdRef.current)?.screenUrl?.trim() ?? "";
+        const stay = useRonic.getState().snap?.profiles.find((item) => item.id === botIdRef.current)?.screenUrl?.trim() ?? "";
         liveUrl.current = stay;
         shown.current = "";
         placed.current = "";
@@ -854,6 +848,7 @@ export function ComputerDock({ inspectedId, onInspect, onClose, onCover, onRunRo
           <strong>{botName(bot)}&apos;s screen</strong>
           <span>{bot.takeover ? "You have control" : "Their computer"}</span>
         </div>
+        <button type="button" className="screen-x" aria-label="Maximize screen" title="Maximize" onClick={() => { setTab("browser"); setMaximized(true); }}>⤢</button>
         {onClose ? <button type="button" className="screen-x" onClick={onClose} aria-label="Close screen">×</button> : null}
       </div>
       <div className="pane-b screen-live">
@@ -864,12 +859,17 @@ export function ComputerDock({ inspectedId, onInspect, onClose, onCover, onRunRo
           </select>
         </label>
         <div className="dock-tabs" role="tablist">
-          {(["browser", "shell", "access", "audit"] as const).map((item) => (
-            <button key={item} type="button" className={tab === item ? "btn small" : "btn ghost small"} onClick={() => setTab(item)}>
-              {item === "browser" ? "Browser" : item === "shell" ? "Shell" : item === "access" ? "Access" : "Audit"}
+          {(["computer", "browser", "shell", "access", "audit"] as const).map((item) => (
+            <button key={item} type="button" className={tab === item ? "btn small" : "btn ghost small"} onClick={() => { setMaximized(false); setTab(item); }}>
+              {item === "computer" ? "Computer" : item === "browser" ? "Browser" : item === "shell" ? "Shell" : item === "access" ? "Access" : "Audit"}
             </button>
           ))}
         </div>
+        {tab === "computer" ? (
+          <div className="screen-body msh-embed">
+            <MiniComputerPanel botId={bot.id} botHandle={botName(bot)} />
+          </div>
+        ) : null}
         {tab === "browser" ? (
           <div className="screen-body">
             <span className="muted">This browser is only {botName(bot)}&apos;s.</span>
@@ -894,21 +894,29 @@ export function ComputerDock({ inspectedId, onInspect, onClose, onCover, onRunRo
                 </button>
               </div>
             ) : <p className="muted">Teach a task writes a SKILL.md from the steps you describe and the page on this computer.</p>}
+            {maximized ? <p className="muted">Maximized — the page fills the window. Restore from the bar up top or press Esc.</p> : null}
             <form className="bot-address" onSubmit={(event) => { event.preventDefault(); void openPage(draft); }}>
               <input ref={inputRef} className="input" value={draft} placeholder="https:// or http://127.0.0.1" onChange={(event) => setDraft(event.target.value)} />
               <button type="submit" className="btn small" disabled={busy || draft.trim().length === 0}>Open</button>
             </form>
             {note ? <p className="muted">{note}</p> : null}
-            <div className="bot-screen-frame" ref={frameRef}>
-              {!isTauriRuntime() ? <div className="page-start"><span>This preview cannot open the bot&apos;s computer. Use the desktop app.</span></div> : refused ? (
-                <div className="page-error">
-                  <strong>Server not found</strong>
-                  <span className="mono">{refused}</span>
-                  <button type="button" className="btn small" onClick={() => void openPage(refused)}>Try again</button>
-                  <span>Ask {botName(bot)} to restart the server.</span>
-                </div>
-              ) : url ? null : <div className="page-start"><span>This computer is off until you or the bot open a page.</span></div>}
-            </div>
+            {maximized ? (
+              <div className="bot-screen-max-note">
+                <span>{botName(bot)}&apos;s screen is maximized.</span>
+                <button type="button" className="btn small" onClick={() => setMaximized(false)}>Restore</button>
+              </div>
+            ) : (
+              <div className="bot-screen-frame" ref={frameRef}>
+                {!isTauriRuntime() ? <div className="page-start"><span>This preview cannot open the bot&apos;s computer. Use the desktop app.</span></div> : refused ? (
+                  <div className="page-error">
+                    <strong>Server not found</strong>
+                    <span className="mono">{refused}</span>
+                    <button type="button" className="btn small" onClick={() => void openPage(refused)}>Try again</button>
+                    <span>Ask {botName(bot)} to restart the server.</span>
+                  </div>
+                ) : url ? null : <div className="page-start"><span>This computer is off until you or the bot open a page.</span></div>}
+              </div>
+            )}
             {bot.screenNodes.length > 0 ? <div className="bot-screen-nodes">{bot.screenNodes.slice(0, 8).map((node) => <span key={node.id} className="mono">[{node.id}] {node.tag} {node.label}</span>)}</div> : null}
             {bot.harnessLaneId === "ag_ui_url" ? <p className="muted">Endpoint saved: {bot.agUiEndpointUrl || "none yet"}. Turns in this thread still use the model you select. The gate still checks wallet, browser, and file tools.</p> : null}
           </div>
@@ -946,7 +954,8 @@ export function ComputerDock({ inspectedId, onInspect, onClose, onCover, onRunRo
             })}
             <span className="muted">MCP</span>
             {snap.mcpServers.map((server) => {
-              const on = server.enables.some((flag) => flag.profileId === bot.id && flag.enabled);
+              const flag = server.enables.find((f) => f.profileId === bot.id);
+              const on = flag ? flag.enabled : true;
               return <Toggle key={server.id} label={server.name} on={on} onClick={() => void run("toggle_mcp", { id: server.id, profileId: bot.id, enabled: !on })} />;
             })}
           </div>
@@ -976,6 +985,32 @@ export function ComputerDock({ inspectedId, onInspect, onClose, onCover, onRunRo
         </div>
         <span className="muted">{harnessLabel(bot)}</span>
       </div>
+      {maximized && tab === "browser"
+        ? createPortal(
+            <div className="bot-screen-max">
+              <div className="bot-screen-max-bar">
+                <strong>{botName(bot)}&apos;s screen</strong>
+                <form className="bot-address" onSubmit={(event) => { event.preventDefault(); void openPage(draft); }}>
+                  <input className="input" value={draft} placeholder="https:// or http://127.0.0.1" onChange={(event) => setDraft(event.target.value)} />
+                  <button type="submit" className="btn small" disabled={busy || draft.trim().length === 0}>Open</button>
+                </form>
+                <span className="muted max-esc">Esc</span>
+                <button type="button" className="btn small" onClick={() => setMaximized(false)}>Restore</button>
+              </div>
+              <div className="bot-screen-frame maxed" ref={frameRef}>
+                {!isTauriRuntime() ? <div className="page-start"><span>This preview cannot open the bot&apos;s computer. Use the desktop app.</span></div> : refused ? (
+                  <div className="page-error">
+                    <strong>Server not found</strong>
+                    <span className="mono">{refused}</span>
+                    <button type="button" className="btn small" onClick={() => void openPage(refused)}>Try again</button>
+                    <span>Ask {botName(bot)} to restart the server.</span>
+                  </div>
+                ) : url ? null : <div className="page-start"><span>This computer is off until you or the bot open a page.</span></div>}
+              </div>
+            </div>,
+            document.body,
+          )
+        : null}
     </aside>
   );
 }
@@ -990,8 +1025,8 @@ function Toggle({ label, on, onClick }: { label: string; on: boolean; onClick: (
 }
 
 export function GatewayCard({ step, model }: { step: Step; model: ChatModel | null }) {
-  const run = useOmni((s) => s.run);
-  const busy = useOmni((s) => s.busy);
+  const run = useRonic((s) => s.run);
+  const busy = useRonic((s) => s.busy);
   const state = String(step.actionPayload.approvalState ?? "pending");
   return (
     <article className="notice stack">

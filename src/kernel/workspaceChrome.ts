@@ -1,8 +1,8 @@
-const SEEN_KEY = "omni.threadSeen.v1";
-const FIRED_KEY = "omni.jobFired.v1";
-const SAVED_KEY = "omni.jobSaved.v1";
-const META_KEY = "omni.selectedModel.meta";
-const TABS_KEY = "omni.openTabs.v1";
+const SEEN_KEY = "ronic.threadSeen.v1";
+const FIRED_KEY = "ronic.jobFired.v1";
+const SAVED_KEY = "ronic.jobSaved.v1";
+const META_KEY = "ronic.selectedModel.meta";
+const TABS_KEY = "ronic.openTabs.v1";
 
 export type ModelMeta = { id: string; providerId: string; upstreamModel: string };
 
@@ -76,7 +76,7 @@ export function markSeen(threadId: string, at: number) {
   if ((seen[threadId] ?? 0) >= at) return;
   seen[threadId] = at;
   writeMap(SEEN_KEY, seen);
-  window.dispatchEvent(new Event("omni-seen"));
+  window.dispatchEvent(new Event("ronic-seen"));
 }
 
 export function isUnread(threadId: string, updatedAt: number, active: boolean) {
@@ -278,5 +278,9 @@ export function restartAsk(url: string) {
 export function speechAvailable() {
   if (typeof window === "undefined") return false;
   const host = window as Window & { SpeechRecognition?: unknown; webkitSpeechRecognition?: unknown };
-  return typeof host.SpeechRecognition === "function" || typeof host.webkitSpeechRecognition === "function";
+  return (
+    typeof host.SpeechRecognition === "function" ||
+    typeof host.webkitSpeechRecognition === "function" ||
+    Boolean(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)
+  );
 }
