@@ -7,10 +7,7 @@ the core loop.
 
 ## Screenshots
 
-These are the running desktop app. The page stays short until you open them.
-
-<details>
-<summary>View screenshots</summary>
+These are the running desktop app.
 
 Chat, with bots and the web apps dock.
 
@@ -19,6 +16,9 @@ Chat, with bots and the web apps dock.
 A bot's computer, with a site open beside the chat.
 
 ![Bot computer](docs/screenshots/bot-computer.png)
+
+<details>
+<summary><mark>View screenshots</mark></summary>
 
 The same chat, with each web app's own icon.
 
