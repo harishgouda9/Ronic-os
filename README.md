@@ -5,6 +5,26 @@ CLIs, web agents, MCP servers, bot profiles, memory, skills, workflows, and a
 sandbox wallet share a single workspace — with no server-side dependency for
 the core loop.
 
+## Screenshots
+
+These are the local preview. The desktop window uses the same screens.
+
+First run. Chats, keys, memory, and the wallet ledger stay on this computer.
+
+![Ronic OS welcome](docs/screenshots/welcome.png)
+
+Bots, sessions, and web apps in one workspace.
+
+![Ronic OS workspace](docs/screenshots/workspace.png)
+
+Skills, plugins, and MCP servers.
+
+![Ronic OS skills](docs/screenshots/skills.png)
+
+Settings → Update, with the release notes and the small update notice.
+
+![Ronic OS settings update](docs/screenshots/settings.png)
+
 - **Frontend:** React 19 + TypeScript + Vite 7 + Tailwind 4 + Zustand
 - **Desktop shell:** Tauri 2 (WebView2), Rust backend (~23k lines)
 - **State:** SQLite (`state.db` under `~/.omniworkspace`) + encrypted vault
