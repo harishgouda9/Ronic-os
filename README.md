@@ -7,23 +7,52 @@ the core loop.
 
 ## Screenshots
 
-These are the local preview. The desktop window uses the same screens.
+These are the running desktop app. The page stays short until you open them.
 
-First run. Chats, keys, memory, and the wallet ledger stay on this computer.
+<details>
+<summary>View screenshots</summary>
 
-![Ronic OS welcome](docs/screenshots/welcome.png)
+Chat, with bots and the web apps dock.
 
-Bots, sessions, and web apps in one workspace.
+![Chat and the web apps dock](docs/screenshots/chat-apps.png)
 
-![Ronic OS workspace](docs/screenshots/workspace.png)
+A bot's computer, with a site open beside the chat.
+
+![Bot computer](docs/screenshots/bot-computer.png)
+
+The same chat, with each web app's own icon.
+
+![Chat with app icons](docs/screenshots/chat-icons.png)
+
+A site window opened from the bot computer.
+
+![Site window](docs/screenshots/site-window.png)
+
+Apps and providers already found on this computer.
+
+![Apps and providers](docs/screenshots/apps-providers.png)
 
 Skills, plugins, and MCP servers.
 
-![Ronic OS skills](docs/screenshots/skills.png)
+![Skills and capabilities](docs/screenshots/skills.png)
 
-Settings → Update, with the release notes and the small update notice.
+A workflow on the canvas.
 
-![Ronic OS settings update](docs/screenshots/settings.png)
+![Workflow](docs/screenshots/workflow.png)
+
+Connect apps, OAuth providers, and MCP tools.
+
+![Connect catalog](docs/screenshots/connect.png)
+
+Wallet and quant terminal. Balances stay on this computer.
+
+![Wallet](docs/screenshots/wallet.png)
+
+Messaging gateway.
+
+![Messaging gateway](docs/screenshots/messaging.png)
+
+</details>
 
 - **Frontend:** React 19 + TypeScript + Vite 7 + Tailwind 4 + Zustand
 - **Desktop shell:** Tauri 2 (WebView2), Rust backend (~23k lines)
