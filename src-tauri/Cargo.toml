@@ -36,7 +36,7 @@ include_dir = "0.7"
 portable-pty = "0.8"
 ed25519-dalek = "2"
 keyring = { version = "3", default-features = false, features = ["windows-native", "apple-native", "linux-native-sync-persistent", "crypto-rust"] }
-tauri-plugin-deep-link = "2"
+tauri-plugin-deep-link = "=2.6.1"
 
 [target.'cfg(windows)'.dependencies]
 webview2-com = "0.39"
