@@ -1,6 +1,18 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { devLaunchDecision, isOurDevServer } from "./desktop.mjs";
+import { defaultBuildCacheDir, desktopBinaryName, devLaunchDecision, isOurDevServer } from "./desktop.mjs";
+
+test("build cache stays outside a space-containing checkout on every desktop OS", () => {
+  assert.equal(defaultBuildCacheDir("win32", { LOCALAPPDATA: "C:\\Users\\Ada\\AppData\\Local" }, "C:\\Users\\Ada"), "C:\\Users\\Ada\\AppData\\Local\\ronicos-target");
+  assert.equal(defaultBuildCacheDir("darwin", { HOME: "/Users/ada" }, "/fallback"), "/Users/ada/Library/Caches/ronicos-target");
+  assert.equal(defaultBuildCacheDir("linux", { HOME: "/home/ada" }, "/fallback"), "/home/ada/.cache/ronicos-target");
+});
+
+test("desktop binary names follow the host platform", () => {
+  assert.equal(desktopBinaryName("win32"), "ronicos.exe");
+  assert.equal(desktopBinaryName("darwin"), "ronicos");
+  assert.equal(desktopBinaryName("linux"), "ronicos");
+});
 
 test("isOurDevServer only accepts the Ronic OS page", () => {
   assert.equal(isOurDevServer("<title>Ronic OS</title>"), true);

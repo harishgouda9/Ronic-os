@@ -1,0 +1,171 @@
+name: Release desktop installers
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            args: --target x86_64-pc-windows-msvc
+            apple: false
+          - name: macOS Intel
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            args: --target x86_64-apple-darwin
+            apple: true
+          - name: macOS Apple Silicon
+            runner: macos-latest
+            target: aarch64-apple-darwin
+            args: --target aarch64-apple-darwin
+            apple: true
+          - name: Linux x64
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            args: --target x86_64-unknown-linux-gnu
+            apple: false
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Linux desktop dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            libxdo-dev \
+            libssl-dev \
+            build-essential \
+            librsvg2-dev \
+            librsvg2-bin \
+            libgtk-3-bin \
+            patchelf \
+            file \
+            wget \
+            xdg-utils
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust build output
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: ${{ matrix.target }}
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Import Windows signing certificate
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          WINDOWS_TIMESTAMP_URL: ${{ secrets.WINDOWS_TIMESTAMP_URL }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE) -or [string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_PASSWORD)) {
+            Write-Host "Windows signing secrets are not configured; building an unsigned installer."
+            exit 0
+          }
+          $pfxPath = Join-Path $env:RUNNER_TEMP "ronic-signing.pfx"
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+          $password = ConvertTo-SecureString -String $env:WINDOWS_CERTIFICATE_PASSWORD -Force -AsPlainText
+          $certificate = Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation Cert:\CurrentUser\My -Password $password
+          if (-not $certificate.Thumbprint) { throw "The Windows signing certificate has no thumbprint." }
+          $configPath = "src-tauri/tauri.conf.json"
+          $config = Get-Content $configPath -Raw | ConvertFrom-Json
+          $config.bundle.windows.certificateThumbprint = $certificate.Thumbprint
+          $config.bundle.windows.digestAlgorithm = "sha256"
+          $config.bundle.windows.timestampUrl = if ([string]::IsNullOrWhiteSpace($env:WINDOWS_TIMESTAMP_URL)) { "http://timestamp.digicert.com" } else { $env:WINDOWS_TIMESTAMP_URL }
+          $config | ConvertTo-Json -Depth 30 | Set-Content $configPath
+          Remove-Item $pfxPath -Force
+
+      - name: Import Apple signing certificate
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          APPLE_ID_SECRET: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD_SECRET: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID_SECRET: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          keychain_path="$RUNNER_TEMP/ronic-build.keychain-db"
+          echo "RONIC_KEYCHAIN_PATH=$keychain_path" >> "$GITHUB_ENV"
+          echo 'APPLE_SIGNING_IDENTITY=-' >> "$GITHUB_ENV"
+          if [[ -n "$APPLE_CERTIFICATE" && -n "$APPLE_CERTIFICATE_PASSWORD" && -n "$KEYCHAIN_PASSWORD" ]]; then
+            certificate_path="$RUNNER_TEMP/ronic-signing.p12"
+            echo -n "$APPLE_CERTIFICATE" | base64 --decode > "$certificate_path"
+            security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain_path"
+            security default-keychain -s "$keychain_path"
+            security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain_path"
+            security set-keychain-settings -t 3600 -u "$keychain_path"
+            security import "$certificate_path" -k "$keychain_path" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+            security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$keychain_path"
+            identity=$(security find-identity -v -p codesigning "$keychain_path" | awk -F'"' '/"/ { print $2; exit }')
+            if [[ -z "$identity" ]]; then
+              echo "No Apple code-signing identity was found after importing the certificate." >&2
+              exit 1
+            fi
+            echo "APPLE_SIGNING_IDENTITY=$identity" >> "$GITHUB_ENV"
+            rm -f "$certificate_path"
+          else
+            echo "Apple signing certificate secrets are not configured; using ad-hoc signing."
+          fi
+          if [[ -n "$APPLE_ID_SECRET" && -n "$APPLE_PASSWORD_SECRET" && -n "$APPLE_TEAM_ID_SECRET" ]]; then
+            {
+              echo "APPLE_ID=$APPLE_ID_SECRET"
+              echo "APPLE_PASSWORD=$APPLE_PASSWORD_SECRET"
+              echo "APPLE_TEAM_ID=$APPLE_TEAM_ID_SECRET"
+            } >> "$GITHUB_ENV"
+          fi
+
+      - name: Build and publish native bundles
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: v__VERSION__
+          releaseName: Ronic OS v__VERSION__
+          releaseBody: |
+            Native Ronic OS desktop release.
+
+            Download the installer for your operating system from the assets below.
+          releaseDraft: false
+          prerelease: false
+          args: ${{ matrix.args }}
+
+      - name: Clean up Apple signing keychain
+        if: always() && runner.os == 'macOS'
+        shell: bash
+        run: |
+          if [[ -n "${RONIC_KEYCHAIN_PATH:-}" && -f "$RONIC_KEYCHAIN_PATH" ]]; then
+            security delete-keychain "$RONIC_KEYCHAIN_PATH" || true
+          fi

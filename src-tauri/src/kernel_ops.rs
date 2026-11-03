@@ -3,6 +3,7 @@
 //! the .shadow-git snapshot store, and folder copies for backups.
 
 use crate::AppState;
+use crate::util::documents_dir;
 use serde_json::{json, Value};
 use tauri::State;
 
@@ -141,9 +142,7 @@ pub async fn workspace_backup(state: State<'_, AppState>) -> std::result::Result
             .map_err(|e| e.to_string())?;
     }
     let stamp = chrono_like_stamp();
-    let documents = std::env::var("USERPROFILE")
-        .map(|root| std::path::Path::new(&root).join("Documents"))
-        .unwrap_or_else(|_| inner.home.clone());
+    let documents = documents_dir();
     let dest = documents.join("Ronic OS backups").join(format!("ronic-backup-{stamp}"));
     std::fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
     let mut copied = 0u64;

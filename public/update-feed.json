@@ -1,24 +1,24 @@
 {
-  "version": "2.1.4",
+  "version": "2.2.0",
   "channel": "stable",
   "published": "2026-11-01",
-  "summary": "Settings includes Update, with release notes and a small notice.",
+  "summary": "Native cross-platform desktop installers and GitHub Releases packaging.",
   "downloadUrl": "",
   "changes": [
     {
       "kind": "feature",
-      "title": "Update",
-      "detail": "Settings → Update lists the installed build and the features and changes published with a release."
+      "title": "Native desktop release",
+      "detail": "Ronic OS now ships as a native Windows installer, macOS DMG, and Linux packages from GitHub Releases."
     },
     {
       "kind": "feature",
-      "title": "Auto update",
-      "detail": "Auto update checks when Ronic OS opens. A newer release, or notes you have not seen for this build, shows a small notice."
+      "title": "Reliable local backend",
+      "detail": "The Rust backend stays embedded in the desktop binary and uses loopback-only services instead of a Node or browser server."
     },
     {
       "kind": "feature",
-      "title": "Manual update",
-      "detail": "Manual update waits until you press Check for updates. The notice appears when that check finds a release you have not dismissed."
+      "title": "Windows installation",
+      "detail": "The Windows setup creates a Start Menu entry and desktop shortcut, and includes the WebView2 offline installer for restricted networks."
     }
   ]
 }

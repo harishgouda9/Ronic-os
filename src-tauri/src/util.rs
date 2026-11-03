@@ -128,6 +128,46 @@ pub fn user_home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// Resolve a user's standard documents/downloads folder without depending on
+/// Windows environment variables. Linux desktop environments may move these
+/// folders through `user-dirs.dirs`; macOS and Windows use the conventional
+/// folders when no override is available.
+pub fn user_folder(kind: &str) -> PathBuf {
+    if let Some(configured) = xdg_user_folder(kind) {
+        return configured;
+    }
+    user_home().join(match kind {
+        "DOCUMENTS" => "Documents",
+        "DOWNLOAD" => "Downloads",
+        _ => kind,
+    })
+}
+
+pub fn documents_dir() -> PathBuf {
+    user_folder("DOCUMENTS")
+}
+
+pub fn downloads_dir() -> PathBuf {
+    user_folder("DOWNLOAD")
+}
+
+fn xdg_user_folder(kind: &str) -> Option<PathBuf> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let path = user_home().join(".config").join("user-dirs.dirs");
+    let key = format!("XDG_{kind}_DIR=");
+    let contents = std::fs::read_to_string(path).ok()?;
+    let line = contents
+        .lines()
+        .find(|line| line.trim_start().starts_with(&key))?;
+    let raw = line.trim_start().strip_prefix(&key)?.trim().trim_matches('"');
+    if raw.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(raw.replace("$HOME", &user_home().to_string_lossy())))
+}
+
 pub fn product_home() -> PathBuf {
     let home = user_home().join(".ronicos");
     migrate_legacy_product_home(&home);

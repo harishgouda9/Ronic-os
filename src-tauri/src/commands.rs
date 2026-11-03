@@ -2,7 +2,7 @@ use crate::db::{self, insert_step, kv_get, kv_set};
 use crate::error::{err, Result};
 use crate::models::*;
 use crate::snapshot::{self, Meta};
-use crate::util::{nid, now_ms, run_capture};
+use crate::util::{documents_dir, downloads_dir, nid, now_ms, run_capture};
 use crate::AppState;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
@@ -1339,9 +1339,7 @@ pub async fn save_exported_file(
         .decode(clean_b64.trim())
         .map_err(|e| err(format!("Invalid base64 payload: {e}")))?;
 
-    let dl_dir = std::env::var("USERPROFILE")
-        .map(|p| std::path::PathBuf::from(p).join("Downloads"))
-        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let dl_dir = downloads_dir();
     let _ = std::fs::create_dir_all(&dl_dir);
 
     let safe_name = filename
@@ -1642,9 +1640,60 @@ pub async fn pick_paths(kind: Option<String>) -> Result<Vec<String>> {
     }
     #[cfg(not(windows))]
     {
-        let _ = kind;
-        Err(err("the file picker runs in the Windows desktop shell"))
+        pick_paths_native(kind.as_deref())
     }
+}
+
+#[cfg(not(windows))]
+fn pick_paths_native(kind: Option<&str>) -> Result<Vec<String>> {
+    let is_folder = matches!(kind, Some("folder" | "directory"));
+    let home = crate::util::user_home();
+
+    #[cfg(target_os = "macos")]
+    {
+        let script = if is_folder {
+            "POSIX path of (choose folder with prompt \"Select Folder\")".to_string()
+        } else {
+            // `choose file` returns a list when multiple selections are enabled.
+            "set chosen to choose file with prompt \"Select Files\" with multiple selections allowed\nset output to \"\"\nrepeat with itemRef in chosen\nset output to output & POSIX path of itemRef & linefeed\nend repeat\nreturn output".to_string()
+        };
+        return run_picker_command("osascript", &["-e", &script]);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let zenity_args = if is_folder {
+            vec!["--file-selection".to_string(), "--directory".to_string()]
+        } else {
+            vec!["--file-selection".to_string(), "--multiple".to_string(), "--separator=\n".to_string()]
+        };
+        if let Ok(paths) = run_picker_command("zenity", &zenity_args.iter().map(String::as_str).collect::<Vec<_>>()) {
+            return Ok(paths);
+        }
+        let kdialog_args = if is_folder {
+            vec!["--getexistingdirectory".to_string(), home.display().to_string()]
+        } else {
+            vec!["--getopenfilename".to_string(), home.display().to_string()]
+        };
+        return run_picker_command("kdialog", &kdialog_args.iter().map(String::as_str).collect::<Vec<_>>());
+    }
+
+    #[allow(unreachable_code)]
+    Err(err("a native file picker is not available on this desktop"))
+}
+
+#[cfg(not(windows))]
+fn run_picker_command(program: &str, args: &[&str]) -> Result<Vec<String>> {
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|error| err(format!("could not start {program}: {error}")))?;
+    if !output.status.success() {
+        // A cancelled native picker is a normal empty selection.
+        return Ok(Vec::new());
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    Ok(text.lines().map(str::trim).filter(|line| !line.is_empty() && std::path::Path::new(line).exists()).map(str::to_string).collect())
 }
 
 #[derive(Deserialize)]
@@ -3318,65 +3367,56 @@ pub struct BackupWriteResult {
 pub async fn detect_backup_destinations() -> std::result::Result<Vec<BackupDestination>, String> {
     let mut dests = Vec::new();
 
-    if let Ok(user_profile) = std::env::var("USERPROFILE") {
-        let docs = std::path::Path::new(&user_profile).join("Documents").join("Ronic OS Memory Backups");
+    let docs = documents_dir().join("Ronic OS Memory Backups");
+    dests.push(BackupDestination {
+        id: "local_documents".into(),
+        name: "Local Documents Folder".into(),
+        kind: "documents".into(),
+        path: docs.display().to_string(),
+        exists: true,
+        description: "Default protected local storage in your Documents folder".into(),
+    });
+
+    let home = crate::util::user_home();
+    let onedrive_paths = [
+        std::env::var("OneDrive").ok().map(std::path::PathBuf::from),
+        std::env::var("OneDriveConsumer").ok().map(std::path::PathBuf::from),
+        std::env::var("OneDriveCommercial").ok().map(std::path::PathBuf::from),
+        Some(home.join("OneDrive")),
+    ];
+    if let Some(path) = onedrive_paths.into_iter().flatten().find(|path| path.is_dir()) {
         dests.push(BackupDestination {
-            id: "local_documents".into(),
-            name: "Local Documents Folder".into(),
-            kind: "documents".into(),
-            path: docs.display().to_string(),
+            id: "cloud_onedrive".into(),
+            name: "Microsoft OneDrive".into(),
+            kind: "onedrive".into(),
+            path: path.join("Ronic OS Memory Backups").display().to_string(),
             exists: true,
-            description: "Default protected local storage in your Documents folder".into(),
+            description: "Synced automatically to your Microsoft OneDrive cloud vault".into(),
         });
+    }
 
-        let onedrive_paths = [
-            std::env::var("OneDrive").ok(),
-            std::env::var("OneDriveConsumer").ok(),
-            std::env::var("OneDriveCommercial").ok(),
-            Some(format!("{}\\OneDrive", user_profile)),
-        ];
-        let mut seen_onedrive = false;
-        for opt in onedrive_paths.into_iter().flatten() {
-            let p = std::path::Path::new(&opt);
-            if p.is_dir() && !seen_onedrive {
-                seen_onedrive = true;
-                let target = p.join("Ronic OS Memory Backups");
-                dests.push(BackupDestination {
-                    id: "cloud_onedrive".into(),
-                    name: "Microsoft OneDrive".into(),
-                    kind: "onedrive".into(),
-                    path: target.display().to_string(),
-                    exists: true,
-                    description: "Synced automatically to your Microsoft OneDrive cloud vault".into(),
-                });
-            }
-        }
+    let dropbox_path = home.join("Dropbox");
+    if dropbox_path.is_dir() {
+        dests.push(BackupDestination {
+            id: "cloud_dropbox".into(),
+            name: "Dropbox".into(),
+            kind: "dropbox".into(),
+            path: dropbox_path.join("Ronic OS Memory Backups").display().to_string(),
+            exists: true,
+            description: "Synced to your local Dropbox folder".into(),
+        });
+    }
 
-        let dropbox_path = std::path::Path::new(&user_profile).join("Dropbox");
-        if dropbox_path.is_dir() {
-            let target = dropbox_path.join("Ronic OS Memory Backups");
-            dests.push(BackupDestination {
-                id: "cloud_dropbox".into(),
-                name: "Dropbox".into(),
-                kind: "dropbox".into(),
-                path: target.display().to_string(),
-                exists: true,
-                description: "Synced to your local Dropbox folder".into(),
-            });
-        }
-
-        let icloud_path = std::path::Path::new(&user_profile).join("iCloudDrive");
-        if icloud_path.is_dir() {
-            let target = icloud_path.join("Ronic OS Memory Backups");
-            dests.push(BackupDestination {
-                id: "cloud_iclouddrive".into(),
-                name: "iCloud Drive".into(),
-                kind: "cloud".into(),
-                path: target.display().to_string(),
-                exists: true,
-                description: "Synced to your iCloud Drive storage".into(),
-            });
-        }
+    let icloud_paths = [home.join("iCloudDrive"), home.join("Library").join("Mobile Documents").join("com~apple~CloudDocs")];
+    if let Some(path) = icloud_paths.into_iter().find(|path| path.is_dir()) {
+        dests.push(BackupDestination {
+            id: "cloud_iclouddrive".into(),
+            name: "iCloud Drive".into(),
+            kind: "cloud".into(),
+            path: path.join("Ronic OS Memory Backups").display().to_string(),
+            exists: true,
+            description: "Synced to your iCloud Drive storage".into(),
+        });
     }
 
     #[cfg(windows)]

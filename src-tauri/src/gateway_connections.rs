@@ -404,10 +404,11 @@ pub async fn gateway_pairing_qr(
         entry.qr_png_base64 = Some(png);
         entry.qr_uri = Some(uri);
     }
-    mgr.lock_connections()
+    let result = mgr.lock_connections()
         .get(&channel_id)
         .cloned()
-        .ok_or_else(|| "pairing state missing".to_string())
+        .ok_or_else(|| "pairing state missing".to_string());
+    result
 }
 
 /// Disconnect a channel, stopping its background listener and removing the stored token.

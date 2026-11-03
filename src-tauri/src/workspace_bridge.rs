@@ -184,7 +184,7 @@ fn rpc(app: &AppHandle, body: &Value) -> Option<Value> {
         "initialize" => Ok(json!({
             "protocolVersion": protocol_of(body),
             "capabilities": { "tools": { "listChanged": false } },
-            "serverInfo": { "name": "ronic-os", "version": "2.1.4" },
+            "serverInfo": { "name": "ronic-os", "version": env!("CARGO_PKG_VERSION") },
             "instructions": instructions()
         })),
         "ping" => Ok(json!({})),

@@ -45,6 +45,10 @@ OPENROUTER_WHOLESALE_KEY       # burst compute margin source
 APP_ORIGIN                     # https://ronic.os
 GHOST_CLUSTER_URL / GHOST_CLUSTER_SECRET   # when the worker cluster ships
 RELEASE_VERSION / RELEASE_NOTES / RELEASE_WINDOWS_URL / RELEASE_WINDOWS_SIG …
+# Optional architecture-specific assets:
+# RELEASE_WINDOWS_AARCH64_URL / RELEASE_WINDOWS_AARCH64_SIG
+# RELEASE_MAC_AARCH64_URL / RELEASE_MAC_AARCH64_SIG
+# RELEASE_LINUX_AARCH64_URL / RELEASE_LINUX_AARCH64_SIG
 ```
 
 Supabase (Edge Function secrets):

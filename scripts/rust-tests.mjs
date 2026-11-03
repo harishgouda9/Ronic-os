@@ -12,7 +12,7 @@
 
 import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, readdirSync, statSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 
 const args = process.argv.slice(2);
 const targetDir = process.env.CARGO_TARGET_DIR || join(process.env.LOCALAPPDATA || "", "ronicos-target");
@@ -23,7 +23,7 @@ const cargoEnv = {
   ...process.env,
   CARGO_TARGET_DIR: targetDir,
   CARGO_TERM_PROGRESS_WHEN: "never",
-  PATH: [join(process.env.USERPROFILE || "", ".cargo", "bin"), process.env.PATH || ""].filter(Boolean).join(";"),
+  PATH: [join(process.env.USERPROFILE || process.env.HOME || "", ".cargo", "bin"), process.env.PATH || ""].filter(Boolean).join(delimiter),
 };
 
 function run(command, cmdArgs, options = {}) {

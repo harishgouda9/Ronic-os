@@ -21,7 +21,6 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
-const DOWNLOAD_URL: &str = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe";
 const ALIAS_PORT: u16 = 8765;
 const START_TIMEOUT_MS: u64 = 45_000;
 
@@ -73,6 +72,22 @@ pub fn binary_path() -> Option<PathBuf> {
 
 fn cloudflared_name() -> &'static str {
     if cfg!(windows) { "cloudflared.exe" } else { "cloudflared" }
+}
+
+fn cloudflared_download() -> (&'static str, bool) {
+    if cfg!(target_os = "windows") {
+        ("https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe", false)
+    } else if cfg!(target_os = "macos") {
+        if cfg!(target_arch = "aarch64") {
+            ("https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64.tgz", true)
+        } else {
+            ("https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-amd64.tgz", true)
+        }
+    } else if cfg!(target_arch = "aarch64") {
+        ("https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64", false)
+    } else {
+        ("https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64", false)
+    }
 }
 
 pub fn status(token: &str) -> TunnelStatus {
@@ -176,10 +191,11 @@ pub fn start() -> Result<String, String> {
     if let Some(stderr) = stderr {
         spawn_log_reader(stderr);
     }
+    TUNNEL_LOG.lock().unwrap_or_else(|poison| poison.into_inner()).clear();
     let pattern = tunnel_url_pattern();
     let deadline = std::time::Instant::now() + Duration::from_millis(START_TIMEOUT_MS);
     let url = loop {
-        if child.try_wait().is_ok() {
+        if matches!(child.try_wait(), Ok(Some(_))) {
             let log_snapshot = TUNNEL_LOG.lock().unwrap_or_else(|poison| poison.into_inner()).clone();
             TUNNEL.lock().unwrap_or_else(|poison| poison.into_inner()).note = "cloudflared exited.".into();
             return Err(format!("cloudflared exited before the tunnel was ready. Last output: {}", tail(&log_snapshot, 600)));
@@ -275,22 +291,26 @@ fn kill_tree(pid: u32) {
     }
     #[cfg(not(windows))]
     {
-        let _ = pid;
+        let pid = pid.to_string();
+        let _ = Command::new("kill").args(["-TERM", &pid]).status();
+        std::thread::sleep(Duration::from_millis(250));
+        let _ = Command::new("kill").args(["-KILL", &pid]).status();
     }
 }
 
-/// Download the single-file cloudflared binary into the product home. Runs on
-/// a blocking thread; reqwest::blocking panics inside the async runtime.
+/// Download the platform-native cloudflared binary into the product home.
+/// Runs on a blocking thread; reqwest::blocking panics inside the async runtime.
 pub fn download_blocking() -> Result<String, String> {
     let dir = product_home().join("bin");
     std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
     let final_path = dir.join(cloudflared_name());
     let part_path = dir.join(format!("{}.part", cloudflared_name()));
+    let (download_url, archive) = cloudflared_download();
     let response = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(20))
         .build()
         .map_err(|error| error.to_string())?
-        .get(DOWNLOAD_URL)
+        .get(download_url)
         .send()
         .map_err(|error| format!("The download did not start: {error}"))?;
     if !response.status().is_success() {
@@ -300,12 +320,78 @@ pub fn download_blocking() -> Result<String, String> {
     if bytes.len() < 5_000_000 {
         return Err("The download was smaller than cloudflared should be, so it was discarded.".into());
     }
-    if cfg!(windows) && !bytes.starts_with(b"MZ") {
-        return Err("The download was not a Windows executable, so it was discarded.".into());
+    if archive {
+        if !bytes.starts_with(&[0x1f, 0x8b]) {
+            return Err("The download was not a gzip archive, so it was discarded.".into());
+        }
+        let archive_path = dir.join("cloudflared.download.tgz");
+        let extract_dir = dir.join(format!("cloudflared-extract-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&extract_dir);
+        std::fs::create_dir_all(&extract_dir).map_err(|error| error.to_string())?;
+        std::fs::write(&archive_path, &bytes).map_err(|error| error.to_string())?;
+        let archive_arg = archive_path.display().to_string();
+        let extract_arg = extract_dir.display().to_string();
+        let status = Command::new("tar")
+            .args(["-xzf", &archive_arg, "-C", &extract_arg])
+            .status()
+            .map_err(|error| format!("could not extract cloudflared: {error}"))?;
+        let _ = std::fs::remove_file(&archive_path);
+        if !status.success() {
+            let _ = std::fs::remove_dir_all(&extract_dir);
+            return Err("could not extract the cloudflared archive".into());
+        }
+        let extracted = find_binary(&extract_dir).ok_or_else(|| "the cloudflared archive had no executable".to_string())?;
+        if final_path.exists() {
+            let _ = std::fs::remove_file(&final_path);
+        }
+        std::fs::rename(&extracted, &final_path).map_err(|error| error.to_string())?;
+        let _ = std::fs::remove_dir_all(&extract_dir);
+    } else {
+        let valid = if cfg!(windows) {
+            bytes.starts_with(b"MZ")
+        } else {
+            bytes.starts_with(&[0x7f, b'E', b'L', b'F'])
+        };
+        if !valid {
+            return Err("the download was not a native cloudflared executable, so it was discarded.".into());
+        }
+        std::fs::write(&part_path, &bytes).map_err(|error| error.to_string())?;
+        std::fs::rename(&part_path, &final_path).map_err(|error| error.to_string())?;
     }
-    std::fs::write(&part_path, &bytes).map_err(|error| error.to_string())?;
-    std::fs::rename(&part_path, &final_path).map_err(|error| error.to_string())?;
+    make_executable(&final_path);
     Ok(format!("cloudflared is ready at {}.", final_path.display()))
+}
+
+fn find_binary(root: &std::path::Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(root).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() && path.file_name().and_then(|name| name.to_str()) == Some("cloudflared") {
+            return Some(path);
+        }
+        if path.is_dir() {
+            if let Some(found) = find_binary(&path) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+fn make_executable(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = std::fs::metadata(path) {
+            let mut permissions = metadata.permissions();
+            permissions.set_mode(0o755);
+            let _ = std::fs::set_permissions(path, permissions);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
 }
 
 fn tail(text: &str, max_chars: usize) -> String {

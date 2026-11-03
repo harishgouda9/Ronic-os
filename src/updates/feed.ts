@@ -1,7 +1,7 @@
 import type { Settings } from "../types";
 
 /** Keep this aligned with package.json, src-tauri/tauri.conf.json, and the Cargo package version. */
-export const PRODUCT_VERSION = "2.1.4";
+export const PRODUCT_VERSION = "2.2.0";
 
 export const UPDATE_NOTICE_KEY = "ronic.update.notice";
 

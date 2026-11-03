@@ -1,6 +1,6 @@
 [package]
 name = "ronicos"
-version = "2.1.4"
+version = "2.2.0"
 description = "Ronic OS — local-first agent workstation"
 edition = "2021"
 rust-version = "1.77"
@@ -35,7 +35,7 @@ url = "2"
 include_dir = "0.7"
 portable-pty = "0.8"
 ed25519-dalek = "2"
-keyring = { version = "3", features = ["windows-native", "sync-secret-service"] }
+keyring = { version = "3", default-features = false, features = ["windows-native", "apple-native", "linux-native-sync-persistent", "crypto-rust"] }
 tauri-plugin-deep-link = "2"
 
 [target.'cfg(windows)'.dependencies]

@@ -1,10 +1,27 @@
 import { execFile, spawn } from "node:child_process";
 import { copyFileSync, existsSync } from "node:fs";
 import { get as httpGet } from "node:http";
+import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const DEV_PORT = 1420;
+
+/** Keep Rust's build output out of a space-containing Windows checkout. */
+export function defaultBuildCacheDir(platform = process.platform, env = process.env, home = homedir()) {
+  const join = platform === "win32" ? path.win32.join : path.posix.join;
+  if (platform === "win32") {
+    return join(env.LOCALAPPDATA || join(home, "AppData", "Local"), "ronicos-target");
+  }
+  if (platform === "darwin") {
+    return join(env.HOME || home, "Library", "Caches", "ronicos-target");
+  }
+  return join(env.XDG_CACHE_HOME || join(env.HOME || home, ".cache"), "ronicos-target");
+}
+
+export function desktopBinaryName(platform = process.platform) {
+  return platform === "win32" ? "ronicos.exe" : "ronicos";
+}
 
 export function isOurDevServer(html) {
   return typeof html === "string" && html.includes("<title>Ronic OS</title>");
@@ -56,7 +73,13 @@ function probeDevServer(timeoutMs = 5000) {
 }
 
 function desktopAppRunning() {
-  if (process.platform !== "win32") return Promise.resolve(null);
+  if (process.platform !== "win32") {
+    return new Promise((resolve) => {
+      execFile("pgrep", ["-x", "ronicos"], { windowsHide: true }, (error, stdout) => {
+        resolve(error ? null : Boolean(stdout?.trim()));
+      });
+    });
+  }
   return new Promise((resolve) => {
     execFile("tasklist", ["/FI", "IMAGENAME eq ronicos.exe", "/NH"], { windowsHide: true }, (error, stdout) => {
       resolve(error ? null : /ronicos\.exe/i.test(stdout ?? ""));
@@ -65,6 +88,16 @@ function desktopAppRunning() {
 }
 
 function focusDesktopWindow() {
+  if (process.platform === "darwin") {
+    return new Promise((resolve) => {
+      execFile("osascript", ["-e", 'tell application "Ronic OS" to activate'], { windowsHide: true }, (error) => resolve(!error));
+    });
+  }
+  if (process.platform === "linux") {
+    return new Promise((resolve) => {
+      execFile("wmctrl", ["-a", "Ronic OS"], { windowsHide: true }, (error) => resolve(!error));
+    });
+  }
   if (process.platform !== "win32") return Promise.resolve(false);
   return new Promise((resolve) => {
     execFile(
@@ -79,7 +112,11 @@ function focusDesktopWindow() {
 // Force-close every running desktop exe. Used to clear an orphaned window
 // (one whose dev server died) so a fresh, healthy instance can take its place.
 function killDesktopApp() {
-  if (process.platform !== "win32") return Promise.resolve(false);
+  if (process.platform !== "win32") {
+    return new Promise((resolve) => {
+      execFile("pkill", ["-x", "ronicos"], { windowsHide: true }, () => resolve(true));
+    });
+  }
   return new Promise((resolve) => {
     execFile("taskkill", ["/IM", "ronicos.exe", "/F"], { windowsHide: true }, () => {
       execFile(
@@ -97,7 +134,27 @@ function killDesktopApp() {
 }
 
 function killPortProcess(port) {
-  if (process.platform !== "win32") return Promise.resolve(false);
+  if (process.platform !== "win32") {
+    return new Promise((resolve) => {
+      execFile("lsof", ["-ti", `:${port}`], { windowsHide: true }, (error, stdout) => {
+        if (error || !stdout) {
+          resolve(false);
+          return;
+        }
+        for (const value of stdout.split(/\s+/)) {
+          const pid = Number(value);
+          if (Number.isInteger(pid) && pid > 0 && pid !== process.pid) {
+            try {
+              process.kill(pid, "SIGKILL");
+            } catch {
+              // The process can exit between lsof and kill.
+            }
+          }
+        }
+        resolve(true);
+      });
+    });
+  }
   return new Promise((resolve) => {
     execFile(
       "powershell.exe",
@@ -110,20 +167,9 @@ function killPortProcess(port) {
 
 async function main() {
   const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-  const localAppData = process.env.LOCALAPPDATA;
-  if (!localAppData) {
-    console.error("LOCALAPPDATA is not set, so the desktop build has nowhere to write.");
-    process.exit(1);
-  }
 
   const tauriArgs = process.argv.slice(2);
   if (tauriArgs.length === 0) tauriArgs.push("dev");
-
-  if (tauriArgs[0] === "build") {
-    if (!tauriArgs.includes("--no-bundle") && !tauriArgs.includes("-b") && !tauriArgs.includes("--bundles")) {
-      tauriArgs.push("--no-bundle");
-    }
-  }
 
   if (tauriArgs[0] === "dev") {
     const probe = await probeDevServer();
@@ -159,15 +205,16 @@ async function main() {
     }
   }
 
-  const home = process.env.USERPROFILE || "";
-  const targetDir = path.join(localAppData, "ronicos-target");
+  const home = process.env.USERPROFILE || process.env.HOME || homedir();
+  const targetDir = process.env.CARGO_TARGET_DIR || defaultBuildCacheDir();
   const cargoBin = path.join(home, ".cargo", "bin");
   const gnuBin = path.join(home, ".rustup", "toolchains", "stable-x86_64-pc-windows-gnu", "bin");
+  const toolPaths = process.platform === "win32" ? [cargoBin, gnuBin] : [cargoBin];
   const env = {
     ...process.env,
     CARGO_TARGET_DIR: targetDir,
     CARGO_TERM_PROGRESS_WHEN: "never",
-    PATH: [cargoBin, gnuBin, process.env.PATH || ""].filter(Boolean).join(path.delimiter),
+    PATH: [...toolPaths, process.env.PATH || ""].filter(Boolean).join(path.delimiter),
   };
 
   console.log("CARGO_TARGET_DIR=" + targetDir);
@@ -185,11 +232,11 @@ async function main() {
   child.on("exit", (code) => {
     if (code === 0 && (tauriArgs[0] === "build" || tauriArgs[0] === "dev")) {
       const mode = tauriArgs[0] === "build" ? "release" : "debug";
-      const builtExe = path.join(targetDir, mode, "ronicos.exe");
+      const builtBinary = path.join(targetDir, mode, desktopBinaryName());
       const rootExe = path.join(root, "ronicos.exe");
-      if (existsSync(builtExe)) {
+      if (process.platform === "win32" && existsSync(builtBinary)) {
         try {
-          copyFileSync(builtExe, rootExe);
+          copyFileSync(builtBinary, rootExe);
           console.log(`Synchronized ${mode} binary to root ronicos.exe successfully.`);
         } catch (copyErr) {
           // If the exe is currently locked by a running process, ignore

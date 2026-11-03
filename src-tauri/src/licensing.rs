@@ -394,7 +394,7 @@ pub async fn open_system_url(url: String) -> std::result::Result<(), String> {
     }
     #[cfg(not(windows))]
     {
-        std::process::Command::new("xdg-open")
+        std::process::Command::new(if cfg!(target_os = "macos") { "open" } else { "xdg-open" })
             .arg(parsed.to_string())
             .spawn()
             .map_err(|e| e.to_string())?;

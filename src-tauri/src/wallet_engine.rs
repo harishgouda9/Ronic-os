@@ -306,18 +306,20 @@ pub fn dispatch_quant_order(
     let ws_latency_ms = started.elapsed().as_secs_f64() * 1000.0;
     let rebate_usd = size_usd * BUILDER_REBATE_BPS as f64 / 10_000.0;
 
+    conn.execute(
+        "UPDATE quant_orders SET ws_latency_ms = ?1, rebate_usd = ?2, reference = ?3 WHERE id = ?4",
+        params![ws_latency_ms, rebate_usd, outcome, order_id],
+    )?;
+
     // Refresh the row settle just transitioned and report its final state.
+    let fallback_reference = outcome.clone();
     let (status, reference): (String, String) = conn
         .query_row(
             "SELECT status, reference FROM quant_orders WHERE id = ?1",
             params![order_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
-        .unwrap_or_else(|_| ("REJECTED".into(), outcome));
-    conn.execute(
-        "UPDATE quant_orders SET ws_latency_ms = ?1, rebate_usd = ?2 WHERE id = ?3",
-        params![ws_latency_ms, rebate_usd, order_id],
-    )?;
+        .unwrap_or_else(|_| ("REJECTED".into(), fallback_reference));
 
     let order = QuantOrder {
         id: order_id,

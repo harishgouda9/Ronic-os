@@ -1,7 +1,7 @@
 {
   "name": "ronicos",
   "private": true,
-  "version": "2.1.4",
+  "version": "2.2.0",
   "type": "module",
   "scripts": {
     "dev": "node ./node_modules/vite/bin/vite.js",
@@ -11,6 +11,8 @@
     "test:rust": "node scripts/rust-tests.mjs",
     "desktop": "node ./scripts/desktop.mjs dev",
     "desktop:build": "node ./scripts/desktop.mjs build",
+    "desktop:build:binary": "node ./scripts/desktop.mjs build --no-bundle",
+    "backend:typecheck": "npm --prefix backend run typecheck",
     "preview": "node ./node_modules/vite/bin/vite.js preview"
   },
   "dependencies": {

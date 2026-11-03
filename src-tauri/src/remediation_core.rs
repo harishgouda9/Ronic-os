@@ -895,6 +895,9 @@ mod fault_injection {
         for _ in 0..600 {
             log_repair(&conn, 1, "filler", "filler", "filler", 0, "repaired").unwrap();
         }
+        // Recent activity is intentionally retained for seven days; age these
+        // fixtures so this test exercises the count cap instead.
+        conn.execute("UPDATE remediation_logs SET created_at = 1000", []).unwrap();
         sentinel_scan(&conn, &home, "sentry_sentinel").unwrap(); // triggers pruning
         let events: i64 = conn.query_row("SELECT COUNT(*) FROM sentinel_events", [], |r| r.get(0)).unwrap();
         let repairs: i64 = conn.query_row("SELECT COUNT(*) FROM remediation_logs", [], |r| r.get(0)).unwrap();
