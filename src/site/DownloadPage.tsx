@@ -1,4 +1,5 @@
-import { useRef, useState, useEffect, type PointerEvent } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore, type PointerEvent } from "react";
+import { siteRecovery, siteResetPassword, siteSession, siteSignIn, siteSignOut, siteSignUp, siteUpdatePassword, startSiteAccount, subscribeSiteAccount } from "./account";
 import { doorStatus, MCP_URL, toolNames } from "./door";
 import { downloads, primaryDownload, type Download } from "./downloads";
 import "./download.css";
@@ -17,7 +18,7 @@ const SCREENS: { name: string; why: string; features: { name: string; detail: st
   { name: "Workflows", why: "You need a job you already finished to run again without building it a second time.", features: [{ name: "Saved run", detail: "A workflow is that finished job, ready to run again." }, { name: "Visible schedule", detail: "A schedule sits with the chat, where you can see it." }, { name: "Laptop closed", detail: "Scheduled jobs pause when you close the app, unless a cloud runner cluster is connected." }], benefit: "Repeat the job. The runner appears only when that cluster is connected." },
   { name: "Marketplace", why: "You need to add a capability without writing it yourself.", features: [{ name: "Install in the app", detail: "Listings install from the Marketplace screen." }, { name: "You choose what turns on", detail: "Nothing from a listing starts until you enable it." }, { name: "Same permissions", detail: "A listing does not receive the vault." }], benefit: "What you add stays inside the permission model you already use." },
   { name: "Wallet & trading", why: "You need a place to practice, and you need a live payment to wait for your signature.", features: [{ name: "Sandbox", detail: "Practice without a live signature." }, { name: "Live signed rail", detail: "A live rail is a choice. The header shows which state you are in." }, { name: "Spend rules", detail: "Spend rules live in Settings, on this computer." }], benefit: "Money moves when you sign." },
-  { name: "Profile", why: "You need the desktop to know the person it answers to.", features: [{ name: "The owner", detail: "Profile is that person. Bots are not the owner." }, { name: "Scoped under you", detail: "A bot, a channel, or a connected app does not become you." }, { name: "Sign-in in the app", detail: "Account opens from the Plan screen after you install. This website does not sign you in." }], benefit: "The bots work under you." },
+  { name: "Profile", why: "You need the desktop to know the person it answers to.", features: [{ name: "The owner", detail: "Profile is that person. Bots are not the owner." }, { name: "Scoped under you", detail: "A bot, a channel, or a connected app does not become you." }, { name: "The same account", detail: "Sign in here. The installed app uses that account on the Plan screen." }], benefit: "The bots work under you." },
   { name: "Self-repair", why: "You need to see a fix when the desk breaks, instead of a silent process changing things.", features: [{ name: "A visible screen", detail: "Self-repair reports what it can fix." }, { name: "Doctor and failover", detail: "Settings holds those controls." }, { name: "Your decision", detail: "You decide what it may change. It does not get a free pass at the vault." }], benefit: "You can read what it is doing before it changes the desk." },
   { name: "Plan & setup", why: "You need the local app free, and a paid desk only when you choose it inside the app.", features: [{ name: "Starter", detail: "The desktop is free to install, with local memory and the providers you connect." }, { name: "Pro", detail: "$14/mo or ₹999/mo, or $120/yr and ₹9,990/yr, billed from the Plan screen." }, { name: "Founder Pass", detail: "$149 once or ₹11,999 once, capped at 500. Cloud runners are $19/mo and appear only when that cluster is connected." }], benefit: "Install first. Pay from the Plan screen after you sign in." },
   { name: "Settings", why: "You need to set the desk once and stop repeating the same choices.", features: [{ name: "Look and data", detail: "Theme, density, the project, the vault, and memory live here." }, { name: "Approvals", detail: "Auto, ask, or manual is one choice." }, { name: "Paths you can read", detail: "Computer profiles, wallet spend rules, updates, local backups, and the paths for CLIs, skills, and the computer are listed." }], benefit: "The rules sit in one screen, on this computer." },
@@ -119,6 +120,99 @@ function DoorCheck() {
   );
 }
 
+function SiteAccount() {
+  const session = useSyncExternalStore(subscribeSiteAccount, siteSession, () => null);
+  const recovery = useSyncExternalStore(subscribeSiteAccount, siteRecovery, () => false);
+  const dialog = useRef<HTMLDialogElement>(null);
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [nextPassword, setNextPassword] = useState("");
+  const [note, setNote] = useState("");
+  const [busy, setBusy] = useState(false);
+  const ready = email.trim().includes("@") && password.length >= 8;
+
+  useEffect(() => { startSiteAccount(); }, []);
+
+  function finish(message: string) {
+    setNote(message);
+    setBusy(false);
+  }
+
+  return (
+    <>
+      <button type="button" className="site-btn ghost" onClick={() => dialog.current?.showModal()}>
+        <span className="site-account">{session?.user.email ?? "Sign in"}</span>
+      </button>
+      <dialog
+        ref={dialog}
+        className="site-auth"
+        aria-label="Account"
+        onClick={(event) => { if (event.target === event.currentTarget) dialog.current?.close(); }}
+      >
+        <button type="button" className="site-btn ghost" onClick={() => dialog.current?.close()}>Close</button>
+        {session ? (
+          <div>
+            <h3>Signed in</h3>
+            <p>{session.user.email}</p>
+            {recovery ? (
+              <form
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  setBusy(true);
+                  void siteUpdatePassword(nextPassword).then((message) => finish(message || "Password saved."));
+                }}
+              >
+                <label>New password<input type="password" autoComplete="new-password" value={nextPassword} onChange={(event) => setNextPassword(event.target.value)} /></label>
+                <div className="site-auth-actions">
+                  <button className="site-btn" disabled={busy || nextPassword.length < 8}>Save password</button>
+                </div>
+              </form>
+            ) : null}
+            <div className="site-auth-actions">
+              <button type="button" className="site-btn ghost" disabled={busy} onClick={() => { setBusy(true); void siteSignOut().then(() => finish("Signed out.")); }}>Sign out</button>
+            </div>
+          </div>
+        ) : (
+          <form
+            onSubmit={(event) => {
+              event.preventDefault();
+              setBusy(true);
+              void siteSignIn(email, password).then((message) => finish(message || "Signed in.")).catch((error) => finish(error instanceof Error ? error.message : "Sign-in failed."));
+            }}
+          >
+            <h3>Sign in</h3>
+            <p>This is the Ronic account. It is not an MCP connection.</p>
+            <label>Email<input type="email" autoComplete="username" value={email} onChange={(event) => setEmail(event.target.value)} required /></label>
+            <label>Password<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} required /></label>
+            <div className="site-auth-actions">
+              <button className="site-btn" disabled={busy || !ready}>Sign in</button>
+              <button
+                type="button"
+                className="site-btn ghost"
+                disabled={busy || !ready}
+                onClick={() => {
+                  setBusy(true);
+                  void siteSignUp(email, password, window.location.origin).then((message) => finish(message || "Account created. You are signed in.")).catch((error) => finish(error instanceof Error ? error.message : "The account could not be created."));
+                }}
+              >Create account</button>
+            </div>
+            <button
+              type="button"
+              className="site-text"
+              disabled={busy || !email.trim().includes("@")}
+              onClick={() => {
+                setBusy(true);
+                void siteResetPassword(email, window.location.origin).then((message) => finish(message || "Reset email sent. Open the link in this browser."));
+              }}
+            >Forgot password</button>
+          </form>
+        )}
+        {note ? <p role="status">{note}</p> : null}
+      </dialog>
+    </>
+  );
+}
+
 function tilt(event: PointerEvent<HTMLDivElement>) {
   if (event.pointerType === "touch") return;
   if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
@@ -132,7 +226,6 @@ function tilt(event: PointerEvent<HTMLDivElement>) {
 export function DownloadPage() {
   const [file, setFile] = useState<Download>(() => primaryDownload(navigator.userAgent));
   const [inr, setInr] = useState(false);
-  const [signInNote, setSignInNote] = useState(false);
   const [pin, setPin] = useState<string | null>(null);
   const [screen, setScreen] = useState<string | null>(null);
   const openScreen = SCREENS.find((item) => item.name === screen);
@@ -160,7 +253,7 @@ export function DownloadPage() {
           <a href="#pricing">Pricing</a>
         </nav>
         <div className="site-bar-actions">
-          <button type="button" className="site-btn ghost" onClick={() => setSignInNote(true)}>Sign in</button>
+          <SiteAccount />
           <a className="site-btn" href={file.href}>Download</a>
         </div>
       </header>
@@ -183,7 +276,6 @@ export function DownloadPage() {
           <a className="site-btn ghost" href="#pricing">See plans</a>
         </div>
         <p className="site-fine">{file.note}</p>
-        {signInNote ? <p className="site-signin">Sign-in opens inside the installed app. Download it, then use Account on the Plan screen.</p> : null}
 
         <div className="site-beam" onPointerMove={tilt} onPointerLeave={(event) => { event.currentTarget.style.removeProperty("--rx"); event.currentTarget.style.removeProperty("--ry"); }}>
           <figure className="site-frame">

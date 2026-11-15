@@ -344,6 +344,33 @@
 }
 .site-light::backdrop { background: rgba(15, 23, 42, 0.72); }
 .site-light form { display: flex; justify-content: flex-end; margin-bottom: 8px; }
+.site-account { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.site-auth {
+  display: grid;
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  margin: 0;
+  max-height: calc(100% - 32px);
+  overflow: auto;
+  width: min(420px, calc(100% - 32px));
+  padding: 22px;
+  border: 1px solid #111;
+  border-radius: 16px;
+  background: #fff;
+  color: #18181b;
+}
+.site-auth > .site-btn { justify-self: end; }
+.site-auth .site-btn { min-height: 44px; }
+.site-auth::backdrop { background: rgba(15, 23, 42, 0.72); }
+.site-auth h3 { margin: 8px 0 0; font-size: 22px; letter-spacing: -0.03em; }
+.site-auth p { margin: 8px 0 0; color: #334155; font-size: 14px; }
+.site-auth label { display: grid; gap: 6px; margin-top: 12px; font-size: 13px; font-weight: 600; }
+.site-auth input { min-height: 40px; padding: 0 12px; border: 1px solid #e5e5e5; border-radius: 8px; background: #fff; color: #111; font: inherit; font-weight: 400; }
+.site-auth-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+.site-text { margin-top: 12px; padding: 0; border: 0; background: none; color: #0f766e; font: inherit; font-size: 13px; font-weight: 600; cursor: pointer; }
+.site-text:disabled { opacity: 0.5; cursor: default; }
 .site-light img { display: block; width: 100%; height: auto; border-radius: 10px; }
 
 @media (max-width: 980px) {
