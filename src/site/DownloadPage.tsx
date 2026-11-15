@@ -1,25 +1,26 @@
-import { useEffect, useRef, useState, type PointerEvent } from "react";
+import { useRef, useState, useEffect, type PointerEvent } from "react";
+import { doorStatus, MCP_URL, toolNames } from "./door";
 import { downloads, primaryDownload, type Download } from "./downloads";
 import "./download.css";
 
-const SCREENS: { name: string; hook: string; body: string; points: string[] }[] = [
-  { name: "Bots & groups", hook: "One chief. The bots do the pieces.", body: "Start in one conversation. A chief can hand a job to a scoped bot with a contract: what done means, which model may spend, and what that bot is not allowed to see.", points: ["The chief stays in the thread you are already in.", "A bot gets the task, not the vault.", "You can see who is working and what it was allowed to touch."] },
-  { name: "Messaging Gateway", hook: "Text the desktop from the phone you already use.", body: "Telegram, Slack, Discord, WhatsApp, and the other inboxes you connect land in one gateway. A stranger does not become the owner.", points: ["You approve who can start a turn.", "Clear the allowlist and the next sender is refused.", "Pairing starts on this computer, then the phone can reach it."] },
-  { name: "Apps & providers", hook: "Keep the model accounts you already pay for.", body: "Connect the providers and the web apps. Ronic OS does not issue a second bill for the models you already have.", points: ["Keys stay in those accounts.", "ChatGPT, Claude, and the rest can sit beside the chat.", "A site login is not an MCP connection."] },
-  { name: "Memory", hook: "The desk remembers. The notes stay here.", body: "Memory is a local database on this computer. Search does not ship the vault out to answer a question.", points: ["A bot can rewrite its own note.", "It cannot replace a note that belongs to another bot.", "You can still edit anything yourself."] },
-  { name: "Skills & Capabilities", hook: "Teach it once. Run it again.", body: "Skills, plugins, and MCP tool servers live in one studio, with the permission each one actually has.", points: ["A skill is a playbook the bot can run again.", "Plugins stay scoped.", "You can see the tool servers instead of hunting a config file."] },
-  { name: "MCP & ACP mesh", hook: "Connect a tool without handing it the keys.", body: "The mesh is where other apps reach this desktop. A connection is something you make, not something a website login implies.", points: ["MCP and ACP links are listed in one place.", "Each link is a connector, not a blank check.", "You can tell what is connected and what is only open in a browser."] },
-  { name: "Harness²", hook: "Small edits stay cheap. Heavy work can step up.", body: "Harness² is the stronger lane for coding work, in the same window as the chat. It does not get its own copy of the vault.", points: ["Short changes can stay on a cheaper or local model.", "Heavier work can move to the harness.", "You stay in the loop on what it spends."] },
-  { name: "Bot fleet", hook: "More than one bot. Still one owner.", body: "The fleet is the set of bots you run. Each one stays scoped to its job instead of becoming a second you.", points: ["See the bots without opening another app.", "A chief can hand work across them.", "One bot cannot quietly take another's notes or keys."] },
-  { name: "Coding agents", hook: "Give the agent the task, not the machine.", body: "A coding agent, a CLI, or Cursor can receive a short sheet of the open work. Memory and the vault stay on the desktop.", points: ["Context copy packs the goal, the files, and the constraint.", "The agent does not receive the vault.", "You keep the editor and the accounts you already use."] },
-  { name: "Computer & browser", hook: "Let it use the computer. Keep your mouse.", body: "Computer use runs in its own windows. You can watch, mark a control, or record one demonstration and turn that into a skill.", points: ["The bot does not take your pointer.", "A marked screen lets a click target one control.", "Show it once, then run that skill again."] },
-  { name: "Workflows", hook: "The job you repeat should not need you every time.", body: "A workflow is a saved run. Scheduled jobs live with the chat, and they pause when you close the app unless a cloud runner is connected.", points: ["Turn a finished job into something you can run again.", "A schedule is visible, not a hidden cron you forgot.", "The runner is optional, and it appears only when that cluster is connected."] },
-  { name: "Marketplace", hook: "Add a capability. Do not rebuild it.", body: "The marketplace is where extra skills and listings are installed onto this desktop. A listing does not receive the vault.", points: ["Install from the app, not from a random script.", "You choose what turns on.", "What you add stays inside the same permission model."] },
-  { name: "Wallet & trading", hook: "Money moves only when you sign.", body: "The wallet can sit in a sandbox, or on a live signed rail. Those are different states, and the header shows which one you are in.", points: ["Practice without a live signature.", "A live rail is a choice, not the default surprise.", "Spend rules live in Settings, on this computer."] },
-  { name: "Profile", hook: "The bots work. You are the owner.", body: "Profile is the person this desktop answers to. A bot, a channel, or a connected app does not become that person.", points: ["Your account opens from the Plan screen after install.", "Bots stay scoped under you.", "Sign-in finishes inside the app, not on this website."] },
-  { name: "Self-repair", hook: "When the desk breaks, you can see the fix.", body: "Self-repair is a screen, not a silent process. It reports what it can fix, and Settings holds the doctor and failover controls.", points: ["You can read what it is doing.", "You decide what it is allowed to change.", "It does not get a free pass at the vault."] },
-  { name: "Plan & setup", hook: "Install free. Pay only for the desk you want.", body: "Starter is the local app. Pro and Founder Pass are billed from the Plan screen after you sign in.", points: ["Pro is $14/mo or ₹999/mo, or $120/yr and ₹9,990/yr.", "Founder Pass is $149 once or ₹11,999 once, capped at 500.", "Cloud runners are $19/mo, and only when that cluster is connected."] },
-  { name: "Settings", hook: "Set the desk once. Stop repeating yourself.", body: "Theme, density, the vault, approvals, computer profiles, wallet rules, and updates live here. Auto, ask, or manual is a single choice, not a row of mystery switches.", points: ["Approvals can be automatic, a question, or manual.", "Local data and backups stay on this computer.", "The paths for CLIs, skills, and the computer are visible."] },
+const SCREENS: { name: string; why: string; features: { name: string; detail: string }[]; benefit: string }[] = [
+  { name: "Bots & groups", why: "You need one conversation, then a way to hand a piece of the job to a bot that cannot see everything you can.", features: [{ name: "Chief handoff", detail: "The chief stays in the thread and sends a scoped bot a contract: what done means, which model may spend, and what it cannot see." }, { name: "Task, not the vault", detail: "The bot receives the job. Secrets stay on this computer." }, { name: "Visible work", detail: "You can see who is working and what it was allowed to touch." }], benefit: "One thread runs the desk. Every bot stays scoped under you." },
+  { name: "Messaging Gateway", why: "You need to reach this desktop from the phone you already carry, without a stranger starting a turn.", features: [{ name: "The inboxes you use", detail: "Telegram, Slack, Discord, WhatsApp, Signal, WeChat, and BlueBubbles land in one gateway." }, { name: "Allowlist", detail: "You approve who can start a turn. An empty allowlist refuses the next sender." }, { name: "Pairing on this computer", detail: "Pairing starts here. After that, the phone can reach the desk." }], benefit: "Your phone talks to the desktop. It does not become a second owner." },
+  { name: "Apps & providers", why: "You need the model accounts you already pay for beside the chat, without a second bill for the same models.", features: [{ name: "Your keys", detail: "Keys stay in the provider accounts you connect." }, { name: "Apps beside the chat", detail: "ChatGPT, Claude, and the other connected web apps sit next to the conversation." }, { name: "Login is not MCP", detail: "Opening an app is a site session. An MCP connection is a separate step." }], benefit: "The desk uses the accounts you already have." },
+  { name: "Memory", why: "You need the desk to remember the work, and you need those notes to stay on this computer.", features: [{ name: "Local database", detail: "Memory lives here. Search does not ship the vault out to answer a question." }, { name: "A bot's own note", detail: "A bot can rewrite its own note. It cannot replace a note that belongs to another bot." }, { name: "You can still edit", detail: "You can open any note and change it yourself." }], benefit: "The next session starts from the notes, on this computer." },
+  { name: "Skills & Capabilities", why: "You need a job you taught once to run again, with the permission you actually gave it.", features: [{ name: "Playbook skills", detail: "A skill is a playbook the bot can run again." }, { name: "Scoped plugins", detail: "Plugins stay inside the permission you set." }, { name: "MCP tool servers", detail: "Tool servers are listed in this studio with the permission each one has." }], benefit: "Teach it once. You can see what it is allowed to run." },
+  { name: "MCP & ACP mesh", why: "You need ChatGPT, Claude, or another agent to call this desktop. A website login does not do that.", features: [{ name: "Public connector", detail: "The address to paste is https://ronicos.vercel.app/mcp. ChatGPT and Claude fetch it from their own servers." }, { name: "Where to paste it", detail: "ChatGPT uses its apps settings. Claude uses custom connectors. Gemini web has no custom MCP connector for consumer accounts." }, { name: "A real check", detail: "Check connection asks this website's door and shows the desktop's tools only when a computer is connected." }], benefit: "You make the connection. The page shows the door's real reply." },
+  { name: "Harness²", why: "You need short edits to stay on a cheaper lane and heavier coding to step up, in the same window.", features: [{ name: "Same window", detail: "Harness² is the stronger coding lane beside the chat." }, { name: "Step up the model", detail: "Short changes can stay on a cheaper or local model. Heavier work can move to the harness." }, { name: "No second vault", detail: "It does not get its own copy of the vault." }], benefit: "You stay in the loop on what the heavier lane spends." },
+  { name: "Bot fleet", why: "You need more than one bot, and you still need one owner.", features: [{ name: "One list", detail: "See the bots you run without opening another app." }, { name: "Handoff across bots", detail: "A chief can hand work from one scoped bot to another." }, { name: "Separate notes and keys", detail: "One bot cannot take another's notes or keys." }], benefit: "The fleet can grow. The owner stays you." },
+  { name: "Coding agents", why: "You need a coding agent, a CLI, or Cursor to receive the task, not the machine.", features: [{ name: "Context copy", detail: "A short sheet packs the goal, the files, and the constraint." }, { name: "Vault stays here", detail: "The agent does not receive the vault." }, { name: "Your editor", detail: "You keep the editor and the accounts you already use." }], benefit: "The agent gets the sheet. The desktop keeps the rest." },
+  { name: "Computer & browser", why: "You need the bot to use a screen while your mouse stays yours.", features: [{ name: "Its own windows", detail: "Computer use runs in windows that are not your pointer." }, { name: "Mark a control", detail: "A marked screen lets a click target one control." }, { name: "One demonstration", detail: "Record one demonstration and turn that into a skill you can run again." }], benefit: "You can watch it work. It does not take your pointer." },
+  { name: "Workflows", why: "You need a job you already finished to run again without building it a second time.", features: [{ name: "Saved run", detail: "A workflow is that finished job, ready to run again." }, { name: "Visible schedule", detail: "A schedule sits with the chat, where you can see it." }, { name: "Laptop closed", detail: "Scheduled jobs pause when you close the app, unless a cloud runner cluster is connected." }], benefit: "Repeat the job. The runner appears only when that cluster is connected." },
+  { name: "Marketplace", why: "You need to add a capability without writing it yourself.", features: [{ name: "Install in the app", detail: "Listings install from the Marketplace screen." }, { name: "You choose what turns on", detail: "Nothing from a listing starts until you enable it." }, { name: "Same permissions", detail: "A listing does not receive the vault." }], benefit: "What you add stays inside the permission model you already use." },
+  { name: "Wallet & trading", why: "You need a place to practice, and you need a live payment to wait for your signature.", features: [{ name: "Sandbox", detail: "Practice without a live signature." }, { name: "Live signed rail", detail: "A live rail is a choice. The header shows which state you are in." }, { name: "Spend rules", detail: "Spend rules live in Settings, on this computer." }], benefit: "Money moves when you sign." },
+  { name: "Profile", why: "You need the desktop to know the person it answers to.", features: [{ name: "The owner", detail: "Profile is that person. Bots are not the owner." }, { name: "Scoped under you", detail: "A bot, a channel, or a connected app does not become you." }, { name: "Sign-in in the app", detail: "Account opens from the Plan screen after you install. This website does not sign you in." }], benefit: "The bots work under you." },
+  { name: "Self-repair", why: "You need to see a fix when the desk breaks, instead of a silent process changing things.", features: [{ name: "A visible screen", detail: "Self-repair reports what it can fix." }, { name: "Doctor and failover", detail: "Settings holds those controls." }, { name: "Your decision", detail: "You decide what it may change. It does not get a free pass at the vault." }], benefit: "You can read what it is doing before it changes the desk." },
+  { name: "Plan & setup", why: "You need the local app free, and a paid desk only when you choose it inside the app.", features: [{ name: "Starter", detail: "The desktop is free to install, with local memory and the providers you connect." }, { name: "Pro", detail: "$14/mo or ₹999/mo, or $120/yr and ₹9,990/yr, billed from the Plan screen." }, { name: "Founder Pass", detail: "$149 once or ₹11,999 once, capped at 500. Cloud runners are $19/mo and appear only when that cluster is connected." }], benefit: "Install first. Pay from the Plan screen after you sign in." },
+  { name: "Settings", why: "You need to set the desk once and stop repeating the same choices.", features: [{ name: "Look and data", detail: "Theme, density, the project, the vault, and memory live here." }, { name: "Approvals", detail: "Auto, ask, or manual is one choice." }, { name: "Paths you can read", detail: "Computer profiles, wallet spend rules, updates, local backups, and the paths for CLIs, skills, and the computer are listed." }], benefit: "The rules sit in one screen, on this computer." },
 ];
 
 const FEATURES = [
@@ -39,6 +40,84 @@ const PINS = [
 ];
 
 const SHOT = "Ronic OS desktop, with the bot list, a chief conversation, the computer panel, and connected web apps";
+
+function DoorCheck() {
+  const field = useRef<HTMLInputElement>(null);
+  const [busy, setBusy] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [status, setStatus] = useState("");
+  const [tools, setTools] = useState<string[]>([]);
+
+  async function copy() {
+    field.current?.focus();
+    field.current?.select();
+    try {
+      await navigator.clipboard.writeText(MCP_URL);
+      setCopied(true);
+    } catch {
+      setCopied(false);
+    }
+  }
+
+  async function check() {
+    setBusy(true);
+    setTools([]);
+    setStatus("Checking the door…");
+    const headers = { "content-type": "application/json", accept: "application/json, text/event-stream" };
+    try {
+      const opened = await fetch("/mcp", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "ronic-site", version: "2.2.0" } },
+        }),
+      });
+      const text = await opened.text();
+      const door = doorStatus(opened.status, text);
+      setStatus(door.ok ? `Connected. ${door.detail}` : door.detail);
+      const session = opened.headers.get("mcp-session-id");
+      if (!door.ok || !session) return;
+      try {
+        await fetch("/mcp", {
+          method: "POST",
+          headers: { ...headers, "mcp-session-id": session },
+          body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
+        });
+        const listed = await fetch("/mcp", {
+          method: "POST",
+          headers: { ...headers, "mcp-session-id": session },
+          body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }),
+        });
+        setTools(toolNames(await listed.text()));
+      } catch {
+        // Initialize already reported the door. A later tools call must not hide that.
+      }
+    } catch (err) {
+      setStatus(err instanceof Error ? err.message : "The door did not answer.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="site-door">
+      <label>
+        Connector URL
+        <input ref={field} readOnly value={MCP_URL} onFocus={(event) => event.currentTarget.select()} />
+      </label>
+      <div className="site-door-actions">
+        <button type="button" className="site-btn ghost" onClick={copy}>{copied ? "Copied" : "Copy URL"}</button>
+        <button type="button" className="site-btn" onClick={check} disabled={busy} aria-busy={busy}>{busy ? "Checking…" : "Check connection"}</button>
+      </div>
+      <p>Paste this into ChatGPT or Claude. Check connection calls this website and shows the reply it gets.</p>
+      {status ? <p role="status">{status}</p> : null}
+      {tools.length ? <p>Tools: {tools.join(", ")}</p> : null}
+    </div>
+  );
+}
 
 function tilt(event: PointerEvent<HTMLDivElement>) {
   if (event.pointerType === "touch") return;
@@ -177,14 +256,18 @@ export function DownloadPage() {
         </div>
         {openScreen ? (
           <article className="site-screen" key={openScreen.name} aria-live="polite">
-            <p className="site-benefit">{openScreen.hook}</p>
+            <p className="site-benefit">Why you need it</p>
             <h3>{openScreen.name}</h3>
-            <p>{openScreen.body}</p>
+            <p>{openScreen.why}</p>
+            <p className="site-label">Features</p>
             <ul>
-              {openScreen.points.map((point) => <li key={point}>{point}</li>)}
+              {openScreen.features.map((feature) => <li key={feature.name}><strong>{feature.name}.</strong> {feature.detail}</li>)}
             </ul>
+            <p className="site-label">Benefit</p>
+            <p>{openScreen.benefit}</p>
+            {openScreen.name === "MCP & ACP mesh" ? <DoorCheck /> : null}
           </article>
-        ) : <p className="site-screen-hint">Pick a screen to see what it does for you.</p>}
+        ) : <p className="site-screen-hint">Pick a screen to see why you need it.</p>}
       </section>
 
       <section className="site-band" id="pricing">
