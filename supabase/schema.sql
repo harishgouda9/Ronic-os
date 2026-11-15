@@ -511,3 +511,59 @@ revoke execute on function public.set_ghost_runner_status(uuid, text, text) from
 grant execute on function public.register_device(uuid, text, text, text) to authenticated;
 grant execute on function public.revoke_device(uuid, uuid) to authenticated;
 grant execute on function public.ensure_user_rows(uuid) to authenticated;
+
+-- One public MCP door. The desktop registers the current quick-tunnel origin.
+-- The hash is not readable. A later call must send the same token; a different token cannot replace it.
+-- shortcut: the row expires 6h after the last register, the desktop republishes while the tunnel is up.
+create table if not exists public.mcp_edge (
+  id integer primary key check (id = 1),
+  upstream text not null,
+  token_hash text not null,
+  updated_at timestamptz not null default now()
+);
+
+alter table public.mcp_edge enable row level security;
+
+create or replace function public.set_mcp_edge(p_upstream text, p_token text)
+returns void
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  next_hash text;
+begin
+  if p_upstream is null or p_upstream !~ '^https://[a-z0-9-]+\.trycloudflare\.com$' then
+    raise exception 'bad upstream' using errcode = '22023';
+  end if;
+  if p_token is null or length(p_token) <> 64 or p_token !~ '^[0-9a-fA-F]+$' then
+    raise exception 'bad token' using errcode = '22023';
+  end if;
+  next_hash := encode(digest(convert_to(p_token, 'UTF8'), 'sha256'), 'hex');
+  insert into public.mcp_edge (id, upstream, token_hash, updated_at)
+  values (1, p_upstream, next_hash, now())
+  on conflict (id) do update
+    set upstream = excluded.upstream,
+        updated_at = excluded.updated_at
+    where public.mcp_edge.token_hash = excluded.token_hash;
+  if not found then
+    raise exception 'token mismatch' using errcode = '42501';
+  end if;
+end;
+$$;
+
+create or replace function public.mcp_edge_upstream()
+returns text
+language sql
+security definer
+set search_path = public
+stable
+as $$
+  select upstream from public.mcp_edge
+  where id = 1 and updated_at > now() - interval '6 hours';
+$$;
+
+revoke all on function public.set_mcp_edge(text, text) from public, anon, authenticated;
+revoke all on function public.mcp_edge_upstream() from public, anon, authenticated;
+grant execute on function public.set_mcp_edge(text, text) to service_role;
+grant execute on function public.mcp_edge_upstream() to service_role;

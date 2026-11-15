@@ -7,7 +7,7 @@
     "dev": "node ./node_modules/vite/bin/vite.js",
     "build": "node ./node_modules/typescript/bin/tsc --noEmit && node ./node_modules/vite/bin/vite.js build",
     "typecheck": "node ./node_modules/typescript/bin/tsc --noEmit",
-    "test": "node --test scripts/desktop.test.mjs scripts/miniDriveScripts.test.mjs scripts/messagingGateway.test.mjs scripts/chiefDelegation.test.mjs scripts/marketplaceAuth.test.mjs scripts/memoryBackup.test.mjs scripts/walletRealRails.test.mjs && node --experimental-strip-types --test scripts/updates.test.mjs",
+    "test": "node --test scripts/desktop.test.mjs scripts/miniDriveScripts.test.mjs scripts/messagingGateway.test.mjs scripts/chiefDelegation.test.mjs scripts/marketplaceAuth.test.mjs scripts/memoryBackup.test.mjs scripts/walletRealRails.test.mjs scripts/mcp-edge.test.mjs && node --experimental-strip-types --test scripts/updates.test.mjs",
     "test:rust": "node scripts/rust-tests.mjs",
     "desktop": "node ./scripts/desktop.mjs dev",
     "desktop:build": "node ./scripts/desktop.mjs build",

@@ -1,0 +1,15 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "rewrites": [
+    { "source": "/mcp", "destination": "/api/mcp?ronic_path=%2Fmcp" },
+    { "source": "/authorize", "destination": "/api/mcp?ronic_path=%2Fauthorize" },
+    { "source": "/token", "destination": "/api/mcp?ronic_path=%2Ftoken" },
+    { "source": "/register", "destination": "/api/mcp?ronic_path=%2Fregister" },
+    { "source": "/.well-known/oauth-protected-resource", "destination": "/api/mcp?ronic_path=%2F.well-known%2Foauth-protected-resource" },
+    { "source": "/.well-known/oauth-protected-resource/mcp", "destination": "/api/mcp?ronic_path=%2F.well-known%2Foauth-protected-resource%2Fmcp" },
+    { "source": "/.well-known/oauth-authorization-server", "destination": "/api/mcp?ronic_path=%2F.well-known%2Foauth-authorization-server" },
+    { "source": "/.well-known/oauth-authorization-server/mcp", "destination": "/api/mcp?ronic_path=%2F.well-known%2Foauth-authorization-server%2Fmcp" },
+    { "source": "/.well-known/openid-configuration", "destination": "/api/mcp?ronic_path=%2F.well-known%2Fopenid-configuration" },
+    { "source": "/auth/bounce", "destination": "/api/auth/bounce" }
+  ]
+}
