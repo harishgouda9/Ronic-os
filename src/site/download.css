@@ -1,0 +1,6 @@
+.site-card { width: min(440px, calc(100% - 48px)); }
+.site-card .boot-logo { animation: none; }
+.site-download { margin-top: 16px; height: 40px; padding: 0 18px; display: inline-flex; align-items: center; text-decoration: none; }
+.site-note { max-width: 360px; }
+.site-others { margin: 14px 0 0; display: flex; flex-wrap: wrap; gap: 8px 14px; justify-content: center; }
+.site-others a { color: var(--ink-2); font-size: 12px; }

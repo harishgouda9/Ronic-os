@@ -6,16 +6,18 @@ import "@fontsource/jetbrains-mono/500.css";
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App";
+import { DownloadPage } from "./site/DownloadPage";
 import { ErrorBoundary } from "./ui/ErrorBoundary";
 import { startCloud } from "./services/cloud";
 import "./styles.css";
 
-startCloud();
+const desktop = "__TAURI_INTERNALS__" in window;
+if (desktop) startCloud();
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
     <ErrorBoundary>
-      <App />
+      {desktop ? <App /> : <DownloadPage />}
     </ErrorBoundary>
   </StrictMode>,
 );
