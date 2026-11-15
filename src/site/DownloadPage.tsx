@@ -2,11 +2,24 @@ import { useEffect, useRef, useState, type PointerEvent } from "react";
 import { downloads, primaryDownload, type Download } from "./downloads";
 import "./download.css";
 
-const SCREENS = [
-  "Bots & groups", "Messaging Gateway", "Apps & providers", "Memory",
-  "Skills & Capabilities", "MCP & ACP mesh", "Harness²", "Bot fleet",
-  "Coding agents", "Computer & browser", "Workflows", "Marketplace",
-  "Wallet & trading", "Profile", "Self-repair", "Plan & setup", "Settings",
+const SCREENS: { name: string; hook: string; body: string; points: string[] }[] = [
+  { name: "Bots & groups", hook: "One chief. The bots do the pieces.", body: "Start in one conversation. A chief can hand a job to a scoped bot with a contract: what done means, which model may spend, and what that bot is not allowed to see.", points: ["The chief stays in the thread you are already in.", "A bot gets the task, not the vault.", "You can see who is working and what it was allowed to touch."] },
+  { name: "Messaging Gateway", hook: "Text the desktop from the phone you already use.", body: "Telegram, Slack, Discord, WhatsApp, and the other inboxes you connect land in one gateway. A stranger does not become the owner.", points: ["You approve who can start a turn.", "Clear the allowlist and the next sender is refused.", "Pairing starts on this computer, then the phone can reach it."] },
+  { name: "Apps & providers", hook: "Keep the model accounts you already pay for.", body: "Connect the providers and the web apps. Ronic OS does not issue a second bill for the models you already have.", points: ["Keys stay in those accounts.", "ChatGPT, Claude, and the rest can sit beside the chat.", "A site login is not an MCP connection."] },
+  { name: "Memory", hook: "The desk remembers. The notes stay here.", body: "Memory is a local database on this computer. Search does not ship the vault out to answer a question.", points: ["A bot can rewrite its own note.", "It cannot replace a note that belongs to another bot.", "You can still edit anything yourself."] },
+  { name: "Skills & Capabilities", hook: "Teach it once. Run it again.", body: "Skills, plugins, and MCP tool servers live in one studio, with the permission each one actually has.", points: ["A skill is a playbook the bot can run again.", "Plugins stay scoped.", "You can see the tool servers instead of hunting a config file."] },
+  { name: "MCP & ACP mesh", hook: "Connect a tool without handing it the keys.", body: "The mesh is where other apps reach this desktop. A connection is something you make, not something a website login implies.", points: ["MCP and ACP links are listed in one place.", "Each link is a connector, not a blank check.", "You can tell what is connected and what is only open in a browser."] },
+  { name: "Harness²", hook: "Small edits stay cheap. Heavy work can step up.", body: "Harness² is the stronger lane for coding work, in the same window as the chat. It does not get its own copy of the vault.", points: ["Short changes can stay on a cheaper or local model.", "Heavier work can move to the harness.", "You stay in the loop on what it spends."] },
+  { name: "Bot fleet", hook: "More than one bot. Still one owner.", body: "The fleet is the set of bots you run. Each one stays scoped to its job instead of becoming a second you.", points: ["See the bots without opening another app.", "A chief can hand work across them.", "One bot cannot quietly take another's notes or keys."] },
+  { name: "Coding agents", hook: "Give the agent the task, not the machine.", body: "A coding agent, a CLI, or Cursor can receive a short sheet of the open work. Memory and the vault stay on the desktop.", points: ["Context copy packs the goal, the files, and the constraint.", "The agent does not receive the vault.", "You keep the editor and the accounts you already use."] },
+  { name: "Computer & browser", hook: "Let it use the computer. Keep your mouse.", body: "Computer use runs in its own windows. You can watch, mark a control, or record one demonstration and turn that into a skill.", points: ["The bot does not take your pointer.", "A marked screen lets a click target one control.", "Show it once, then run that skill again."] },
+  { name: "Workflows", hook: "The job you repeat should not need you every time.", body: "A workflow is a saved run. Scheduled jobs live with the chat, and they pause when you close the app unless a cloud runner is connected.", points: ["Turn a finished job into something you can run again.", "A schedule is visible, not a hidden cron you forgot.", "The runner is optional, and it appears only when that cluster is connected."] },
+  { name: "Marketplace", hook: "Add a capability. Do not rebuild it.", body: "The marketplace is where extra skills and listings are installed onto this desktop. A listing does not receive the vault.", points: ["Install from the app, not from a random script.", "You choose what turns on.", "What you add stays inside the same permission model."] },
+  { name: "Wallet & trading", hook: "Money moves only when you sign.", body: "The wallet can sit in a sandbox, or on a live signed rail. Those are different states, and the header shows which one you are in.", points: ["Practice without a live signature.", "A live rail is a choice, not the default surprise.", "Spend rules live in Settings, on this computer."] },
+  { name: "Profile", hook: "The bots work. You are the owner.", body: "Profile is the person this desktop answers to. A bot, a channel, or a connected app does not become that person.", points: ["Your account opens from the Plan screen after install.", "Bots stay scoped under you.", "Sign-in finishes inside the app, not on this website."] },
+  { name: "Self-repair", hook: "When the desk breaks, you can see the fix.", body: "Self-repair is a screen, not a silent process. It reports what it can fix, and Settings holds the doctor and failover controls.", points: ["You can read what it is doing.", "You decide what it is allowed to change.", "It does not get a free pass at the vault."] },
+  { name: "Plan & setup", hook: "Install free. Pay only for the desk you want.", body: "Starter is the local app. Pro and Founder Pass are billed from the Plan screen after you sign in.", points: ["Pro is $14/mo or ₹999/mo, or $120/yr and ₹9,990/yr.", "Founder Pass is $149 once or ₹11,999 once, capped at 500.", "Cloud runners are $19/mo, and only when that cluster is connected."] },
+  { name: "Settings", hook: "Set the desk once. Stop repeating yourself.", body: "Theme, density, the vault, approvals, computer profiles, wallet rules, and updates live here. Auto, ask, or manual is a single choice, not a row of mystery switches.", points: ["Approvals can be automatic, a question, or manual.", "Local data and backups stay on this computer.", "The paths for CLIs, skills, and the computer are visible."] },
 ];
 
 const FEATURES = [
@@ -42,6 +55,8 @@ export function DownloadPage() {
   const [inr, setInr] = useState(false);
   const [signInNote, setSignInNote] = useState(false);
   const [pin, setPin] = useState<string | null>(null);
+  const [screen, setScreen] = useState<string | null>(null);
+  const openScreen = SCREENS.find((item) => item.name === screen);
   const light = useRef<HTMLDialogElement>(null);
 
   useEffect(() => {
@@ -153,9 +168,23 @@ export function DownloadPage() {
       <section className="site-block" id="screens">
         <p className="site-kicker">The rail</p>
         <h2>Seventeen screens. One window.</h2>
-        <ul className="site-chips">
-          {SCREENS.map((name) => <li key={name}>{name}</li>)}
-        </ul>
+        <div className="site-chips" role="group" aria-label="Screens">
+          {SCREENS.map((item) => (
+            <button key={item.name} type="button" aria-pressed={screen === item.name} onClick={() => setScreen((current) => current === item.name ? null : item.name)}>
+              {item.name}
+            </button>
+          ))}
+        </div>
+        {openScreen ? (
+          <article className="site-screen" key={openScreen.name} aria-live="polite">
+            <p className="site-benefit">{openScreen.hook}</p>
+            <h3>{openScreen.name}</h3>
+            <p>{openScreen.body}</p>
+            <ul>
+              {openScreen.points.map((point) => <li key={point}>{point}</li>)}
+            </ul>
+          </article>
+        ) : <p className="site-screen-hint">Pick a screen to see what it does for you.</p>}
       </section>
 
       <section className="site-band" id="pricing">

@@ -22,7 +22,7 @@
 .site a.site-btn { color: #fff; text-decoration: none; }
 .site a.site-btn.ghost { color: #111; }
 .site h1, .site h2, .site h3 { font-family: "Plus Jakarta Sans", Inter, "Segoe UI", system-ui, sans-serif; }
-.site-kicker, .site-price, .site-proof, .site-fine, .site-frame figcaption, .site-chips li, .site-pin {
+.site-kicker, .site-price, .site-proof, .site-fine, .site-frame figcaption, .site-chips button, .site-pin {
   font-family: "JetBrains Mono", "Cascadia Mono", ui-monospace, monospace;
 }
 
@@ -245,8 +245,33 @@
 .site-grid .site-reveal:nth-child(6) { animation-delay: 300ms; }
 @keyframes site-rise { from { opacity: 0; transform: translateY(18px); } to { opacity: 1; transform: none; } }
 
-.site-chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 22px 0 0; padding: 0; list-style: none; }
-.site-chips li { background: #fff; border: 1px solid #e5e5e5; border-radius: 999px; padding: 6px 10px; font-size: 12px; color: #3f3f46; }
+.site-chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 22px 0 0; }
+.site-chips button {
+  min-height: 36px;
+  padding: 6px 12px;
+  border: 1px solid #e5e5e5;
+  border-radius: 999px;
+  background: #fff;
+  color: #3f3f46;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background-color 160ms ease, color 160ms ease, border-color 160ms ease;
+}
+.site-chips button[aria-pressed="true"] { background: #111; color: #fff; border-color: #111; }
+.site-screen-hint { margin: 16px 0 0; color: #71717a; font-size: 14px; }
+.site-screen {
+  margin-top: 16px;
+  padding: 22px;
+  background: #fff;
+  border: 1px solid #111;
+  border-radius: 16px;
+  animation: site-rise 0.35s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+.site-screen h3 { margin: 10px 0 0; font-size: 22px; letter-spacing: -0.03em; }
+.site-screen p { max-width: 65ch; margin: 8px 0 0; color: #334155; }
+.site-screen ul { margin: 14px 0 0; padding: 0; list-style: none; display: grid; gap: 8px; }
+.site-screen li { padding-left: 14px; color: #18181b; font-size: 14px; position: relative; }
+.site-screen li::before { content: ""; position: absolute; left: 0; top: 0.55em; width: 6px; height: 6px; border-radius: 99px; background: #0f766e; }
 
 .site-band { margin-top: 72px; background: #fff; border-top: 1px solid #e5e5e5; }
 .site-band-inner { padding: 72px 0; }
@@ -321,6 +346,7 @@
   .site-bar { flex-wrap: wrap; padding: 10px 16px; }
   .site-bar-actions { width: 100%; }
   .site-bar-actions .site-btn { flex: 1; min-height: 44px; }
+  .site-chips button { min-height: 44px; }
   .site-hero, .site-block, .site-band-inner, .site-facts, .site-foot-inner { width: min(1120px, calc(100% - 32px)); }
   .site-hero { padding-top: 36px; }
   .site h1 { font-size: 36px; }
@@ -337,5 +363,5 @@
 @media (prefers-reduced-motion: reduce) {
   .site-btn, .site-card, .site-switch-thumb, .site-beam { transition: none; animation: none; }
   .site-beam, .site-card:hover, .site-btn:hover, .site-btn:active { transform: none; }
-  .site-reveal, .site-price { animation: none; }
+  .site-reveal, .site-price, .site-screen { animation: none; }
 }
