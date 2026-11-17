@@ -1,4 +1,5 @@
 import type { Snapshot } from "../types";
+import { keepDesktop } from "./pluginScreen";
 
 export type MarketplaceCategory =
   | "Recommended for you"
@@ -2489,6 +2490,7 @@ export async function installMarketplaceItem(
   }
 
   if (item.kind === "plugin") {
+    const desktop = keepDesktop(item.pluginConfig?.desktop || []);
     const draft = {
       id: item.id,
       slug: item.slug,
@@ -2499,12 +2501,15 @@ export async function installMarketplaceItem(
       tools: item.pluginConfig?.tools || [],
       hooks: item.pluginConfig?.hooks || [],
       skills: item.pluginConfig?.skills || [],
-      desktop: item.pluginConfig?.desktop || [],
+      desktop,
     };
     await run("save_plugin", { draft });
     await run("trust_plugin", { id: item.id });
     if (targetProfile) {
       await run("toggle_plugin_agent", { id: item.id, profileId: targetProfile, enabled: true });
+    }
+    if (desktop.some((bit) => bit.kind === "pane")) {
+      await run("toggle_plugin_desktop", { id: item.id, enabled: true });
     }
     return `✓ Plugin "${item.name}" saved with tools & skills, trusted, and mounted.`;
   }

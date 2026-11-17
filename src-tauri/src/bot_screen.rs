@@ -256,9 +256,12 @@ fn prepare(app: &AppHandle, home: &Path, id: &str, url: &str, present: Present) 
         create_view(app, &window, home, &id, &label, parsed.clone(), bounds)?;
     }
     let view = app.get_webview(&label).ok_or_else(|| err("this bot's browser did not open"))?;
+    crate::site_session::import_shared(&view);
     let same = view.url().ok().is_some_and(|current| current.as_str() == parsed.as_str());
     if !same {
         view.navigate(parsed.clone()).map_err(|error| err(error.to_string()))?;
+    } else if crate::site_session::should_reload_for_session(&label, parsed.as_str()) {
+        let _ = view.reload();
     }
     match present {
         Present::Show { bounds, focus } => {
@@ -279,6 +282,8 @@ fn create_view(app: &AppHandle, window: &tauri::Window<tauri::Wry>, home: &Path,
     std::fs::create_dir_all(&dir)?;
     let notify = app.clone();
     let watch_id = id.to_string();
+    let export_app = app.clone();
+    let export_label = label.to_string();
     let popup = app.clone();
     let popup_label = label.to_string();
     let builder = WebviewBuilder::new(label, WebviewUrl::External(target.clone()))
@@ -288,6 +293,9 @@ fn create_view(app: &AppHandle, window: &tauri::Window<tauri::Wry>, home: &Path,
         .on_page_load(move |_view, payload| {
             if payload.event() == PageLoadEvent::Finished {
                 note_page(&notify, &watch_id, payload.url().as_str());
+                if crate::site_session::worth_sharing(payload.url().as_str()) {
+                    crate::site_session::schedule_export(&export_app, &export_label);
+                }
             }
         })
         .on_new_window(move |next, _features| {

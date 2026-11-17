@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-context-copies"
+description = "Enables the list_context_copies command without any pre-configured scope."
+commands.allow = ["list_context_copies"]
+
+[[permission]]
+identifier = "deny-list-context-copies"
+description = "Denies the list_context_copies command without any pre-configured scope."
+commands.deny = ["list_context_copies"]

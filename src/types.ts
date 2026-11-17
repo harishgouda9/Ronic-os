@@ -212,6 +212,7 @@ export type MemoryItem = {
   syncedEngines: string[];
   validFrom?: number | null;
   invalidAt?: number | null;
+  relations?: { relation: string; target: string }[];
 };
 
 export type MemoryEngine = {
@@ -581,6 +582,7 @@ export type Snapshot = {
   providers: Provider[];
   apps: LinkedApp[];
   memories: MemoryItem[];
+  curated?: { id: string; store: string; content: string }[];
   memoryEngines: MemoryEngine[];
   memoryRoute: MemoryRoute;
   memoryRoutes: MemoryRoute[];

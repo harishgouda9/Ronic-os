@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-paste-context-copy-to-targets"
+description = "Enables the paste_context_copy_to_targets command without any pre-configured scope."
+commands.allow = ["paste_context_copy_to_targets"]
+
+[[permission]]
+identifier = "deny-paste-context-copy-to-targets"
+description = "Denies the paste_context_copy_to_targets command without any pre-configured scope."
+commands.deny = ["paste_context_copy_to_targets"]

@@ -759,6 +759,85 @@ export function getBrandCustomSvg(brandKey: string): React.ReactNode {
   }
 }
 
+type KnownIcon = { brand?: string; domain: string };
+
+/** Built-in web apps, desktop apps, and provider ids. A missing install path still gets the product icon. */
+const KNOWN_APP_ICONS: Record<string, KnownIcon> = {
+  chatgpt: { brand: "chatgpt", domain: "chatgpt.com" },
+  prov_chatgpt: { brand: "chatgpt", domain: "chatgpt.com" },
+  claude: { brand: "claude", domain: "claude.ai" },
+  "claude code": { brand: "claude-code", domain: "claude.ai" },
+  "claude-code": { brand: "claude-code", domain: "claude.ai" },
+  prov_claude: { brand: "claude-code", domain: "claude.ai" },
+  app_claude: { brand: "claude-code", domain: "claude.ai" },
+  anthropic: { brand: "claude", domain: "anthropic.com" },
+  prov_anthropic: { brand: "claude", domain: "anthropic.com" },
+  gemini: { brand: "gemini", domain: "gemini.google.com" },
+  "gemini cli": { brand: "gemini", domain: "gemini.google.com" },
+  prov_gemini: { brand: "gemini", domain: "gemini.google.com" },
+  app_gemini: { brand: "gemini", domain: "gemini.google.com" },
+  grok: { domain: "grok.com" },
+  prov_grok: { domain: "grok.com" },
+  grokbot: { domain: "x.ai" },
+  app_grokbot: { domain: "x.ai" },
+  openrouter: { domain: "openrouter.ai" },
+  prov_openrouter: { domain: "openrouter.ai" },
+  deepseek: { domain: "deepseek.com" },
+  prov_deepseek: { domain: "deepseek.com" },
+  qwen: { domain: "qwen.ai" },
+  prov_qwen: { domain: "qwen.ai" },
+  tokenrouter: { domain: "tokenrouter.io" },
+  prov_tokenrouter: { domain: "tokenrouter.io" },
+  bedrock: { domain: "aws.amazon.com" },
+  prov_bedrock: { domain: "aws.amazon.com" },
+  nvidia: { domain: "nvidia.com" },
+  "nvidia nim": { domain: "nvidia.com" },
+  prov_nvidia: { domain: "nvidia.com" },
+  meta: { domain: "meta.ai" },
+  "meta ai": { domain: "meta.ai" },
+  mistral: { domain: "mistral.ai" },
+  prov_mistral: { domain: "mistral.ai" },
+  perplexity: { domain: "perplexity.ai" },
+  prov_perplexity: { domain: "perplexity.ai" },
+  groq: { domain: "groq.com" },
+  prov_groq: { domain: "groq.com" },
+  together: { domain: "together.ai" },
+  prov_together: { domain: "together.ai" },
+  cohere: { domain: "cohere.com" },
+  prov_cohere: { domain: "cohere.com" },
+  copilot: { domain: "copilot.microsoft.com" },
+  ollama: { domain: "ollama.com" },
+  prov_ollama: { domain: "ollama.com" },
+  cursor: { brand: "cursor", domain: "cursor.com" },
+  app_cursor: { brand: "cursor", domain: "cursor.com" },
+  vscode: { brand: "vscode", domain: "code.visualstudio.com" },
+  "vs code": { brand: "vscode", domain: "code.visualstudio.com" },
+  app_vscode: { brand: "vscode", domain: "code.visualstudio.com" },
+  obsidian: { brand: "obsidian", domain: "obsidian.md" },
+  app_obsidian: { brand: "obsidian", domain: "obsidian.md" },
+  aider: { domain: "aider.chat" },
+  app_aider: { domain: "aider.chat" },
+  opencode: { domain: "opencode.ai" },
+  app_opencode: { domain: "opencode.ai" },
+  "codex cli": { brand: "chatgpt", domain: "openai.com" },
+  app_codex: { brand: "chatgpt", domain: "openai.com" },
+};
+
+const FILE_ICON_DOMAINS: Record<string, string> = {
+  code: "code.visualstudio.com",
+  cursor: "cursor.com",
+  obsidian: "obsidian.md",
+  ollama: "ollama.com",
+  claude: "claude.ai",
+  chatgpt: "chatgpt.com",
+};
+
+function knownAppIcon(id?: string, name?: string): KnownIcon | undefined {
+  const idKey = (id || "").trim().toLowerCase();
+  const nameKey = (name || "").trim().toLowerCase();
+  return KNOWN_APP_ICONS[idKey] || KNOWN_APP_ICONS[nameKey];
+}
+
 export function normalizeBrand(id?: string, name?: string, command?: string, url?: string): string {
   const n = (name || "").toLowerCase();
   const i = (id || "").toLowerCase();
@@ -889,6 +968,7 @@ export function extractDomain(urlOrName?: string): string {
   if (cleaned.includes("/") || cleaned.includes("\\") || cleaned.toLowerCase().endsWith(".exe")) {
     const filename = cleaned.split(/[\\/]/).pop()?.replace(/\.exe$/i, "").toLowerCase() || "";
     if (filename) {
+      if (FILE_ICON_DOMAINS[filename]) return FILE_ICON_DOMAINS[filename];
       if (BRAND_DOMAINS[filename]) return BRAND_DOMAINS[filename];
       const matchKey = Object.keys(BRAND_DOMAINS).find((k) => filename.includes(k));
       if (matchKey) return BRAND_DOMAINS[matchKey];
@@ -978,11 +1058,13 @@ export function AppLogo({
   className?: string;
 }) {
   const safeName = name || id || "App";
-  const brandKey = normalizeBrand(id, name, command, url);
+  const known = knownAppIcon(id, safeName);
+  const brandKey = known?.brand || normalizeBrand(id, name, command, url);
   const logo = brandKey ? LOGOS[brandKey] : undefined;
 
   // Domain & Remote icon sources
   const domain =
+    known?.domain ||
     extractDomain(url) ||
     extractDomain(command) ||
     BRAND_DOMAINS[safeName.toLowerCase()] ||

@@ -94,6 +94,40 @@ test("connect keeps existing credentials over the draft", () => {
   assert.equal(connected.ownerUserId, "saved-owner");
 });
 
+test("saved credentials survive a reload and a blank form clears them", () => {
+  const file = mod.upsertSavedCredential({}, "telegram", { token: "123456789:AAH-token-token-token-token-token", ownerId: "8512444167", extras: [] }, true);
+  const parsed = mod.parseSavedCredentials(JSON.parse(JSON.stringify(file)));
+  assert.equal(parsed.telegram.reconnect, true);
+  assert.equal(parsed.telegram.ownerId, "8512444167");
+  const channels = mod.applyStoredCredentials([baseChannel], parsed);
+  assert.equal(channels[0].botTokenMasked, parsed.telegram.token);
+  const cleared = mod.upsertSavedCredential(parsed, "telegram", { token: "", ownerId: "", extras: [] });
+  assert.equal(cleared.telegram, undefined);
+  const linked = mod.upsertSavedCredential({}, "whatsapp", { token: "", ownerId: "", extras: [] }, true);
+  assert.equal(linked.whatsapp.reconnect, true);
+});
+
+test("a scanned QR fills the gateway it belongs to", () => {
+  const telegram = mod.interpretScannedGatewayQr("token 123456789:AAHabcdefghijklmnopqrstuvwxyz0123456789", "discord");
+  assert.equal(telegram.ok, true);
+  assert.equal(telegram.channelId, "telegram");
+  assert.equal(telegram.kind, "bot_token");
+  const login = mod.interpretScannedGatewayQr("tg://login?token=abc", "telegram");
+  assert.equal(login.ok, false);
+  const four = "2@AbCdEf,AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=,BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=,CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=";
+  const whatsapp = mod.interpretScannedGatewayQr(`${four},1`, "telegram");
+  assert.equal(whatsapp.ok, true);
+  assert.equal(whatsapp.channelId, "whatsapp");
+  assert.equal(whatsapp.kind, "whatsapp_link");
+  assert.equal(mod.isWhatsAppCompanionCode(`https://wa.me/settings/linked_devices#${four},1`), true);
+  assert.equal(mod.isWhatsAppCompanionCode("http://192.168.1.20:9/pair?channel=signal&code=ab"), false);
+  const slack = mod.interpretScannedGatewayQr("xoxb-123456789012-abcdefABCDEF", "telegram");
+  assert.equal(slack.channelId, "slack");
+  const other = mod.interpretScannedGatewayQr("mattermost-bot-secret", "mattermost");
+  assert.equal(other.ok, true);
+  assert.equal(other.channelId, "mattermost");
+});
+
 test("saving credentials writes the draft onto the channel", () => {
   const saved = mod.applySaveCredentials(baseChannel, { token: "t1", ownerId: "o1" });
   assert.equal(saved.botTokenMasked, "t1");
@@ -201,7 +235,102 @@ test("extra credentials stay optional and only known ones change the connection"
   assert.equal(mod.connectTokenFor("telegram", cloudOnly), "");
   assert.equal(mod.channelUsesQrPairing("whatsapp"), true);
   assert.equal(mod.channelUsesQrPairing("telegram"), false);
-  assert.equal(mod.pairingUri("whatsapp", "abc"), "ronic://gateway/pair?channel=whatsapp&code=abc");
+  assert.equal(mod.pairingUri("whatsapp", "abc", "192.168.1.20:47321"), "http://192.168.1.20:47321/pair?channel=whatsapp&code=abc");
+  assert.equal(mod.pairingUri("whatsapp", "abc").includes("ronic://"), false);
+  const instructions = mod.whatsappLinkInstructions();
+  assert.match(instructions, /Linked devices/);
+  assert.match(instructions, /Link a device/);
+  assert.equal(instructions.includes("does not log in"), false);
+  assert.equal(instructions.includes("http://"), false);
+});
+
+test("a live Connected listener enables the channel", () => {
+  const waiting = mod.syncChannelFromLive(
+    { status: "disconnected", enabled: false },
+    { state: "AwaitingQrScan", error: null },
+  );
+  assert.equal(waiting.status, "disconnected");
+  assert.equal(waiting.enabled, false);
+  assert.equal(mod.canSendPush(waiting), false);
+  const live = mod.syncChannelFromLive(waiting, { state: "Connected", error: null });
+  assert.equal(live.status, "connected");
+  assert.equal(live.enabled, true);
+  assert.equal(mod.canSendPush(live), true);
+  assert.equal(mod.pushBlockReason({ status: "connected", enabled: false }).includes("not connected"), false);
+  assert.match(mod.pushBlockReason({ status: "connected", enabled: false }), /listener is connected/);
+});
+
+test("the first telegram sender is adopted and an @username matches that id", () => {
+  const adopted = mod.decideInboundAccess([], "8512444167", "Hari (@harish_g_9449)");
+  assert.equal(adopted.ok, true);
+  assert.equal(adopted.adoptedOwnerId, "8512444167");
+  const again = mod.decideInboundAccess(adopted.allow, "8512444167", "Hari (@harish_g_9449)");
+  assert.equal(again.ok, true);
+  assert.equal(again.adoptedOwnerId, null);
+  const named = mod.decideInboundAccess(["@harish_g_9449"], "8512444167", "Hari (@harish_g_9449)");
+  assert.equal(named.ok, true);
+  assert.equal(named.adoptedOwnerId, null);
+  const stranger = mod.decideInboundAccess(["8512444167"], "999", "Other (@nope)");
+  assert.equal(stranger.ok, false);
+  assert.match(stranger.reason, /999/);
+  assert.match(mod.ownerAllowlistRefusal(stranger.reason), /Owner allowlist/);
+});
+
+test("a saved empty allowlist refuses the next sender", () => {
+  const bag = new Map();
+  globalThis.localStorage = {
+    getItem: (key) => bag.get(key) ?? null,
+    setItem: (key, value) => bag.set(key, value),
+    removeItem: (key) => bag.delete(key),
+  };
+  mod.writeOwnerAllowlist("telegram", []);
+  const blocked = mod.inboundAccess("telegram", "", "999", "Stranger");
+  assert.equal(blocked.ok, false);
+  assert.match(blocked.reason, /999/);
+  const fresh = mod.inboundAccess("slack", "", "8512444167", "Hari");
+  assert.equal(fresh.ok, true);
+  assert.equal(fresh.adoptedOwnerId, "8512444167");
+});
+
+test("owner allowlist adds a blocked sender without dropping the saved owner", () => {
+  const bag = new Map();
+  globalThis.localStorage = {
+    getItem: (key) => bag.get(key) ?? null,
+    setItem: (key, value) => bag.set(key, value),
+    removeItem: (key) => bag.delete(key),
+  };
+  assert.deepEqual(mod.effectiveOwnerAllowlist(null, "111"), ["111"]);
+  assert.deepEqual(mod.withAllowedOwner([], "111", "8512444167"), ["111", "8512444167"]);
+  assert.deepEqual(mod.withoutAllowedOwner(["111", "8512444167"], "111"), ["8512444167"]);
+
+  assert.equal(mod.savedOwnerAllowlist("telegram"), null);
+  assert.deepEqual(mod.inboundAllowlist("telegram", "111"), ["111"]);
+  const allowed = mod.allowOwner("telegram", "111", "8512444167");
+  assert.deepEqual(allowed, ["111", "8512444167"]);
+  assert.deepEqual(mod.inboundAllowlist("telegram", "999"), ["111", "8512444167"]);
+  const kept = mod.decideInboundAccess(mod.inboundAllowlist("telegram", "111"), "8512444167", "Hari");
+  assert.equal(kept.ok, true);
+  mod.rememberBlockedSender("telegram", "8512444167", "Hari");
+  assert.equal(mod.lastBlockedSender("telegram").senderId, "8512444167");
+  mod.clearBlockedSender("telegram", "8512444167");
+  assert.equal(mod.lastBlockedSender("telegram"), null);
+  assert.deepEqual(mod.removeAllowedOwner("telegram", "111", "111"), ["8512444167"]);
+  const onlyOwner = mod.decideInboundAccess(mod.inboundAllowlist("telegram", "111"), "111", "Other");
+  assert.equal(onlyOwner.ok, false);
+});
+
+test("one routable bot receives a message that names nobody", () => {
+  const fleet = mod.fleetMembers([{ id: "bot_spidy", handle: "spidy", displayName: "Spidy" }], []);
+  const routed = mod.resolveInboundRoute("Hi", { routableBots: ["@spidy"], defaultBot: "" }, fleet);
+  assert.equal(routed.ok, true);
+  assert.equal(routed.handle, "@spidy");
+  assert.equal(routed.prompt, "Hi");
+  const many = mod.resolveInboundRoute("Hi", { routableBots: ["@spidy", "@raj"], defaultBot: "" }, [
+    ...fleet,
+    { id: "bot_raj", handle: "@raj", displayName: "Raj", kind: "bot", leadBotId: "bot_raj" },
+  ]);
+  assert.equal(many.ok, false);
+  assert.match(many.reason, /No default bot/);
 });
 
 test("full simulated flow: reclaim → configure → route → push → disconnect", () => {
@@ -236,4 +365,29 @@ test("full simulated flow: reclaim → configure → route → push → disconne
   ch = mod.applyToggleConnect(ch, { token: "", ownerId: "" });
   assert.equal(mod.canSendPush(ch), false);
   assert.equal(mod.localCommandVerdict(ch), "blocked");
+});
+
+test("a gateway turn replies with the new assistant text only", () => {
+  const before = new Set(["old"]);
+  const steps = [
+    { id: "old", threadId: "t1", role: "assistant", actionType: "message", contentMarkdown: "earlier" },
+    { id: "think", threadId: "t1", role: "assistant", actionType: "thinking", contentMarkdown: "hidden" },
+    { id: "user", threadId: "t1", role: "user", actionType: "message", contentMarkdown: "[Telegram] hi" },
+    { id: "new", threadId: "t1", role: "assistant", actionType: "message", contentMarkdown: "Hello from spidy." },
+    { id: "other", threadId: "t2", role: "assistant", actionType: "message", contentMarkdown: "wrong thread" },
+  ];
+  assert.equal(mod.gatewayAssistantReply(steps, "t1", before), "Hello from spidy.");
+  assert.equal(mod.gatewayAssistantReply(steps, "", before), "");
+});
+
+test("telegram replies are split and markdown-safe", () => {
+  assert.equal(mod.channelAcceptsReply("telegram"), true);
+  assert.equal(mod.channelAcceptsReply("whatsapp"), false);
+  const chunks = mod.outboundChannelChunks("telegram", "use _this_ *model*");
+  assert.equal(chunks.length, 1);
+  assert.equal(chunks[0], "use \\_this\\_ \\*model\\*");
+  const long = `${"a".repeat(2000)}\n${"b".repeat(50)}`;
+  const parts = mod.outboundChannelChunks("telegram", long);
+  assert.ok(parts.length >= 2);
+  assert.ok(parts.every((part) => part.length <= 4096));
 });

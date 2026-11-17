@@ -2,12 +2,11 @@
 //!
 //! Web harnesses (ChatGPT apps, Claude connectors) fetch an MCP server from
 //! OpenAI's or Anthropic's own cloud, so a `127.0.0.1` URL can never work for
-//! them. This module fronts the token-gated alias server (port 8765) with a
-//! Cloudflare quick tunnel and hands the user one URL that already contains
-//! the bridge token as a query parameter. Without that token the alias server
-//! answers 401, so the public URL alone grants nothing. The timestamp of the
-//! last authorized MCP call is kept as real evidence that a harness reached
-//! the bridge — the presence of a webview profile folder proves nothing.
+//! them. The connector Server URL is always `https://ronicos.vercel.app/mcp`.
+//! A Cloudflare quick tunnel is only the private hop: this module registers
+//! that origin with the Vercel door, which proxies back here. OAuth on the
+//! alias (port 8765) issues the bridge token. The timestamp of the last
+//! authorized MCP call is the evidence a harness reached this computer.
 
 use crate::util::{now_ms, product_home};
 use regex::Regex;
@@ -23,6 +22,8 @@ use std::time::Duration;
 
 const ALIAS_PORT: u16 = 8765;
 const START_TIMEOUT_MS: u64 = 45_000;
+const DOOR_MCP: &str = "https://ronicos.vercel.app/mcp";
+const DOOR_REGISTER: &str = "https://ronicos.vercel.app/api/mcp-register";
 
 static LAST_MCP_CALL_MS: AtomicI64 = AtomicI64::new(0);
 static TUNNEL_LOG: Mutex<String> = Mutex::new(String::new());
@@ -93,11 +94,8 @@ fn cloudflared_download() -> (&'static str, bool) {
 pub fn status(token: &str) -> TunnelStatus {
     let state = TUNNEL.lock().unwrap_or_else(|poison| poison.into_inner());
     let running = state.child.is_some() && !state.url.is_empty();
-    let public_mcp_url = if running && !token.is_empty() {
-        format!("{}?token={}", join_mcp(&state.url), token)
-    } else {
-        String::new()
-    };
+    let _ = token; // OAuth on the Vercel door issues this bearer. The pasted URL must not contain it.
+    let public_mcp_url = if running { public_mcp_base() } else { String::new() };
     TunnelStatus {
         binary_present: binary_path().is_some(),
         downloading: PREINSTALLING.load(Ordering::Relaxed),
@@ -158,6 +156,44 @@ fn join_mcp(url: &str) -> String {
     }
 }
 
+/// Connector Server URL. Stable Vercel origin, no bridge token.
+pub fn public_mcp_base() -> String {
+    DOOR_MCP.to_string()
+}
+
+/// `https://<tunnel>` with no path. Empty until cloudflared prints a URL.
+pub fn public_site_origin() -> Option<String> {
+    let state = TUNNEL.lock().unwrap_or_else(|poison| poison.into_inner());
+    let parsed = url::Url::parse(state.url.trim()).ok()?;
+    if parsed.scheme() != "https" {
+        return None;
+    }
+    let host = parsed.host_str()?;
+    Some(match parsed.port() {
+        Some(port) => format!("https://{host}:{port}"),
+        None => format!("https://{host}"),
+    })
+}
+
+/// This PC often cannot open its own `*.trycloudflare.com` host. The browser
+/// sign-in step is the local alias; ChatGPT's cloud still uses the public URL.
+pub fn browser_authorize_url(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    if parsed.scheme() != "https" || !parsed.username().is_empty() || parsed.password().is_some() {
+        return None;
+    }
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    if !host.ends_with(".trycloudflare.com") || parsed.path().trim_end_matches('/') != "/authorize" {
+        return None;
+    }
+    let query = url.split_once('?').map(|(_, query)| query.split('#').next().unwrap_or("")).unwrap_or("");
+    if query.is_empty() {
+        Some(format!("http://127.0.0.1:{ALIAS_PORT}/authorize"))
+    } else {
+        Some(format!("http://127.0.0.1:{ALIAS_PORT}/authorize?{query}"))
+    }
+}
+
 pub fn start() -> Result<String, String> {
     let binary = binary_path().ok_or_else(|| {
         "cloudflared is not installed. Use Download cloudflared, or install it yourself and try again.".to_string()
@@ -168,7 +204,10 @@ pub fn start() -> Result<String, String> {
     {
         let mut state = TUNNEL.lock().unwrap_or_else(|poison| poison.into_inner());
         if state.child.is_some() && !state.url.is_empty() {
-            return Ok(format!("The tunnel is already running at {}.", state.url));
+            let url = state.url.clone();
+            drop(state);
+            publish_edge(&url);
+            return Ok(format!("The tunnel is already running. ChatGPT's server URL is {DOOR_MCP}."));
         }
         state.url = String::new();
         state.note = "Starting the tunnel.".into();
@@ -221,10 +260,98 @@ pub fn start() -> Result<String, String> {
         state.child = Some(child);
         state.url = url.clone();
         state.since_ms = now_ms();
-        state.note = format!("Tunnel is live at {url}. Register the full MCP URL (with token) in the harness connector settings.");
+        state.note = format!("Tunnel is live. ChatGPT's server URL is {DOOR_MCP}.");
         state.note.clone()
     };
+    publish_edge(&url);
     Ok(note)
+}
+
+/// Tell the Vercel door which quick-tunnel origin is this computer.
+/// A failed register leaves the tunnel up; the note says the door did not open.
+fn publish_edge(upstream: &str) {
+    let Ok(upstream) = tunnel_origin(upstream) else { return };
+    ensure_edge_refresh();
+    std::thread::spawn(move || {
+        let result = register_edge(&upstream);
+        let mut state = TUNNEL.lock().unwrap_or_else(|poison| poison.into_inner());
+        if tunnel_origin(&state.url).ok().as_deref() != Some(upstream.as_str()) {
+            return;
+        }
+        state.note = match result {
+            Ok(()) => format!("Tunnel is live. ChatGPT's server URL is {DOOR_MCP}."),
+            Err(error) => format!("Tunnel is live at {upstream}. The Vercel door could not be reached ({error})."),
+        };
+    });
+}
+
+fn ensure_edge_refresh() {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    if STARTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    // shortcut: republish every 2h, the row expires 6h after the last register.
+    std::thread::spawn(|| {
+        loop {
+            std::thread::sleep(Duration::from_secs(2 * 60 * 60));
+            let upstream = {
+                let state = TUNNEL.lock().unwrap_or_else(|poison| poison.into_inner());
+                state.url.clone()
+            };
+            if tunnel_origin(&upstream).is_err() {
+                continue;
+            }
+            let _ = register_edge(&upstream);
+        }
+    });
+}
+
+fn register_edge(upstream: &str) -> Result<(), String> {
+    let upstream = tunnel_origin(upstream)?;
+    let home = product_home();
+    let token = bridge_token(&home);
+    if token.len() != 64 || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("missing bridge token".into());
+    }
+    let secret = door_secret(&home);
+    if secret.len() < 16 {
+        return Err("missing door secret".into());
+    }
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+        .map_err(|_| "could not be reached".to_string())?;
+    let response = client
+        .post(DOOR_REGISTER)
+        .json(&serde_json::json!({ "upstream": upstream, "token": token, "secret": secret }))
+        .send()
+        .map_err(|_| "could not be reached".to_string())?;
+    if response.status().is_success() {
+        return Ok(());
+    }
+    let code = response.status();
+    let body = response.text().unwrap_or_default();
+    let detail = if body.contains("not configured") {
+        "not configured"
+    } else if body.contains("rejected") {
+        "rejected the tunnel"
+    } else {
+        "rejected"
+    };
+    Err(format!("{detail} ({code})"))
+}
+
+fn tunnel_origin(raw: &str) -> Result<String, String> {
+    let parsed = url::Url::parse(raw.trim()).map_err(|_| "bad tunnel url".to_string())?;
+    let host = parsed.host_str().unwrap_or("").to_ascii_lowercase();
+    let path_ok = parsed.path() == "/" || parsed.path().is_empty();
+    let name_ok = host
+        .strip_suffix(".trycloudflare.com")
+        .is_some_and(|name| !name.is_empty() && !name.contains('.') && name.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'));
+    if parsed.scheme() != "https" || parsed.port().is_some() || !parsed.username().is_empty() || !path_ok || !name_ok {
+        return Err("bad tunnel url".into());
+    }
+    Ok(format!("https://{host}"))
 }
 
 pub fn stop() -> Result<String, String> {
@@ -407,13 +534,30 @@ fn bridge_token(home: &std::path::Path) -> String {
     std::fs::read_to_string(home.join("bridge-token")).unwrap_or_default().trim().to_string()
 }
 
+/// `MCP_DOOR_SECRET` when it is at least 16 characters, otherwise the `door-secret` file.
+fn door_secret(home: &std::path::Path) -> String {
+    let from_env = std::env::var("MCP_DOOR_SECRET").unwrap_or_default();
+    let from_env = from_env.trim();
+    if from_env.len() >= 16 {
+        return from_env.to_string();
+    }
+    std::fs::read_to_string(home.join("door-secret")).unwrap_or_default().trim().to_string()
+}
+
 #[tauri::command]
 pub async fn mesh_tunnel_status(state: tauri::State<'_, crate::AppState>) -> Result<TunnelStatus, String> {
     Ok(status(&bridge_token(&state.home)))
 }
 
 #[tauri::command]
+pub async fn mesh_arm_connector() -> Result<(), String> {
+    crate::mcp_oauth::arm_consent();
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn mesh_tunnel_start() -> Result<TunnelStatus, String> {
+    crate::mcp_oauth::arm_consent();
     let note = tauri::async_runtime::spawn_blocking(start).await.map_err(|error| error.to_string())??;
     let mut view = status(&bridge_token(&crate::util::product_home()));
     if view.running {
@@ -460,5 +604,28 @@ mod tests {
         assert!(!view.running);
         assert_eq!(view.public_mcp_url, "");
         assert_eq!(view.public_mcp_url, "");
+    }
+
+    #[test]
+    fn public_connector_url_is_the_vercel_origin() {
+        assert_eq!(public_mcp_base(), "https://ronicos.vercel.app/mcp");
+        assert_eq!(tunnel_origin("https://Example-Words.trycloudflare.com").as_deref(), Ok("https://example-words.trycloudflare.com"));
+        assert!(tunnel_origin("https://evil.example").is_err());
+        assert!(tunnel_origin("http://example-words.trycloudflare.com").is_err());
+        assert!(tunnel_origin("https://example-words.trycloudflare.com/mcp").is_err());
+        assert!(tunnel_origin("https://user@example-words.trycloudflare.com").is_err());
+    }
+
+    #[test]
+    fn local_authorize_keeps_the_encoded_query() {
+        let raw = "https://identifying-epa-sussex-forgotten.trycloudflare.com/authorize?response_type=code&redirect_uri=https%3A%2F%2Fchatgpt.com%2Fconnector_platform_oauth_redirect&scope=offline_access+ronic&code_challenge=PaACdgVzTXtqMHNOQAymQsZtZ7McoJkT_eaMQcED-Y0";
+        let local = browser_authorize_url(raw).unwrap();
+        assert_eq!(
+            local,
+            format!("http://127.0.0.1:{ALIAS_PORT}/authorize?response_type=code&redirect_uri=https%3A%2F%2Fchatgpt.com%2Fconnector_platform_oauth_redirect&scope=offline_access+ronic&code_challenge=PaACdgVzTXtqMHNOQAymQsZtZ7McoJkT_eaMQcED-Y0")
+        );
+        assert!(browser_authorize_url("https://identifying-epa-sussex-forgotten.trycloudflare.com/mcp").is_none());
+        assert!(browser_authorize_url("https://chatgpt.com/authorize?code=1").is_none());
+        assert!(browser_authorize_url("http://evil.trycloudflare.com/authorize").is_none());
     }
 }

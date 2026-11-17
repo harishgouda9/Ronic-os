@@ -45,6 +45,14 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     ensure_column(conn, "chat_threads", "target_type", "ALTER TABLE chat_threads ADD COLUMN target_type TEXT NOT NULL DEFAULT 'direct_bot'")?;
     ensure_column(conn, "chat_threads", "group_id", "ALTER TABLE chat_threads ADD COLUMN group_id TEXT NOT NULL DEFAULT ''")?;
     ensure_column(conn, "chat_threads", "routine_schedule", "ALTER TABLE chat_threads ADD COLUMN routine_schedule TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(conn, "chat_threads", "routine_job", "ALTER TABLE chat_threads ADD COLUMN routine_job TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(conn, "chat_threads", "routine_armed_at", "ALTER TABLE chat_threads ADD COLUMN routine_armed_at INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(conn, "chat_threads", "routine_fired_at", "ALTER TABLE chat_threads ADD COLUMN routine_fired_at INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(conn, "chat_threads", "task_status", "ALTER TABLE chat_threads ADD COLUMN task_status TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(conn, "chat_threads", "task_goal", "ALTER TABLE chat_threads ADD COLUMN task_goal TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(conn, "chat_threads", "task_next", "ALTER TABLE chat_threads ADD COLUMN task_next TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(conn, "workflows", "armed_at", "ALTER TABLE workflows ADD COLUMN armed_at INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(conn, "workflows", "last_fired_at", "ALTER TABLE workflows ADD COLUMN last_fired_at INTEGER NOT NULL DEFAULT 0")?;
     ensure_column(conn, "memory_items", "engine_origin", "ALTER TABLE memory_items ADD COLUMN engine_origin TEXT NOT NULL DEFAULT 'mem0_builtin'")?;
     ensure_column(conn, "memory_items", "valid_from", "ALTER TABLE memory_items ADD COLUMN valid_from INTEGER")?;
     ensure_column(conn, "memory_items", "invalid_at", "ALTER TABLE memory_items ADD COLUMN invalid_at INTEGER")?;
@@ -55,6 +63,24 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         [],
     )?;
     ensure_column(conn, "execution_steps", "turn_id", "ALTER TABLE execution_steps ADD COLUMN turn_id TEXT NOT NULL DEFAULT ''")?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS context_copies (
+            copy_id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            source_surface TEXT NOT NULL,
+            trigger_reason TEXT NOT NULL,
+            included_slices_json TEXT NOT NULL,
+            raw_token_estimate INTEGER NOT NULL,
+            compressed_token_count INTEGER NOT NULL,
+            secrets_redacted_count INTEGER NOT NULL DEFAULT 0,
+            payload_xml_md TEXT NOT NULL,
+            payload_cli_flags TEXT NOT NULL,
+            payload_cursor_mdc TEXT NOT NULL,
+            integrity_sha256 TEXT NOT NULL,
+            pinned INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL
+        );",
+    )?;
     ensure_column(conn, "sentinels", "severity", "ALTER TABLE sentinels ADD COLUMN severity TEXT NOT NULL DEFAULT 'info'")?;
     ensure_column(conn, "sentinels", "acknowledged", "ALTER TABLE sentinels ADD COLUMN acknowledged INTEGER NOT NULL DEFAULT 0")?;
     ensure_column(conn, "quant_orders", "wallet_tx_id", "ALTER TABLE quant_orders ADD COLUMN wallet_tx_id TEXT")?;
@@ -105,8 +131,38 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             conn.execute("UPDATE provider_accounts SET fallback_account_id = '' WHERE id = ?1", params![id])?;
         }
     }
+    clear_factory_model_lanes(conn)?;
     crate::remediation_core::sentinels_ensure(conn)?;
     prune(conn)?;
+    Ok(())
+}
+
+/// Bots used to be created with Gemini and OpenRouter filled in, and a harness
+/// copied into Primary, before any key existed. Drop that stamp. A lane the
+/// user pointed at a provider that now has a key stays. Local Ollama has no key.
+pub fn clear_factory_model_lanes(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE bot_profiles SET primary_account_id = ''
+         WHERE COALESCE(engine_kind, '') = ''
+           AND long_context_account_id = 'prov_gemini'
+           AND fallback_account_id = 'prov_openrouter'
+           AND primary_account_id IN ('prov_claude','prov_gemini','prov_chatgpt','prov_grok','prov_openrouter')
+           AND NOT EXISTS (
+             SELECT 1 FROM provider_accounts
+             WHERE id = bot_profiles.primary_account_id AND (has_secret = 1 OR provider_type = 'local_ollama')
+           )",
+        [],
+    )?;
+    conn.execute(
+        "UPDATE bot_profiles SET long_context_account_id = '', fallback_account_id = ''
+         WHERE long_context_account_id = 'prov_gemini'
+           AND fallback_account_id = 'prov_openrouter'
+           AND NOT EXISTS (
+             SELECT 1 FROM provider_accounts
+             WHERE id IN (bot_profiles.long_context_account_id, bot_profiles.fallback_account_id) AND has_secret = 1
+           )",
+        [],
+    )?;
     Ok(())
 }
 
@@ -289,6 +345,21 @@ CREATE TABLE IF NOT EXISTS memory_events (
   payload_json TEXT NOT NULL,
   created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS memory_edges (
+  id TEXT PRIMARY KEY,
+  memory_id TEXT NOT NULL,
+  relation TEXT NOT NULL,
+  target TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS memory_edges_memory ON memory_edges(memory_id);
+CREATE TABLE IF NOT EXISTS curated_entries (
+  id TEXT PRIMARY KEY,
+  store TEXT NOT NULL,
+  content TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS curated_entries_store ON curated_entries(store, updated_at);
 CREATE TABLE IF NOT EXISTS memory_engines (
   id TEXT PRIMARY KEY,
   label TEXT NOT NULL,
@@ -812,7 +883,7 @@ pub fn ensure_default_profile(conn: &Connection) -> Result<()> {
     }
     let t = now_ms();
     conn.execute(
-        "INSERT INTO bot_profiles (id, handle, display_name, avatar, soul_markdown, primary_account_id, long_context_account_id, fallback_account_id, allow_computer_use, allow_browser_use, allow_code_exec, scoped_obsidian_folder, daily_wallet_limit_usd, is_pinned, role, created_at, status_line) VALUES ('bot_default','@assistant','Assistant','mark:orb','Finish the task in front of you. Use the workspace tools when they help, and say clearly what you did.','prov_ollama','prov_gemini','prov_openrouter',1,1,1,'',5,1,'General assistant that handles tasks end to end',?1,'Ready for tasks')",
+        "INSERT INTO bot_profiles (id, handle, display_name, avatar, soul_markdown, primary_account_id, long_context_account_id, fallback_account_id, allow_computer_use, allow_browser_use, allow_code_exec, scoped_obsidian_folder, daily_wallet_limit_usd, is_pinned, role, created_at, status_line) VALUES ('bot_default','@assistant','Assistant','mark:orb','Finish the task in front of you. Use the workspace tools when they help, and say clearly what you did.','','','',1,1,1,'',5,1,'General assistant that handles tasks end to end',?1,'Ready for tasks')",
         params![t],
     )?;
     if kv_get(conn, "active_profile")?.as_deref().unwrap_or("").trim().is_empty() {
@@ -880,6 +951,9 @@ pub fn record_turn_activity(conn: &Connection, thread_id: &str, turn_id: &str, d
         "INSERT INTO execution_steps (id, thread_id, turn_id, role, model_used, content_markdown, action_type, action_payload_json, execution_latency_ms, created_at) VALUES (?1,?2,?3,'tool','activity',?4,'turn_activity',?5,0,?6)",
         params![nid("act"), thread_id, turn_id, detail, json!({"detail": detail}).to_string(), now],
     )?;
+    // The stuck-run check reads this clock. A turn that is still noting
+    // activity must not look idle just because the model call is long.
+    conn.execute("UPDATE chat_threads SET updated_at = ?1 WHERE id = ?2", params![now, thread_id])?;
     Ok(())
 }
 

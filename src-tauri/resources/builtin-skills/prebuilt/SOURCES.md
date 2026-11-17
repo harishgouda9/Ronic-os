@@ -38,3 +38,16 @@ NVIDIA skills are dual-licensed under Apache-2.0 and CC-BY-4.0. License texts ar
 | mineru | https://github.com/opendatalab/MinerU |
 
 MinerU is licensed under the MinerU Open Source License (Apache-2.0 base). Converts PDFs, DOCX, PPTX, and scanned documents into structured Markdown, LaTeX math, and tables for LLM agents. License notice is in `notices/mineru-LICENSE.txt`.
+
+## Ponytail (added 2026-11-06)
+
+| Skill | Upstream |
+| --- | --- |
+| ponytail | https://github.com/DietrichGebert/ponytail/tree/main/skills/ponytail |
+| ponytail-review | https://github.com/DietrichGebert/ponytail/tree/main/skills/ponytail-review |
+| ponytail-audit | https://github.com/DietrichGebert/ponytail/tree/main/skills/ponytail-audit |
+| ponytail-debt | https://github.com/DietrichGebert/ponytail/tree/main/skills/ponytail-debt |
+| ponytail-gain | https://github.com/DietrichGebert/ponytail/tree/main/skills/ponytail-gain |
+| ponytail-help | https://github.com/DietrichGebert/ponytail/tree/main/skills/ponytail-help |
+
+MIT. License text is in `notices/ponytail-LICENSE.txt`.

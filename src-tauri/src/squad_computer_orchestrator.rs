@@ -149,11 +149,41 @@ pub fn launch_tiling_squad_mini_windows(
                 .position(x, y)
                 .always_on_top(true)
                 .resizable(true)
-                .initialization_script(crate::computer_subsystem::BOT_MINI_WINDOW_HUD_SCRIPT);
+                .initialization_script(crate::computer_subsystem::BOT_MINI_WINDOW_HUD_SCRIPT)
+                .initialization_script(crate::workspace_bridge::PAGE_SCRIPT);
             builder = builder.data_directory(dir);
+            let sync_app = app.clone();
+            let sync_label = label.clone();
+            let sync_url = parsed.to_string();
+            builder = builder.on_page_load(move |_window, payload| {
+                if payload.event() == tauri::webview::PageLoadEvent::Finished && crate::site_session::worth_sharing(payload.url().as_str()) {
+                    crate::site_session::schedule_export(&sync_app, &sync_label);
+                }
+            });
             builder
                 .build()
                 .map_err(|e| err(format!("failed to spawn the squad window for {bot_id}: {e}")))?;
+            let reload_app = app.clone();
+            let reload_label = label.clone();
+            std::thread::spawn(move || {
+                let view = {
+                    let mut found = None;
+                    for _ in 0..8 {
+                        if let Some(view) = reload_app.get_webview(&reload_label) {
+                            found = Some(view);
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(250));
+                    }
+                    let Some(view) = found else { return };
+                    view
+                };
+                // The window already started loading. Apply the shared session,
+                // then reload once so the first document is requested with it.
+                if crate::site_session::import_shared(&view) && crate::site_session::worth_sharing(&sync_url) {
+                    let _ = view.reload();
+                }
+            });
         } else if let Some(win) = app.get_webview_window(&label) {
             let _ = win.set_focus();
         }

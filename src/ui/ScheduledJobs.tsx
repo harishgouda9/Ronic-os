@@ -1,6 +1,6 @@
 import { useEffect, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { X } from "lucide-react";
-import { anchorFor, dueLabel, forgetSchedule, nextRun, parseSchedule, readFired, rememberSchedule, SCHEDULES, scheduleLabel } from "../kernel/workspaceChrome";
+import { forgetSchedule, parseSchedule, rememberSchedule, SCHEDULES, scheduleLabel } from "../kernel/workspaceChrome";
 import { useRonic } from "../store";
 import { botName } from "./BotCoworkers";
 
@@ -18,7 +18,6 @@ export function ScheduledJobs({ open, canRun, onClose, onRun, nudge = 0 }: { ope
   const snap = useRonic((s) => s.snap)!;
   const run = useRonic((s) => s.run);
   const busy = useRonic((s) => s.busy);
-  const [now, setNow] = useState(() => Date.now());
   const [pick, setPick] = useState<string>(SCHEDULES[0].value);
   const [width, setWidth] = useState(readJobsWidth);
   const thread = snap.threads.find((item) => item.id === snap.activeThreadId);
@@ -55,12 +54,6 @@ export function ScheduledJobs({ open, canRun, onClose, onRun, nudge = 0 }: { ope
     window.addEventListener("pointerup", end);
   }
 
-  useEffect(() => {
-    if (!open) return;
-    const timer = window.setInterval(() => setNow(Date.now()), 15000);
-    return () => window.clearInterval(timer);
-  }, [open]);
-
   if (!open) return null;
 
   const jobs = snap.threads.filter((item) => item.routineSchedule.trim());
@@ -74,7 +67,7 @@ export function ScheduledJobs({ open, canRun, onClose, onRun, nudge = 0 }: { ope
       </div>
       <div className="pane-b stack">
         <p className="muted">These run while Ronic OS is open. Closing the app pauses them.</p>
-        {!canRun ? <p className="muted">Choose a model in the chat. A job uses that model.</p> : null}
+        {!canRun ? <p className="muted">A job uses this bot's model. Pick one on the bot if a run has none.</p> : null}
         <div className="stack">
           <span>On this chat</span>
           <select className="select" aria-label="Schedule" value={pick} onChange={(event) => setPick(event.target.value)}>
@@ -86,9 +79,7 @@ export function ScheduledJobs({ open, canRun, onClose, onRun, nudge = 0 }: { ope
             disabled={busy || !thread}
             onClick={() => {
               if (!thread) return;
-              const stamp = Date.now();
-              setNow(stamp);
-              rememberSchedule(thread.id, pick, stamp);
+              rememberSchedule(thread.id, pick, Date.now());
               void run("set_routine", { threadId: thread.id, schedule: pick });
             }}
           >
@@ -99,7 +90,7 @@ export function ScheduledJobs({ open, canRun, onClose, onRun, nudge = 0 }: { ope
         {jobs.length === 0 ? <p className="muted">No scheduled jobs yet.</p> : jobs.map((item) => {
           const bot = snap.profiles.find((profile) => profile.id === item.botProfileId);
           const parsed = parseSchedule(item.routineSchedule);
-          const when = parsed ? dueLabel(nextRun(parsed, anchorFor(item.id, item.routineSchedule, now), readFired()[item.id] ?? 0, now), now) : "Not a timer";
+          const when = parsed ? "runs while the app is open" : "Not a timer";
           return (
             <article key={item.id} className="tool-card stack">
               <div className="between">
@@ -108,7 +99,7 @@ export function ScheduledJobs({ open, canRun, onClose, onRun, nudge = 0 }: { ope
               </div>
               <span className="muted">{bot ? botName(bot) : "Bot"} · {scheduleLabel(item.routineSchedule)}</span>
               <div className="row-actions">
-                <button type="button" className="btn ghost small" disabled={busy || !canRun || !parsed} onClick={() => onRun(item.id)}>Run now</button>
+                <button type="button" className="btn ghost small" disabled={busy || !parsed} onClick={() => onRun(item.id)}>Run now</button>
                 <button type="button" className="btn ghost small" disabled={busy} onClick={() => { forgetSchedule(item.id); void run("set_routine", { threadId: item.id, schedule: "" }); }}>Remove</button>
               </div>
             </article>

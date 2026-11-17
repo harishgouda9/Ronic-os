@@ -4,7 +4,7 @@ import { ChiefDelegationPanel } from "./ChiefDelegation";
 import { createPortal } from "react-dom";
 import type { BotProfile, Provider, Step } from "../types";
 import { useRonic } from "../store";
-import { effortFor } from "../kernel/modelPrefs";
+import { assignBotModel, catalog, effortFor, modelClaimedBy, readBotModels } from "../kernel/modelPrefs";
 import type { ChatModel, ChatProviderLink } from "../kernel/liveChat";
 import { ago, forgetSchedule, isUnread, lastLine, rememberSchedule, safePageUrl } from "../kernel/workspaceChrome";
 import { hideBotScreens, isTauriRuntime, placeBotScreen, revealBotScreen, type WebAppBounds } from "../lib/tauriBridge";
@@ -13,6 +13,7 @@ import "../mini-shell/shell.css";
 import { ProviderAuth, ProviderState } from "./ProviderAuth";
 
 const HARNESSES = [
+  ["", "None"],
   ["claude_cli", "Claude Code CLI"],
   ["agy_cli", "Gemini / Antigravity agy"],
   ["codex_cli", "Codex CLI"],
@@ -29,7 +30,8 @@ const MODES = [
 ] as const;
 
 export function harnessLabel(bot: BotProfile) {
-  return HARNESSES.find((item) => item[0] === bot.harnessLaneId)?.[1] || bot.engine || bot.harnessLaneId || "In-app model";
+  const lane = HARNESSES.find((item) => item[0] && item[0] === bot.harnessLaneId)?.[1];
+  return lane || bot.engine || bot.harnessLaneId || "In-app model";
 }
 
 export function botName(bot?: { displayName?: string; handle?: string }) {
@@ -119,20 +121,21 @@ function shadeColor(color: string, percent: number) {
   return `#${(R << 16 | G << 8 | B).toString(16).padStart(6, "0")}`;
 }
 
-export function FacePicker({ name, mark, color, onChange, onColorChange }: { name: string; mark: string; color?: string; onChange: (mark: string) => void; onColorChange?: (color: string) => void }) {
+export function FacePicker({ name, mark, color, seed, onChange, onColorChange }: { name: string; mark: string; color?: string; seed?: string; onChange: (mark: string) => void; onColorChange?: (color: string) => void }) {
   const locked = mark.startsWith("mark:");
   const shown = locked ? mark : `mark:${markFromName(name)}`;
+  const faceSeed = seed || name || shown;
   return (
     <div className="stack face-pick">
       <div className="face-stage">
-        <BotFace seed={name || shown} mark={shown} size={76} color={color} />
+        <BotFace seed={faceSeed} mark={shown} size={76} color={color} />
       </div>
       <div className="mark-row">
         {BOT_MARKS.map((item) => {
           const on = shown === `mark:${item.id}`;
           return (
             <button key={item.id} type="button" className={`face-btn ${on ? "on" : ""}`} aria-label={item.label} aria-pressed={on} onClick={() => onChange(`mark:${item.id}`)}>
-              <BotFace seed={name || item.id} mark={`mark:${item.id}`} size={40} color={color} />
+              <BotFace seed={faceSeed} mark={`mark:${item.id}`} size={40} color={color} />
               <span className="mark-label">{item.label}</span>
             </button>
           );
@@ -150,7 +153,7 @@ export function FacePicker({ name, mark, color, onChange, onColorChange }: { nam
         })}
       </div>
       <button type="button" className="text-btn" onClick={() => onChange(`mark:${BOT_MARKS[Math.floor(Math.random() * BOT_MARKS.length)].id}`)}>Randomize</button>
-      <p className="muted">{locked ? "Face is locked to this shape." : "Face follows the name until you pick a shape."}{color ? "" : " No color picked yet — the face uses its name color."}</p>
+      <p className="muted">{locked ? "Face is locked to this shape." : "Face follows the name until you pick a shape."}{color ? "" : " No color picked yet — the face uses the same color as the bot list."}</p>
     </div>
   );
 }
@@ -203,6 +206,7 @@ export function CoworkerSidebar({ onInspect, onEditProfile }: { onInspect: (id: 
         unread: snap.threads.some((item) => item.groupId === group.id && isUnread(item.id, item.updatedAt, item.id === snap.activeThreadId)),
         on: activeGroup?.id === group.id,
         pinned: false,
+        chief: false,
         seed: group.id,
         members: names,
       };
@@ -220,13 +224,14 @@ export function CoworkerSidebar({ onInspect, onEditProfile }: { onInspect: (id: 
         unread: snap.threads.some((item) => item.botProfileId === bot.id && item.targetType !== "bot_group" && isUnread(item.id, item.updatedAt, item.id === snap.activeThreadId)),
         on: !activeGroup && bot.id === snap.activeProfileId,
         pinned: bot.isPinned,
+        chief: bot.id === snap.chiefBotId,
         seed: bot.id,
         members: [bot],
       };
     }),
   ]
     .filter((row) => !needle || `${row.title} ${row.preview}`.toLowerCase().includes(needle))
-    .sort((a, b) => Number(b.pinned) - Number(a.pinned) || b.when - a.when);
+    .sort((a, b) => Number(b.chief) - Number(a.chief) || Number(b.pinned) - Number(a.pinned) || b.when - a.when);
 
   const sessions = snap.threads
     .map((item) => {
@@ -276,7 +281,7 @@ export function CoworkerSidebar({ onInspect, onEditProfile }: { onInspect: (id: 
           <>
             {rows.length === 0 ? <p className="roster-empty">{needle ? "No match." : "No bots yet. Add one and tell it the job."}</p> : null}
             {rows.map((row) => (
-              <div key={`${row.kind}-${row.id}`} className={`roster-row ${row.on ? "on" : ""}`}>
+              <div key={`${row.kind}-${row.id}`} className={`roster-row${row.on ? " on" : ""}`} data-copy-bot={row.kind === "group" ? undefined : row.id}>
                 {row.kind === "group" && row.members.length > 1 ? (
                   <span className="face-stack">
                     {row.members.slice(0, 2).map((bot) => (
@@ -307,7 +312,10 @@ export function CoworkerSidebar({ onInspect, onEditProfile }: { onInspect: (id: 
                 >
                   <span className="roster-copy">
                     <span className="roster-top">
-                      <strong>{row.unread ? <i className="unread-dot" /> : null}{row.title}</strong>
+                      <span className="roster-name">
+                        <strong>{row.unread ? <i className="unread-dot" /> : null}{row.title}</strong>
+                        {row.chief ? <span className="chief-tag">Chief</span> : null}
+                      </span>
                       {row.when ? <time>{ago(row.when)}</time> : null}
                     </span>
                     <span className="preview">{row.preview}</span>
@@ -321,7 +329,7 @@ export function CoworkerSidebar({ onInspect, onEditProfile }: { onInspect: (id: 
           <>
             {sessions.length === 0 ? <p className="roster-empty">{needle ? "No match." : "No chats yet. Send a bot the work."}</p> : null}
             {sessions.map((row) => (
-              <div key={row.id} className={`roster-row ${row.on ? "on" : ""}`}>
+              <div key={row.id} className={`roster-row ${row.on ? "on" : ""}`} data-copy-chat={row.id}>
                 <button type="button" className="face-btn" aria-label={`Edit ${botName(row.bot)}`} onClick={() => row.bot && onEditProfile(row.bot.id)}>
                   <BotFace seed={row.bot?.id || row.id} mark={row.bot?.avatar} state={row.bot ? botPresence(row.bot) : ""} color={row.bot?.avatarColor} />
                 </button>
@@ -359,7 +367,7 @@ function NewBot({ onClose, onInspect }: { onClose: () => void; onInspect: (id: s
   const [mark, setMark] = useState("");
   const [color, setColor] = useState("");
   const [role, setRole] = useState("");
-  const [harness, setHarness] = useState("claude_cli");
+  const [harness, setHarness] = useState("");
   const [endpoint, setEndpoint] = useState("");
   const [soul, setSoul] = useState("");
   const [skills, setSkills] = useState("");
@@ -400,9 +408,10 @@ function NewBot({ onClose, onInspect }: { onClose: () => void; onInspect: (id: s
           <label className="field">
             <span>Harness</span>
             <select className="select" value={harness} onChange={(event) => setHarness(event.target.value)}>
-              {HARNESSES.map((item) => <option key={item[0]} value={item[0]}>{item[1]}</option>)}
+              {HARNESSES.map((item) => <option key={item[0] || "none"} value={item[0]}>{item[1]}</option>)}
             </select>
           </label>
+          <p className="muted">None uses the model you pick in chat. A harness does not connect a provider.</p>
           {harness === "ag_ui_url" ? <label className="field"><span>AG-UI endpoint</span><input className="input" value={endpoint} placeholder="https:// or http://127.0.0.1" onChange={(event) => setEndpoint(event.target.value)} /></label> : null}
           <label className="field"><span>Skills already in the workspace</span><input className="input" value={skills} placeholder="/security-audit, /code-review" onChange={(event) => setSkills(event.target.value)} /></label>
           <label className="field"><span>Plugins already installed</span><input className="input" value={plugins} placeholder="plugin slug, comma separated" onChange={(event) => setPlugins(event.target.value)} /></label>
@@ -476,12 +485,13 @@ function NewGroup({ onClose, onInspect }: { onClose: () => void; onInspect: (id:
   );
 }
 
-export function ProfileSlide({ bot, providers, links, onClose, onSignIn, onOpenKeys, onContinueChatGpt, onSaveKey }: { bot: BotProfile; providers: Provider[]; links: ChatProviderLink[]; onClose: () => void; onSignIn: (siteId: string) => void; onOpenKeys: (url: string) => void; onContinueChatGpt: () => void; onSaveKey: (id: string, secret: string) => void }) {
+export function ProfileSlide({ bot, providers, links, onClose, onSignIn, onOpenKeys, onContinueChatGpt, onSaveKey, ollamaReady = false }: { bot: BotProfile; providers: Provider[]; links: ChatProviderLink[]; onClose: () => void; onSignIn: (siteId: string) => void; onOpenKeys: (url: string) => void; onContinueChatGpt: () => void; onSaveKey: (id: string, secret: string) => void; ollamaReady?: boolean }) {
   const run = useRonic((s) => s.run);
-  const busy = useRonic((s) => s.busy);
+  const isChief = useRonic((s) => (s.snap?.chiefBotId || "") === bot.id);
   const [draft, setDraft] = useState(bot);
   const [openGroup, setOpenGroup] = useState("");
   const [note, setNote] = useState("");
+  const [saving, setSaving] = useState(false);
   const [confirmClose, setConfirmClose] = useState(false);
   useEffect(() => {
     setDraft(bot);
@@ -515,13 +525,27 @@ export function ProfileSlide({ bot, providers, links, onClose, onSignIn, onOpenK
     setConfirmClose(false);
   }
 
+  const named = draft.displayName.trim().length > 0 && draft.handle.trim().length > 0;
+
+  async function saveProfile() {
+    if (saving || !dirty || !named) return;
+    setSaving(true);
+    setNote("");
+    try {
+      const res = await run("save_profile", { profile: draft });
+      setNote(res ? "Profile saved." : "Could not save. Check the message at the top of the app.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
   return (
     <aside className="profile-pane" aria-label={`Edit ${botName(draft)}`}>
       <div className="screen-h">
         <BotFace seed={draft.id} mark={draft.avatar} size={36} state={botPresence(draft)} color={draft.avatarColor} />
         <div className="screen-who">
-          <strong>{botName(draft)}</strong>
-          <span>{dirty ? "Profile · unsaved changes" : "Profile"}</span>
+          <div className="who-line"><strong>{botName(draft)}</strong>{isChief ? <span className="chief-tag">Chief</span> : null}</div>
+          <span>{isChief ? "Chief officer" : "Profile"}{dirty ? " · unsaved changes" : ""}</span>
         </div>
         <button type="button" className="screen-x" onClick={requestClose} aria-label="Close profile">×</button>
       </div>
@@ -536,7 +560,7 @@ export function ProfileSlide({ bot, providers, links, onClose, onSignIn, onOpenK
             </div>
           </div>
         ) : null}
-        <FacePicker name={botName(draft)} mark={`mark:${botMark(draft.avatar)}`} color={draft.avatarColor} onChange={(avatar) => edit({ ...draft, avatar })} onColorChange={(color) => edit({ ...draft, avatarColor: color })} />
+        <FacePicker seed={draft.id} name={botName(draft)} mark={`mark:${botMark(draft.avatar)}`} color={draft.avatarColor} onChange={(avatar) => edit({ ...draft, avatar })} onColorChange={(color) => edit({ ...draft, avatarColor: color })} />
         <label className="field"><span>Display name</span><input className="input" value={draft.displayName} onChange={(event) => edit({ ...draft, displayName: event.target.value })} /></label>
         <label className="field"><span>Handle</span><input className="input" value={draft.handle} onChange={(event) => edit({ ...draft, handle: event.target.value })} /></label>
         <label className="field"><span>Role</span><input className="input" value={draft.role} onChange={(event) => edit({ ...draft, role: event.target.value })} /></label>
@@ -553,12 +577,11 @@ export function ProfileSlide({ bot, providers, links, onClose, onSignIn, onOpenK
         <div className="stack">
           <p className="muted">Approval mode: <strong>{draft.approvalMode === "auto" ? "Auto approve — acts autonomously" : draft.approvalMode === "manual" ? "Manual — every action is held" : "Ask — external actions and wallet spend held"}</strong>. Change it under Settings → Approvals.</p>
         </div>
+        <BotModelPick botId={draft.id} ollamaReady={ollamaReady} />
         <AccountPick label="Primary" value={draft.primaryAccountId} providers={providers} onChange={(primaryAccountId) => edit({ ...draft, primaryAccountId })} />
         <AccountPick label="Long context" value={draft.longContextAccountId} providers={providers} onChange={(longContextAccountId) => edit({ ...draft, longContextAccountId })} />
         <AccountPick label="Fallback" value={draft.fallbackAccountId} providers={providers} onChange={(fallbackAccountId) => edit({ ...draft, fallbackAccountId })} />
-        <button type="button" className="btn" disabled={busy || !dirty || draft.displayName.trim().length === 0 || draft.handle.trim().length === 0} onClick={() => { void run("save_profile", { profile: draft }).then((res) => setNote(res ? "Profile saved." : "Could not save. Check the message at the top of the app.")); }}>{dirty ? "Save profile" : "Saved"}</button>
-        {note ? <p className="muted" role="status">{note}</p> : null}
-        {dirty ? <p className="muted">You have unsaved changes.</p> : null}
+        <p className="muted">Optional. None uses the model selected in this chat. Primary is the normal model. Long context takes over once a thread is about 32,000 characters. Fallback is used when that model cannot answer.</p>
         <div className="pane-h dock-sub">Model providers</div>
         <p className="muted">Continue with ChatGPT uses that plan in this chat. Other providers need an API key. A site window does not connect the bot.</p>
         {links.map((link) => (
@@ -572,7 +595,43 @@ export function ProfileSlide({ bot, providers, links, onClose, onSignIn, onOpenK
           </section>
         ))}
       </div>
+      <div className="profile-save">
+        <button type="button" className="btn" disabled={saving || !dirty || !named} onClick={() => void saveProfile()}>
+          {saving ? "Saving…" : dirty ? "Save changes" : "Saved"}
+        </button>
+        {dirty && !named ? <p className="muted">Add a name and a handle before saving.</p> : null}
+        {note ? <p className="muted" role="status">{note}</p> : null}
+      </div>
     </aside>
+  );
+}
+
+export function BotModelPick({ botId, ollamaReady = false }: { botId: string; ollamaReady?: boolean }) {
+  const providers = useRonic((s) => s.snap?.providers ?? []);
+  const profiles = useRonic((s) => s.snap?.profiles ?? []);
+  const [tick, setTick] = useState(0);
+  void tick;
+  const keyed = providers.filter((item) => item.hasSecret).map((item) => item.id);
+  const models = catalog(keyed, ollamaReady);
+  const held = readBotModels();
+  const value = held[botId] ?? "";
+  return (
+    <label className="field">
+      <span>Model</span>
+      <select
+        className="select"
+        value={models.some((item) => item.id === value) ? value : ""}
+        onChange={(event) => { assignBotModel(botId, event.target.value); setTick((n) => n + 1); }}
+      >
+        <option value="">None</option>
+        {models.map((item) => {
+          const owner = modelClaimedBy(held, item.id, botId);
+          const who = owner ? profiles.find((bot) => bot.id === owner)?.handle : "";
+          return <option key={item.id} value={item.id}>{item.label}{who ? ` · ${who}` : ""}</option>;
+        })}
+      </select>
+      <p className="muted">This model stays on this bot. Picking one another bot has moves it here.</p>
+    </label>
   );
 }
 
@@ -581,6 +640,8 @@ function AccountPick({ label, value, providers, onChange }: { label: string; val
     <label className="field">
       <span>{label}</span>
       <select className="select" value={value} onChange={(event) => onChange(event.target.value)}>
+        <option value="">None</option>
+        {value && !providers.some((item) => item.id === value) ? <option value={value}>Saved provider</option> : null}
         {providers.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
       </select>
     </label>
@@ -601,7 +662,7 @@ function screenBounds(el: HTMLElement, coverAll = false): WebAppBounds | null {
         if (x < edge) x = edge;
       }
     }
-    for (const selector of [".page-col", "[data-edge-rail]", "[data-jobs-panel]", ".chat-side", ".preview-col"]) {
+    for (const selector of [".page-col", "[data-edge-rail]", "[data-jobs-panel]", "[data-copy-panel]", "[data-plugin-panel]", ".chat-side", ".preview-col"]) {
       const neighbor = document.querySelector(selector);
       if (!neighbor || neighbor.contains(el)) continue;
       const edge = neighbor.getBoundingClientRect().left;
@@ -750,7 +811,7 @@ export function ComputerDock({ inspectedId, onInspect, onClose, onCover, onRunRo
     if (frameRef.current) observer.observe(frameRef.current);
     const parent = frameRef.current?.closest(".chat-layout, .chat-grid");
     if (parent) observer.observe(parent);
-    for (const selector of ["[data-pane=thread]", "[data-edge-rail]", "[data-jobs-panel]", ".chat-side", ".preview-col", ".page-col"]) {
+    for (const selector of ["[data-pane=thread]", "[data-edge-rail]", "[data-jobs-panel]", "[data-copy-panel]", "[data-plugin-panel]", ".chat-side", ".preview-col", ".page-col"]) {
       const node = document.querySelector(selector);
       if (node) observer.observe(node);
     }

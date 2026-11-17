@@ -1,6 +1,7 @@
 import * as Sentry from "@sentry/react";
 import posthog from "posthog-js";
 import { createClient, type Session, type SupabaseClient } from "@supabase/supabase-js";
+import { classifySignup, parseAuthCallback, type SignUpResult } from "./accountAuth";
 
 export type StoreListing = {
   id: string;
@@ -40,6 +41,17 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
 
 let client: SupabaseClient | null = null;
 let session: Session | null = null;
+let passwordRecovery = false;
+let authNotice = "";
+let authSeq = 0;
+let completedAuthSeq = 0;
+let completedAuthMessage = "";
+let memoryVerifier = "";
+let ensuredFor = "";
+let ensurePromise: Promise<void> | null = null;
+const seenAuth = new Set<string>();
+let pendingAuth: { resolve: (message: string) => void; timer: number } | null = null;
+let authHooksStarted = false;
 const listeners = new Set<() => void>();
 
 function emit() {
@@ -53,6 +65,14 @@ export function subscribeCloud(listener: () => void) {
 
 export function cloudSession() {
   return session;
+}
+
+export function passwordRecoveryPending() {
+  return passwordRecovery;
+}
+
+export function cloudAuthNotice() {
+  return authNotice;
 }
 
 export function supabase() {
@@ -74,22 +94,45 @@ export function startCloud() {
   }
   const db = supabase();
   if (!db) return;
+  startAuthHooks();
   void restoreFromKeychain().finally(() => {
     void db.auth.getSession().then(({ data }) => {
       session = data.session;
       emit();
+      void pullPendingAuth();
     });
   });
-  db.auth.onAuthStateChange((_event, next) => {
+  db.auth.onAuthStateChange((event, next) => {
     session = next;
     if (next?.user && posthogKey) posthog.identify(next.user.id);
     // Mirror the refresh token into the OS keychain (Windows Credential
     // Manager / macOS Keychain). Fire-and-forget: a failed mirror must not
     // break the in-app session.
     if (next?.refresh_token) void invoke("cloud_keychain_store", { refreshToken: next.refresh_token }).catch(() => {});
-    if (!next) void invoke("cloud_keychain_clear").catch(() => {});
+    if (!next) {
+      passwordRecovery = false;
+      void invoke("cloud_keychain_clear").catch(() => {});
+    }
+    if (next?.user && (event === "SIGNED_IN" || event === "INITIAL_SESSION" || event === "PASSWORD_RECOVERY")) {
+      if (event === "PASSWORD_RECOVERY") passwordRecovery = true;
+      void ensureAccountRows(next.user.id);
+    }
     emit();
   });
+}
+
+function ensureAccountRows(userId: string): Promise<void> {
+  if (ensuredFor === userId) return Promise.resolve();
+  if (ensurePromise) return ensurePromise;
+  ensurePromise = (async () => {
+    const db = supabase();
+    if (!db) return;
+    const { error } = await db.rpc("ensure_user_rows", { p_user_id: userId });
+    if (!error) ensuredFor = userId;
+  })().finally(() => {
+    ensurePromise = null;
+  });
+  return ensurePromise;
 }
 
 // If the WebView lost its local session (cleared storage, new install), the
@@ -101,9 +144,10 @@ async function restoreFromKeychain() {
   if (data.session) return;
   const token = await invoke<string>("cloud_keychain_restore").catch(() => null);
   if (!token) return;
-  const { data: restored } = await db.auth.setSession({ access_token: token, refresh_token: token });
-  if (!restored.session) {
-    // Expired/revoked — drop the stale entry.
+  // The keychain holds the refresh token only. setSession would treat it as
+  // an access token, fail, and wipe a still-valid login.
+  const { data: restored, error } = await db.auth.refreshSession({ refresh_token: token });
+  if (error || !restored.session) {
     void invoke("cloud_keychain_clear").catch(() => {});
   }
 }
@@ -129,43 +173,96 @@ async function makePkcePair(): Promise<{ verifier: string; challenge: string }> 
   return { verifier, challenge: b64url(new Uint8Array(digest)) };
 }
 
-async function waitForAuthCode(timeoutMs: number): Promise<string> {
-  const { listen } = await import("@tauri-apps/api/event");
-  return new Promise<string>((resolve, reject) => {
-    let done = false;
-    let unlisten: (() => void) | null = null;
-    const stop = () => {
-      if (unlisten) unlisten();
-    };
-    const timer = window.setTimeout(() => {
-      if (!done) {
-        done = true;
-        reject(new Error("The browser sign-in did not come back in time. Open Ronic OS and try again."));
-        stop();
-      }
-    }, timeoutMs);
+function settleAuthWait(message: string) {
+  const pending = pendingAuth;
+  if (!pending) return;
+  pendingAuth = null;
+  window.clearTimeout(pending.timer);
+  pending.resolve(message);
+}
+
+function clearCustomVerifier() {
+  memoryVerifier = "";
+  try {
+    localStorage.removeItem(PKCE_VERIFIER_KEY);
+  } catch {
+    /* ignore */
+  }
+}
+
+function takeCustomVerifier(): string {
+  const fromMemory = memoryVerifier;
+  clearCustomVerifier();
+  return fromMemory;
+}
+
+function startAuthHooks() {
+  if (authHooksStarted || typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) return;
+  authHooksStarted = true;
+  void import("@tauri-apps/api/event").then(({ listen }) => {
     void listen<string>("ronic://auth-code", (event) => {
-      if (done) return;
-      const params = new URLSearchParams(event.payload ?? "");
-      const code = params.get("code");
-      const oauthError = params.get("error_description") ?? params.get("error");
-      if (!code) {
-        done = true;
-        window.clearTimeout(timer);
-        reject(new Error(oauthError || "The sign-in was canceled."));
-        stop();
-        return;
-      }
-      done = true;
-      window.clearTimeout(timer);
-      resolve(code);
-      stop();
-    }).then((fn) => {
-      // If the wait already ended before the subscription landed, close it now.
-      if (done) fn();
-      else unlisten = fn;
+      void acceptAuthQuery(String(event.payload ?? ""));
     });
   });
+}
+
+async function pullPendingAuth() {
+  const query = await invoke<string | null>("take_auth_callback").catch(() => null);
+  if (query) void acceptAuthQuery(query);
+}
+
+async function exchangeCustomCode(code: string, verifier: string): Promise<string> {
+  const db = supabase();
+  if (!db) return "Supabase is not configured.";
+  const tokenRes = await fetch(`${url}/auth/v1/token?grant_type=pkce`, {
+    method: "POST",
+    headers: { apikey: anon, "content-type": "application/json" },
+    body: JSON.stringify({ auth_code: code, code_verifier: verifier }),
+  });
+  if (!tokenRes.ok) {
+    const detail = (await tokenRes.json().catch(() => ({}))) as { error_description?: string; msg?: string };
+    return detail.error_description || detail.msg || "The sign-in code could not be exchanged.";
+  }
+  const tokens = (await tokenRes.json()) as { access_token: string; refresh_token: string };
+  const { error } = await db.auth.setSession({ access_token: tokens.access_token, refresh_token: tokens.refresh_token });
+  return error ? error.message : "";
+}
+
+async function completeAuthCallback(raw: string): Promise<string> {
+  const db = supabase();
+  if (!db) return "Supabase is not configured.";
+  const parsed = parseAuthCallback(raw);
+  if (parsed.kind === "empty") return "The sign-in was canceled.";
+  if (parsed.kind === "error") return parsed.message;
+  if (parsed.kind === "session") {
+    if (parsed.recovery) passwordRecovery = true;
+    const { error } = await db.auth.setSession({ access_token: parsed.accessToken, refresh_token: parsed.refreshToken });
+    return error ? error.message : "";
+  }
+  // Browser OAuth stores its own verifier. Email confirm and password reset
+  // use the verifier supabase-js stored for this webview.
+  if (memoryVerifier) return exchangeCustomCode(parsed.code, takeCustomVerifier());
+  // A recovery code emits PASSWORD_RECOVERY before this promise resolves.
+  const exchanged = await db.auth.exchangeCodeForSession(parsed.code);
+  return exchanged.error ? exchanged.error.message : "";
+}
+
+async function acceptAuthQuery(raw: string) {
+  const key = raw.trim();
+  if (!key) {
+    authNotice = "The sign-in was canceled.";
+    emit();
+    settleAuthWait(authNotice);
+    return;
+  }
+  if (seenAuth.has(key)) return;
+  seenAuth.add(key);
+  const message = await completeAuthCallback(key);
+  completedAuthSeq = authSeq;
+  completedAuthMessage = message;
+  authNotice = message;
+  emit();
+  settleAuthWait(message);
 }
 
 export async function signInWithBrowser(provider: "github" | "google"): Promise<string> {
@@ -175,40 +272,34 @@ export async function signInWithBrowser(provider: "github" | "google"): Promise<
     return "Browser sign-in needs the desktop app.";
   }
   const { verifier, challenge } = await makePkcePair();
+  memoryVerifier = verifier;
   try {
     localStorage.setItem(PKCE_VERIFIER_KEY, verifier);
   } catch {
-    /* private mode — the exchange below still works within this session */
+    /* private mode — the exchange below still uses memoryVerifier */
   }
-
+  const attempt = ++authSeq;
   const authorize = new URL(`${url}/auth/v1/authorize`);
   authorize.searchParams.set("provider", provider);
   authorize.searchParams.set("redirect_to", bounceUrl);
   authorize.searchParams.set("code_challenge", challenge);
   authorize.searchParams.set("code_challenge_method", "s256");
-
-  await invoke<void>("open_system_url", { url: authorize.toString() });
-  const code = await waitForAuthCode(5 * 60_000);
-
-  // Raw PKCE exchange against GoTrue; supabase-js never sees the browser
-  // window, so its stored verifier cannot exist — ours is the real one.
-  const tokenRes = await fetch(`${url}/auth/v1/token?grant_type=pkce`, {
-    method: "POST",
-    headers: { apikey: anon, "content-type": "application/json" },
-    body: JSON.stringify({ auth_code: code, code_verifier: verifier }),
-  });
   try {
-    localStorage.removeItem(PKCE_VERIFIER_KEY);
-  } catch {
-    /* ignore */
+    await invoke<void>("open_system_url", { url: authorize.toString() });
+  } catch (error) {
+    clearCustomVerifier();
+    return error instanceof Error ? error.message : String(error);
   }
-  if (!tokenRes.ok) {
-    const detail = (await tokenRes.json().catch(() => ({}))) as { error_description?: string; msg?: string };
-    return detail.error_description || detail.msg || "The sign-in code could not be exchanged.";
-  }
-  const tokens = (await tokenRes.json()) as { access_token: string; refresh_token: string };
-  const { error } = await db.auth.setSession({ access_token: tokens.access_token, refresh_token: tokens.refresh_token });
-  return error ? error.message : "";
+  if (completedAuthSeq === attempt) return completedAuthMessage;
+  return new Promise<string>((resolve) => {
+    const timer = window.setTimeout(() => {
+      if (pendingAuth?.resolve !== resolve) return;
+      pendingAuth = null;
+      clearCustomVerifier();
+      resolve("The browser sign-in did not come back in time. Open Ronic OS and try again.");
+    }, 5 * 60_000);
+    pendingAuth = { resolve, timer };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -299,27 +390,51 @@ export async function startProductCheckout(product: "founder_pass" | "pro_monthl
 export async function signIn(email: string, password: string) {
   const db = supabase();
   if (!db) return "Supabase is not configured.";
+  authNotice = "";
   const { error } = await db.auth.signInWithPassword({ email: email.trim(), password });
   return error ? error.message : "";
 }
 
-export async function signUp(email: string, password: string, displayName: string) {
+export async function signUp(email: string, password: string, displayName: string): Promise<SignUpResult> {
   const db = supabase();
-  if (!db) return "Supabase is not configured.";
-  const { error } = await db.auth.signUp({
+  if (!db) return { status: "error", message: "Supabase is not configured." };
+  const name = displayName.trim();
+  authNotice = "";
+  const { data, error } = await db.auth.signUp({
     email: email.trim(),
     password,
-    options: { data: { display_name: displayName.trim() } },
+    options: {
+      data: { display_name: name, full_name: name },
+      emailRedirectTo: bounceUrl,
+    },
   });
-  return error ? error.message : "";
+  return classifySignup({
+    errorMessage: error?.message,
+    hasSession: Boolean(data.session),
+    identityCount: data.user?.identities ? data.user.identities.length : null,
+  });
 }
 
 export async function signOut() {
   const db = supabase();
+  passwordRecovery = false;
   if (!db) return;
   await db.auth.signOut();
   void invoke("cloud_keychain_clear").catch(() => {});
   if (posthogKey) posthog.reset();
+}
+
+export async function loadAccountProfile(): Promise<{ email: string; displayName: string } | null> {
+  const db = supabase();
+  const user = session?.user;
+  if (!db || !user) return null;
+  const { data, error } = await db.from("profiles").select("email, full_name").eq("id", user.id).maybeSingle();
+  if (error || !data) return null;
+  const row = data as { email?: string; full_name?: string };
+  return {
+    email: String(row.email || user.email || ""),
+    displayName: String(row.full_name || ""),
+  };
 }
 
 export async function saveDisplayName(displayName: string) {
@@ -328,10 +443,17 @@ export async function saveDisplayName(displayName: string) {
   if (!db || !user) return "Sign in first.";
   const name = displayName.trim();
   if (!name) return "Enter a name.";
-  const { error } = await db.from("profiles").update({ display_name: name }).eq("id", user.id);
+  await ensureAccountRows(user.id);
+  let { data, error } = await db.from("profiles").update({ full_name: name }).eq("id", user.id).select("id");
+  if (!error && (!data || data.length === 0)) {
+    ensuredFor = "";
+    await ensureAccountRows(user.id);
+    ({ data, error } = await db.from("profiles").update({ full_name: name }).eq("id", user.id).select("id"));
+  }
   if (error) return error.message;
-  await db.auth.updateUser({ data: { display_name: name } });
-  return "";
+  if (!data || data.length === 0) return "The profile row is missing. Re-run supabase/schema.sql in the Supabase SQL editor, then try again.";
+  const updated = await db.auth.updateUser({ data: { display_name: name, full_name: name } });
+  return updated.error ? updated.error.message : "";
 }
 
 export async function listListings(): Promise<StoreListing[]> {
@@ -435,27 +557,43 @@ export interface RonicUserProfile {
 const PROFILE_KEY = "ronic.profile.user";
 const VPS_KEY = "ronic.vps.node";
 
-export function getLocalProfile(): RonicUserProfile {
-  try {
-    const raw = localStorage.getItem(PROFILE_KEY);
-    if (raw) {
-      const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed === "object" && parsed.email) {
-        return parsed as RonicUserProfile;
-      }
-    }
-  } catch {}
+function blankProfile(id?: string): RonicUserProfile {
   return {
-    id: "usr_guest_" + Math.random().toString(36).substring(2, 9),
+    id: id || "usr_" + Math.random().toString(36).slice(2, 10),
     email: "",
     displayName: "Workspace Operator",
     role: "Local Developer",
     tier: "Free Community",
-    createdAt: Date.now() - 86400000 * 14,
+    createdAt: Date.now(),
     lastLoginAt: Date.now(),
     cloudSyncEnabled: false,
     cloudProvider: "local_only",
   };
+}
+
+export function getLocalProfile(): RonicUserProfile {
+  try {
+    const raw = localStorage.getItem(PROFILE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<RonicUserProfile> | null;
+      if (parsed && typeof parsed === "object") {
+        const id = typeof parsed.id === "string" && parsed.id ? parsed.id : blankProfile().id;
+        const base = blankProfile(id);
+        const profile = { ...base, ...parsed, id, tier: parsed.tier || base.tier };
+        if (parsed.id !== id) {
+          try {
+            localStorage.setItem(PROFILE_KEY, JSON.stringify(profile));
+          } catch {}
+        }
+        return profile;
+      }
+    }
+  } catch {}
+  const created = blankProfile();
+  try {
+    localStorage.setItem(PROFILE_KEY, JSON.stringify(created));
+  } catch {}
+  return created;
 }
 
 export function saveLocalProfile(patch: Partial<RonicUserProfile>): RonicUserProfile {
@@ -496,35 +634,42 @@ export function saveStoredVpsNode(node: { url: string; token: string; label: str
 
 export async function resetPassword(email: string): Promise<string> {
   const db = supabase();
-  if (db) {
-    const { error } = await db.auth.resetPasswordForEmail(email.trim(), {
-      redirectTo: `${window.location.origin}/auth/reset-callback`,
-    });
-    if (error) return error.message;
-    return "";
-  }
-  if (!email || !email.includes("@")) return "Enter a valid email address.";
-  return "";
+  if (!db) return "Password recovery needs the account cloud (Supabase).";
+  if (!email.trim().includes("@")) return "Enter a valid email address.";
+  const { error } = await db.auth.resetPasswordForEmail(email.trim(), { redirectTo: bounceUrl });
+  return error ? error.message : "";
 }
 
-export async function updatePassword(password: string): Promise<string> {
+export async function updatePassword(password: string, currentPassword = ""): Promise<string> {
   if (password.length < 6) return "Password must be at least 6 characters.";
   const db = supabase();
-  if (db && session) {
-    const { error } = await db.auth.updateUser({ password });
-    if (error) return error.message;
-    return "";
+  const user = session?.user;
+  if (!db || !user) return cloudConfig.supabase ? "Sign in before changing the password." : "Password changes need the account cloud (Supabase).";
+  const providers = user.app_metadata?.providers;
+  const hasEmailPassword = Array.isArray(providers) ? providers.includes("email") : user.app_metadata?.provider === "email";
+  if (hasEmailPassword && !passwordRecovery) {
+    if (!currentPassword) return "Enter your current password.";
+    const email = user.email?.trim();
+    if (!email) return "This account has no email to check the current password against.";
+    const check = await db.auth.signInWithPassword({ email, password: currentPassword });
+    if (check.error) return "Current password is wrong.";
   }
+  const { error } = await db.auth.updateUser({ password });
+  if (error) return error.message;
+  passwordRecovery = false;
+  emit();
   return "";
 }
 
 export async function deleteUserAccount(): Promise<string> {
   const db = supabase();
   if (db && session) {
-    try {
-      await db.rpc("delete_user");
-    } catch {}
-    await db.auth.signOut();
+    const { error } = await db.rpc("delete_user");
+    if (error) return error.message || "The account could not be deleted.";
+    passwordRecovery = false;
+    await db.auth.signOut().catch(() => {});
+  } else if (cloudConfig.supabase) {
+    return "Sign in before deleting the cloud account.";
   }
   clearLocalProfile();
   saveStoredVpsNode(null);

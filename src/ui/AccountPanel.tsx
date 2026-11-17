@@ -1,9 +1,11 @@
 import { useEffect, useState, useSyncExternalStore } from "react";
 import { useRonic } from "../store";
 import {
+  cloudAuthNotice,
   cloudConfig,
   cloudSession,
   listDevices,
+  passwordRecoveryPending,
   refreshLicense,
   registerThisDevice,
   revokeDevice,
@@ -14,6 +16,7 @@ import {
   signUp,
   startProductCheckout,
   subscribeCloud,
+  updatePassword,
   type DeviceRow,
 } from "../services/cloud";
 import { invoke as tauriInvokeRaw } from "@tauri-apps/api/core";
@@ -59,7 +62,16 @@ export function AccountPanel() {
   const [note, setNote] = useState("");
   const [busy, setBusy] = useState(false);
   const [devices, setDevices] = useState<DeviceRow[] | null>(null);
+  const [nextPassword, setNextPassword] = useState("");
+  const [, bumpCloud] = useState(0);
   const license = snap?.license;
+
+  useEffect(() => {
+    const stop = subscribeCloud(() => bumpCloud((n) => n + 1));
+    return () => {
+      stop();
+    };
+  }, []);
 
   useEffect(() => {
     if (!session) {
@@ -136,8 +148,10 @@ export function AccountPanel() {
             disabled={busy || email.trim().length === 0 || password.length < 8}
             onClick={() => {
               setBusy(true);
-              void signUp(email, password, name).then((message) => {
-                setNote(message || "Account created. Confirm the email if Supabase asks, then sign in.");
+              void signUp(email, password, name).then((result) => {
+                if (result.status === "error") setNote(result.message);
+                else if (result.status === "confirm_email") setNote("Account created. Open the confirmation link in that email. It comes back into Ronic OS.");
+                else setNote("Account created. You are signed in.");
                 setBusy(false);
               }).catch((error) => {
                 setNote(error instanceof Error ? error.message : String(error));
@@ -147,6 +161,7 @@ export function AccountPanel() {
           >Create account</button>
         </div>
         {note ? <p className="muted">{note}</p> : null}
+        {cloudAuthNotice() ? <p className="muted">{cloudAuthNotice()}</p> : null}
       </form>
     );
   }
@@ -160,6 +175,24 @@ export function AccountPanel() {
         <button type="button" className="btn ghost small" disabled={busy} onClick={() => void signOut()}>Sign out</button>
       </div>
       <p className="muted">{session.user.email}</p>
+      {passwordRecoveryPending() ? (
+        <form
+          className="stack"
+          onSubmit={(event) => {
+            event.preventDefault();
+            setBusy(true);
+            void updatePassword(nextPassword).then((message) => {
+              setNote(message || "Password updated.");
+              if (!message) setNextPassword("");
+              setBusy(false);
+            });
+          }}
+        >
+          <p className="muted">The reset link worked. Set a new password. The current one is not required.</p>
+          <label className="field"><span>New password</span><input className="input" type="password" autoComplete="new-password" value={nextPassword} onChange={(event) => setNextPassword(event.target.value)} /></label>
+          <button className="btn" disabled={busy || nextPassword.length < 6}>Save new password</button>
+        </form>
+      ) : null}
 
       {license ? (
         <div className="between">

@@ -2,6 +2,7 @@ mod prebuilt;
 mod prompt;
 mod registry;
 mod skill_doc;
+mod skill_use;
 
 use crate::db;
 use crate::error::{err, Result};
@@ -19,6 +20,7 @@ use std::time::Duration;
 static RECONCILE_AFTER: AtomicU64 = AtomicU64::new(0);
 
 pub use prompt::{in_index, system_for};
+pub use skill_use::{mcp_turn, playbook, required_tools};
 
 pub struct CapabilityView {
     pub skills: Vec<Skill>,
@@ -312,16 +314,17 @@ pub fn save_plugin(conn: &Connection, home: &Path, draft: PluginDraft) -> Result
     } else {
         (format!("plug-{slug}"), home.join("plugins").join(&slug), "folder".into())
     };
+    let desktop = skill_doc::keep_desktop(draft.desktop);
     let parsed = skill_doc::ParsedPlugin {
         slug: slug.clone(),
         name: if draft.name.trim().is_empty() { slug.clone() } else { draft.name.trim().to_string() },
         version: if draft.version.trim().is_empty() { "1.0.0".into() } else { draft.version.trim().to_string() },
         has_agent: draft.has_agent,
-        has_desktop: draft.has_desktop,
+        has_desktop: draft.has_desktop || !desktop.is_empty(),
         tools: draft.tools,
         hooks: draft.hooks.into_iter().filter(|hook| skill_doc::is_hook(hook)).collect(),
         skills: draft.skills.iter().map(|skill| skill_doc::sanitize_slug(skill)).filter(|skill| !skill.is_empty()).collect(),
-        desktop: draft.desktop.into_iter().filter(|bit| matches!(bit.kind.as_str(), "status" | "command" | "pane")).collect(),
+        desktop,
     };
     fs::create_dir_all(&dir)?;
     fs::write(dir.join("plugin.yaml"), skill_doc::render_plugin(&parsed))?;
@@ -478,34 +481,116 @@ pub fn remove_mcp(conn: &Connection, home: &Path, id: &str) -> Result<()> {
     Ok(())
 }
 
-// Marketplace items whose integration is an MCP server. Installing one of
-// these slugs registers the real server entry (untrusted until the user
-// reviews it) instead of only writing a documentation skill.
+// Same connection fields as the marketplace screen. A display name, the
+// marketplace id, or the slug all resolve to one row.
 struct CatalogMcp {
+    id: &'static str,
+    slug: &'static str,
     name: &'static str,
-    transport: &'static str, // "sse" for remote URLs, "stdio" for local commands
+    transport: &'static str,
     command: &'static str,
     args: &'static [&'static str],
     url: &'static str,
-    note: &'static str,
 }
 
-fn catalog_mcp(slug: &str) -> Option<CatalogMcp> {
-    let found: CatalogMcp = match slug {
-        "notion-mcp" => CatalogMcp { name: "Notion", transport: "sse", command: "", args: &[], url: "https://mcp.notion.com/mcp", note: "Notion asks you to sign in the first time it connects." },
-        "linear-mcp" => CatalogMcp { name: "Linear", transport: "sse", command: "", args: &[], url: "https://mcp.linear.app/sse", note: "Linear asks you to sign in the first time it connects." },
-        "sentry-mcp" => CatalogMcp { name: "Sentry", transport: "sse", command: "", args: &[], url: "https://mcp.sentry.dev/mcp", note: "Sentry asks you to authorize the connection." },
-        "slack-mcp" => CatalogMcp { name: "Slack", transport: "sse", command: "", args: &[], url: "https://slack.com/api/mcp", note: "Slack asks you to install the app into your workspace." },
-        "composio-mcp" => CatalogMcp { name: "Composio MCP", transport: "sse", command: "", args: &[], url: "https://connect.composio.dev/mcp", note: "Composio asks you to connect apps from its dashboard." },
-        "github-mcp" => CatalogMcp { name: "GitHub MCP", transport: "sse", command: "", args: &[], url: "https://api.githubcopilot.com/mcp/", note: "GitHub asks you to authorize with your account." },
-        "supabase-mcp" => CatalogMcp { name: "Supabase", transport: "stdio", command: "npx", args: &["-y", "supabase-mcp@latest"], url: "", note: "Supabase needs a personal access token in the server command." },
-        "filesystem-mcp" => CatalogMcp { name: "Filesystem MCP", transport: "stdio", command: "npx", args: &["-y", "@modelcontextprotocol/server-filesystem"], url: "", note: "The server opens the workspace folder on this computer." },
-        "memory-mcp" => CatalogMcp { name: "Memory MCP", transport: "stdio", command: "npx", args: &["-y", "@modelcontextprotocol/server-memory"], url: "", note: "" },
-        "playwright-cdp" => CatalogMcp { name: "Playwright MCP", transport: "stdio", command: "npx", args: &["-y", "@playwright/mcp@latest"], url: "", note: "" },
-        "razorpay-upi" => CatalogMcp { name: "Razorpay MCP", transport: "stdio", command: "npx", args: &["-y", "razorpay-mcp"], url: "", note: "Razorpay needs your key id and secret in the server command." },
-        _ => return None,
-    };
-    Some(found)
+fn catalog_rows() -> &'static [CatalogMcp] {
+    &[
+        CatalogMcp { id: "mcp-notion", slug: "notion-mcp", name: "Notion", transport: "sse", command: "", args: &[], url: "https://mcp.notion.com/mcp" },
+        CatalogMcp { id: "mcp-linear", slug: "linear-mcp", name: "Linear", transport: "sse", command: "", args: &[], url: "https://mcp.linear.app/mcp" },
+        CatalogMcp { id: "mcp-sentry", slug: "sentry-mcp", name: "Sentry", transport: "sse", command: "", args: &[], url: "https://mcp.sentry.dev/mcp" },
+        CatalogMcp { id: "mcp-supabase", slug: "supabase-mcp", name: "Supabase", transport: "sse", command: "", args: &[], url: "https://mcp.supabase.com/mcp" },
+        CatalogMcp { id: "mcp-composio", slug: "composio-mcp", name: "Composio MCP", transport: "sse", command: "", args: &[], url: "https://connect.composio.dev/mcp" },
+        CatalogMcp { id: "mcp-github", slug: "github-mcp", name: "GitHub MCP", transport: "sse", command: "", args: &[], url: "https://api.githubcopilot.com/mcp/" },
+        CatalogMcp { id: "mcp-slack", slug: "slack-mcp", name: "Slack MCP", transport: "stdio", command: "npx", args: &["-y", "@modelcontextprotocol/server-slack"], url: "" },
+        CatalogMcp { id: "mcp-filesystem", slug: "filesystem-mcp", name: "Filesystem MCP", transport: "stdio", command: "npx", args: &["-y", "@modelcontextprotocol/server-filesystem", "."], url: "" },
+        CatalogMcp { id: "mcp-memory", slug: "memory-mcp", name: "Memory MCP", transport: "stdio", command: "npx", args: &["-y", "@modelcontextprotocol/server-memory"], url: "" },
+        CatalogMcp { id: "mcp-playwright", slug: "playwright-cdp", name: "Playwright MCP", transport: "stdio", command: "npx", args: &["-y", "@playwright/mcp@latest"], url: "" },
+        CatalogMcp { id: "mcp-razorpay", slug: "razorpay-upi", name: "Razorpay MCP", transport: "stdio", command: "npx", args: &["-y", "@razorpay/mcp-server"], url: "" },
+        CatalogMcp { id: "mcp-datadog", slug: "datadog-mcp", name: "Datadog", transport: "sse", command: "", args: &[], url: "https://mcp.datadoghq.com/mcp" },
+        CatalogMcp { id: "mcp-superpowers", slug: "superpowers-mcp", name: "Superpowers", transport: "stdio", command: "npx", args: &["-y", "superpowers-mcp"], url: "" },
+        CatalogMcp { id: "mcp-firecrawl", slug: "firecrawl-mcp", name: "Firecrawl", transport: "stdio", command: "npx", args: &["-y", "firecrawl-mcp"], url: "" },
+        CatalogMcp { id: "mcp-posthog", slug: "posthog-mcp", name: "PostHog", transport: "sse", command: "", args: &[], url: "https://mcp.posthog.com/mcp" },
+        CatalogMcp { id: "mcp-apify", slug: "apify-mcp", name: "Apify", transport: "sse", command: "", args: &[], url: "https://mcp.apify.com/mcp" },
+        CatalogMcp { id: "mcp-parallel", slug: "parallel-mcp", name: "Parallel", transport: "sse", command: "", args: &[], url: "https://mcp.parallel.ai/mcp" },
+        CatalogMcp { id: "mcp-granola", slug: "granola-mcp", name: "Granola", transport: "sse", command: "", args: &[], url: "https://mcp.granola.ai/mcp" },
+        CatalogMcp { id: "mcp-apollo", slug: "apollo-mcp", name: "Apollo.io", transport: "sse", command: "", args: &[], url: "https://mcp.apollo.io/mcp" },
+        CatalogMcp { id: "mcp-canva", slug: "canva-mcp", name: "Canva", transport: "sse", command: "", args: &[], url: "https://mcp.canva.com/mcp" },
+        CatalogMcp { id: "mcp-google-docs", slug: "google-docs-mcp", name: "Google Docs", transport: "sse", command: "", args: &[], url: "https://mcp.google.com/docs/mcp" },
+        CatalogMcp { id: "mcp-google-sheets", slug: "google-sheets-mcp", name: "Google Sheets", transport: "sse", command: "", args: &[], url: "https://mcp.google.com/sheets/mcp" },
+        CatalogMcp { id: "mcp-google-slides", slug: "google-slides-mcp", name: "Google Slides", transport: "sse", command: "", args: &[], url: "https://mcp.google.com/slides/mcp" },
+        CatalogMcp { id: "mcp-google-calendar", slug: "google-calendar-mcp", name: "Google Calendar", transport: "sse", command: "", args: &[], url: "https://mcp.google.com/calendar/mcp" },
+        CatalogMcp { id: "mcp-gmail", slug: "gmail-mcp", name: "Gmail", transport: "sse", command: "", args: &[], url: "https://mcp.google.com/gmail/mcp" },
+        CatalogMcp { id: "mcp-outlook", slug: "outlook-mcp", name: "Outlook", transport: "sse", command: "", args: &[], url: "https://mcp.microsoft.com/outlook/mcp" },
+        CatalogMcp { id: "mcp-onedrive", slug: "onedrive-mcp", name: "OneDrive", transport: "sse", command: "", args: &[], url: "https://mcp.microsoft.com/onedrive/mcp" },
+        CatalogMcp { id: "mcp-email", slug: "email-mcp", name: "Email", transport: "stdio", command: "npx", args: &["-y", "email-mcp-server"], url: "" },
+        CatalogMcp { id: "mcp-x", slug: "x-mcp", name: "X", transport: "sse", command: "", args: &[], url: "https://mcp.x.com/mcp" },
+        CatalogMcp { id: "mcp-mobbin", slug: "mobbin-mcp", name: "Mobbin", transport: "sse", command: "", args: &[], url: "https://mcp.mobbin.com/mcp" },
+        CatalogMcp { id: "mcp-1password", slug: "1password-mcp", name: "1Password", transport: "stdio", command: "npx", args: &["-y", "@1password/mcp-server"], url: "" },
+        CatalogMcp { id: "mcp-atlassian", slug: "atlassian-mcp", name: "Atlassian", transport: "sse", command: "", args: &[], url: "https://mcp.atlassian.com/mcp" },
+        CatalogMcp { id: "mcp-higgsfield", slug: "higgsfield-mcp", name: "Higgsfield", transport: "sse", command: "", args: &[], url: "https://mcp.higgsfield.ai/mcp" },
+        CatalogMcp { id: "mcp-finance", slug: "finance-mcp", name: "Finance", transport: "stdio", command: "npx", args: &["-y", "finance-mcp"], url: "" },
+        CatalogMcp { id: "mcp-x-money", slug: "x-money-mcp", name: "X Money", transport: "sse", command: "", args: &[], url: "https://mcp.x.money/mcp" },
+        CatalogMcp { id: "mcp-klaviyo", slug: "klaviyo-mcp", name: "Klaviyo", transport: "sse", command: "", args: &[], url: "https://mcp.klaviyo.com/mcp" },
+        CatalogMcp { id: "mcp-brevo", slug: "brevo-mcp", name: "Brevo", transport: "sse", command: "", args: &[], url: "https://mcp.brevo.com/mcp" },
+        CatalogMcp { id: "mcp-mailerlite", slug: "mailerlite-mcp", name: "MailerLite", transport: "sse", command: "", args: &[], url: "https://mcp.mailerlite.com/mcp" },
+        CatalogMcp { id: "mcp-bulkpublish", slug: "bulkpublish-mcp", name: "BulkPublish", transport: "stdio", command: "npx", args: &["-y", "bulkpublish-mcp"], url: "" },
+        CatalogMcp { id: "mcp-shopify", slug: "shopify-mcp", name: "Shopify Merchant", transport: "sse", command: "", args: &[], url: "https://mcp.shopify.com/mcp" },
+        CatalogMcp { id: "mcp-link", slug: "link-mcp", name: "Link", transport: "sse", command: "", args: &[], url: "https://mcp.link.com/mcp" },
+        CatalogMcp { id: "mcp-kraken", slug: "kraken-mcp", name: "Kraken", transport: "stdio", command: "npx", args: &["-y", "kraken-mcp-server"], url: "" },
+        CatalogMcp { id: "mcp-phantom", slug: "phantom-mcp", name: "Phantom", transport: "stdio", command: "npx", args: &["-y", "phantom-wallet-mcp"], url: "" },
+        CatalogMcp { id: "mcp-ramp", slug: "ramp-mcp", name: "Ramp", transport: "sse", command: "", args: &[], url: "https://mcp.ramp.com/mcp" },
+        CatalogMcp { id: "mcp-context-dev", slug: "context-dev-mcp", name: "Context.dev", transport: "sse", command: "", args: &[], url: "https://mcp.context.dev/mcp" },
+        CatalogMcp { id: "mcp-ahrefs", slug: "ahrefs-mcp", name: "Ahrefs", transport: "sse", command: "", args: &[], url: "https://mcp.ahrefs.com/mcp" },
+        CatalogMcp { id: "mcp-treg", slug: "treg-mcp", name: "Treg", transport: "stdio", command: "npx", args: &["-y", "treg-mcp"], url: "" },
+        CatalogMcp { id: "mcp-redis", slug: "redis-mcp", name: "Redis MCP", transport: "stdio", command: "npx", args: &["-y", "@modelcontextprotocol/server-redis"], url: "" },
+        CatalogMcp { id: "mcp-mongodb", slug: "mongodb-mcp", name: "MongoDB MCP", transport: "stdio", command: "npx", args: &["-y", "mongodb-mcp-server"], url: "" },
+        CatalogMcp { id: "mcp-qdrant", slug: "qdrant-mcp", name: "Qdrant Vector DB", transport: "stdio", command: "npx", args: &["-y", "mcp-server-qdrant"], url: "" },
+        CatalogMcp { id: "mcp-pinecone", slug: "pinecone-mcp", name: "Pinecone MCP", transport: "stdio", command: "npx", args: &["-y", "@pinecone-database/mcp"], url: "" },
+        CatalogMcp { id: "mcp-exa", slug: "exa-mcp", name: "Exa Search MCP", transport: "stdio", command: "npx", args: &["-y", "exa-mcp-server"], url: "" },
+        CatalogMcp { id: "mcp-perplexity", slug: "perplexity-mcp", name: "Perplexity MCP", transport: "stdio", command: "npx", args: &["-y", "perplexity-mcp-server"], url: "" },
+        CatalogMcp { id: "mcp-docker", slug: "docker-mcp", name: "Docker MCP", transport: "stdio", command: "docker", args: &["run", "-i", "--rm", "mcp/docker"], url: "" },
+    ]
+}
+
+fn catalog_mcp(raw: &str) -> Option<&'static CatalogMcp> {
+    let slug = skill_doc::sanitize_slug(raw);
+    if slug.is_empty() {
+        return None;
+    }
+    let rows = catalog_rows();
+    if let Some(hit) = rows.iter().find(|row| row.slug == slug || row.id == slug || skill_doc::sanitize_slug(row.name) == slug) {
+        return Some(hit);
+    }
+    let hits: Vec<_> = rows.iter().filter(|row| row.slug.trim_end_matches("-mcp").trim_end_matches("-cdp") == slug).collect();
+    if hits.len() == 1 {
+        return Some(hits[0]);
+    }
+    None
+}
+
+fn catalog_args(row: &CatalogMcp, home: &Path) -> Vec<String> {
+    row.args.iter().map(|arg| if *arg == "." { home.display().to_string() } else { (*arg).to_string() }).collect()
+}
+
+fn http_mcp_url(url: &str) -> bool {
+    let url = url.trim().to_ascii_lowercase();
+    url.starts_with("https://") || url.starts_with("http://")
+}
+
+fn loopback_mcp_url(url: &str) -> bool {
+    let url = url.trim().to_ascii_lowercase();
+    url.starts_with("http://127.0.0.1")
+        || url.starts_with("https://127.0.0.1")
+        || url.starts_with("http://localhost")
+        || url.starts_with("https://localhost")
+        || url.starts_with("http://[::1]")
+        || url.starts_with("https://[::1]")
+}
+
+#[derive(Debug)]
+pub struct McpConnect {
+    pub id: String,
+    pub note: String,
 }
 
 pub fn install_catalog(conn: &Connection, home: &Path, profile_id: &str, slug: &str, title: &str, blurb: &str) -> Result<String> {
@@ -518,23 +603,20 @@ pub fn install_catalog(conn: &Connection, home: &Path, profile_id: &str, slug: &
     let mut installed_mcp = false;
     let mut mcp_note = String::new();
     if let Some(mcp) = catalog_mcp(&slug) {
-        let mut args: Vec<String> = mcp.args.iter().map(|arg| arg.to_string()).collect();
-        if slug == "filesystem-mcp" {
-            // Point the official filesystem server at this workspace.
-            args.push(home.display().to_string());
-        }
         save_mcp(conn, home, McpDraft {
-            id: String::new(),
+            id: mcp.id.into(),
             name: mcp.name.into(),
             transport: mcp.transport.into(),
             command: mcp.command.into(),
-            args,
+            args: catalog_args(mcp, home),
             url: mcp.url.into(),
             tools: Vec::new(),
             secret: String::new(),
         })?;
         installed_mcp = true;
-        mcp_note = mcp.note.to_string();
+        if !mcp.url.is_empty() {
+            mcp_note = "A remote server still needs its credential before it counts as connected.".into();
+        }
     }
     let body = skill_doc::render_skill(&slug, title, &format!("/{slug}"), &[], &["windows".into(), "macos".into(), "linux".into()], &format!("# {title}\n\n{blurb}\n"));
     let catalog = home.join("catalog").join("skills").join(&slug).join("SKILL.md");
@@ -772,57 +854,81 @@ pub fn connect_mcp_server(
     args: &[String],
     url: Option<&str>,
     secret: Option<&str>,
-) -> Result<String> {
+) -> Result<McpConnect> {
     let name = name.trim();
     if name.is_empty() {
         return Err(err("connect_mcp needs an MCP server name"));
     }
-    let slug = skill_doc::sanitize_slug(name);
     let profile = resolve_profile(conn, profile_id);
+    let cat = catalog_mcp(name);
 
-    let mut trans = transport.unwrap_or("stdio").trim().to_lowercase();
+    let mut trans = transport.unwrap_or("").trim().to_lowercase();
     let mut cmd = command.unwrap_or("").trim().to_string();
     let mut server_args = args.to_vec();
     let mut endpoint_url = url.unwrap_or("").trim().to_string();
+    let mut saved_id = String::new();
+    let mut saved_name = name.to_string();
 
-    // If command and url are empty, check if it matches a catalog MCP (e.g. filesystem-mcp, github-mcp)
     if cmd.is_empty() && endpoint_url.is_empty() {
-        if let Some(cat) = catalog_mcp(&slug) {
-            trans = cat.transport.to_string();
-            cmd = cat.command.to_string();
-            server_args = cat.args.iter().map(|s| s.to_string()).collect();
-            endpoint_url = cat.url.to_string();
+        if let Some(row) = cat {
+            trans = row.transport.to_string();
+            cmd = row.command.to_string();
+            server_args = catalog_args(row, home);
+            endpoint_url = row.url.to_string();
+            saved_id = row.id.to_string();
+            saved_name = row.name.to_string();
+        }
+    } else if let Some(row) = cat {
+        saved_id = row.id.to_string();
+        saved_name = row.name.to_string();
+        if trans.is_empty() {
+            trans = row.transport.to_string();
         }
     }
-
+    if trans.is_empty() {
+        trans = "stdio".into();
+    }
+    // A URL with no command is a remote server even when transport was left blank.
+    if cmd.is_empty() && http_mcp_url(&endpoint_url) && trans != "sse" {
+        trans = "sse".into();
+    }
+    if trans == "sse" && !http_mcp_url(&endpoint_url) {
+        return Err(err(format!("MCP server '{name}' needs an https URL.")));
+    }
     if trans != "sse" && cmd.is_empty() {
         return Err(err(format!("MCP server '{name}' needs a command (e.g. 'npx -y @modelcontextprotocol/server-filesystem') or an SSE URL")));
     }
-    let remote = endpoint_url.starts_with("http://") || endpoint_url.starts_with("https://") || trans == "sse";
-    if remote && secret.unwrap_or("").trim().is_empty() {
+    let remote = http_mcp_url(&endpoint_url) || trans == "sse";
+    let secret_text = secret.unwrap_or("").trim();
+    if remote && !loopback_mcp_url(&endpoint_url) && secret_text.is_empty() {
         return Err(err(format!("MCP server '{name}' needs a credential before it can be saved. An empty form is not a connection.")));
     }
+    if saved_id.is_empty() {
+        saved_id = server_id_for_name(&saved_name);
+    }
 
-    let id = server_id_for_name(name);
     save_mcp(conn, home, McpDraft {
-        id: id.clone(),
-        name: name.to_string(),
-        transport: trans.clone(),
+        id: saved_id.clone(),
+        name: saved_name.clone(),
+        transport: trans,
         command: cmd,
         args: server_args,
         url: endpoint_url,
         tools: Vec::new(),
-        secret: secret.unwrap_or("").to_string(),
+        secret: secret_text.to_string(),
     })?;
 
-    conn.execute("UPDATE mcp_servers SET trust = 'trusted' WHERE id = ?1", params![id])?;
-    enable_mcp_defaults(conn, &id)?;
+    conn.execute("UPDATE mcp_servers SET trust = 'trusted' WHERE id = ?1", params![saved_id])?;
+    enable_mcp_defaults(conn, &saved_id)?;
     if !profile.is_empty() && profile_exists(conn, &profile)? {
-        note_delta(conn, &profile, &format!("MCP server {name} is trusted. Profile switches default to Active."))?;
+        note_delta(conn, &profile, &format!("MCP server {saved_name} is trusted. Profile switches default to Active."))?;
     }
 
-    let credential = if secret.unwrap_or("").trim().is_empty() { "No credential was stored." } else { "The credential is in the vault." };
-    Ok(format!("MCP server '{name}' is trusted. Profile switches default to Active. {credential}"))
+    let mut note = format!("MCP server '{saved_name}' is trusted. Profile switches default to Active.");
+    if secret_text.is_empty() {
+        note.push_str(" No credential was stored.");
+    }
+    Ok(McpConnect { id: saved_id, note })
 }
 
 struct SkillRow {
@@ -1532,6 +1638,10 @@ mod tests {
         assert!(!other.contains("Ship the pull request"), "{other}");
         let slashed = system_for(&conn, &home, &profile, "Soul A", "/ship-pr now", "none").unwrap();
         assert!(slashed.contains("STAGE2-BODY-MARKER"), "{slashed}");
+        let named = system_for(&conn, &home, &profile, "Soul A", "please use ship-pr on this branch", "none").unwrap();
+        assert!(named.contains("STAGE2-BODY-MARKER"), "{named}");
+        let needed = system_for(&conn, &home, &profile, "Soul A", "Ship the pull request for the branch", "none").unwrap();
+        assert!(needed.contains("STAGE2-BODY-MARKER"), "{needed}");
         let before = home.join("profiles").join(&profile).join("skills").join("from-agent").join("SKILL.md");
         let note = propose_skill(&conn, &profile, "thread", "from-agent", "A learned checklist", "---\nname: from-agent\ndescription: Learned\nslash_command: /from-agent\nrequires_tools: []\nplatforms: [windows]\n---\n\nSTEP-FROM-AGENT\n").unwrap();
         assert!(note.contains("not written"));
@@ -1541,6 +1651,61 @@ mod tests {
         assert!(before.exists());
         let old: i64 = conn.query_row("SELECT COUNT(*) FROM skills_and_mcps", [], |row| row.get(0)).unwrap();
         assert_eq!(old, 0);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn catalog_skill_and_trusted_mcp_load_when_the_job_matches() {
+        let (home, conn, profile) = setup();
+        let dir = home.join("catalog").join("skills").join("rules-audit");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: rules-audit\ndescription: Audit the zedvault firebase ruleset\nslash_command: /rules-audit\nplatforms: [windows, macos, linux]\n---\n\nCATALOG-BODY-MARKER\n",
+        )
+        .unwrap();
+        reconcile(&conn, &home, "").unwrap();
+        let hello = system_for(&conn, &home, &profile, "Soul A", "hello", "none").unwrap();
+        assert!(hello.contains("Audit the zedvault firebase ruleset"), "{hello}");
+        assert!(!hello.contains("CATALOG-BODY-MARKER"), "{hello}");
+        assert!(!hello.contains("MCP for this turn"), "{hello}");
+        let job = "Audit the zedvault firebase ruleset before release";
+        let needed = system_for(&conn, &home, &profile, "Soul A", job, "none").unwrap();
+        assert!(needed.contains("CATALOG-BODY-MARKER"), "{needed}");
+        let other = system_for(&conn, &home, "bot_b", "Soul B", job, "none").unwrap();
+        assert!(other.contains("CATALOG-BODY-MARKER"), "{other}");
+        save_mcp(
+            &conn,
+            &home,
+            McpDraft {
+                id: String::new(),
+                name: "Zedvault".into(),
+                transport: "stdio".into(),
+                command: "npx".into(),
+                args: vec!["-y".into(), "zedvault".into()],
+                url: String::new(),
+                tools: vec![DeclaredTool { name: "scan_ledger".into(), description: "Zedvault ledger scan phrase".into() }],
+                secret: String::new(),
+            },
+        )
+        .unwrap();
+        let ask = "please do a Zedvault ledger scan phrase now";
+        let untrusted = system_for(&conn, &home, &profile, "Soul A", ask, "none").unwrap();
+        assert!(!untrusted.contains("MCP for this turn"), "{untrusted}");
+        trust_mcp(&conn, "mcp-zedvault").unwrap();
+        let trusted = system_for(&conn, &home, &profile, "Soul A", ask, "none").unwrap();
+        assert!(trusted.contains("MCP for this turn"), "{trusted}");
+        assert!(trusted.contains("scan_ledger"), "{trusted}");
+        let quiet = system_for(&conn, &home, &profile, "Soul A", "hello", "none").unwrap();
+        assert!(!quiet.contains("MCP for this turn"), "{quiet}");
+        toggle_mcp(&conn, "mcp-zedvault", &profile, false).unwrap();
+        let off = system_for(&conn, &home, &profile, "Soul A", ask, "none").unwrap();
+        assert!(!off.contains("MCP for this turn"), "{off}");
+        toggle_skill(&conn, &home, "sk-catalog-rules-audit", &profile, false).unwrap();
+        let hidden = system_for(&conn, &home, &profile, "Soul A", job, "none").unwrap();
+        assert!(!hidden.contains("CATALOG-BODY-MARKER"), "{hidden}");
+        let still = system_for(&conn, &home, "bot_b", "Soul B", job, "none").unwrap();
+        assert!(still.contains("CATALOG-BODY-MARKER"), "{still}");
         let _ = fs::remove_dir_all(&home);
     }
 
@@ -1595,7 +1760,7 @@ mod tests {
             .unwrap()
             .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap();
-        for name in ["find-skills", "grill-me", "agent-browser", "improve-codebase-architecture", "computer-use", "code-review", "vercel-react-best-practices", "remotion-to-hyperframes", "hyperframes-cli", "composio"] {
+        for name in ["find-skills", "grill-me", "agent-browser", "improve-codebase-architecture", "computer-use", "code-review", "vercel-react-best-practices", "remotion-to-hyperframes", "hyperframes-cli", "composio", "ponytail", "ponytail-review", "ponytail-audit", "ponytail-debt", "ponytail-gain", "ponytail-help"] {
             assert!(slugs.iter().any(|slug| slug == &format!("prebuilt-skills:{name}")), "{slugs:?}");
         }
         let trust: String = conn.query_row("SELECT trust FROM plugins WHERE id = ?1", params![prebuilt::PLUGIN_ID], |row| row.get(0)).unwrap();
@@ -1649,4 +1814,114 @@ mod tests {
         assert!(!index_of(&turned).lines().any(|line| line.starts_with("/find-skills")), "{turned}");
         let _ = fs::remove_dir_all(&home);
     }
+
+    #[test]
+    fn mcp_connect_catalog_matches_the_marketplace_screen() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../src/kernel/marketplaceCatalog.ts");
+        let text = fs::read_to_string(&path).unwrap();
+        let mut parsed = Vec::new();
+        let mut search = 0;
+        while let Some(rel) = text[search..].find("kind: \"mcp\",") {
+            let at = search + rel;
+            let start = text[..at].rfind("\n  {").unwrap();
+            let cfg_at = at + text[at..].find("mcpConfig:").unwrap();
+            let head = &text[start..cfg_at];
+            let cfg = &text[cfg_at..text.len().min(cfg_at + 700)];
+            parsed.push((
+                quoted(head, "id"),
+                quoted(head, "slug"),
+                quoted(head, "name"),
+                quoted(cfg, "transport"),
+                quoted(cfg, "command"),
+                quoted(cfg, "url"),
+                quoted_list(cfg, "args"),
+            ));
+            search = cfg_at + 10;
+        }
+        assert_eq!(parsed.len(), catalog_rows().len(), "marketplace MCP rows drifted");
+        for (id, slug, name, transport, command, url, args) in parsed {
+            let row = catalog_mcp(&slug).unwrap_or_else(|| panic!("missing {slug}"));
+            assert_eq!(row.id, id, "{slug}");
+            assert_eq!(row.name, name, "{slug}");
+            assert_eq!(row.transport, transport, "{slug}");
+            assert_eq!(row.command, command, "{slug}");
+            assert_eq!(row.url, url, "{slug}");
+            assert_eq!(row.args, args.as_slice(), "{slug}");
+        }
+        assert_eq!(catalog_mcp("Notion").unwrap().id, "mcp-notion");
+        assert_eq!(catalog_mcp("mcp-notion").unwrap().url, "https://mcp.notion.com/mcp");
+        assert_eq!(catalog_mcp("Apollo.io").unwrap().id, "mcp-apollo");
+        assert_eq!(catalog_mcp("x").unwrap().id, "mcp-x");
+        assert_eq!(catalog_mcp("x-money").unwrap().id, "mcp-x-money");
+        assert!(catalog_mcp("google").is_none());
+        assert!(catalog_mcp("linear").unwrap().url.ends_with("/mcp"));
+    }
+
+    #[test]
+    fn mcp_connect_saves_the_catalog_id_and_refuses_an_empty_remote() {
+        let (home, conn, profile) = setup();
+        let notion = connect_mcp_server(&conn, &home, &profile, "Notion", None, None, &[], None, Some("token")).unwrap();
+        assert_eq!(notion.id, "mcp-notion");
+        assert!(!notion.note.contains("vault"), "{}", notion.note);
+        let row: (String, String, String) = conn
+            .query_row("SELECT name, transport, url FROM mcp_servers WHERE id = 'mcp-notion'", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap();
+        assert_eq!(row, ("Notion".into(), "sse".into(), "https://mcp.notion.com/mcp".into()));
+        let by_id = connect_mcp_server(&conn, &home, &profile, "mcp-notion", None, None, &[], None, Some("token")).unwrap();
+        assert_eq!(by_id.id, "mcp-notion");
+
+        let before: i64 = conn.query_row("SELECT COUNT(*) FROM mcp_servers", [], |row| row.get(0)).unwrap();
+        let denied = connect_mcp_server(&conn, &home, &profile, "custom", None, None, &[], Some("https://example.com/mcp"), None);
+        assert!(denied.is_err(), "{denied:?}");
+        let after: i64 = conn.query_row("SELECT COUNT(*) FROM mcp_servers", [], |row| row.get(0)).unwrap();
+        assert_eq!(before, after);
+        let bad_sse = connect_mcp_server(&conn, &home, &profile, "weird", Some("sse"), None, &[], Some("stdio:local"), None);
+        assert!(bad_sse.unwrap_err().0.contains("https"));
+
+        let local = connect_mcp_server(&conn, &home, &profile, "local-bridge", None, None, &[], Some("http://127.0.0.1:9/mcp"), None).unwrap();
+        let transport: String = conn.query_row("SELECT transport FROM mcp_servers WHERE id = ?1", params![local.id], |row| row.get(0)).unwrap();
+        assert_eq!(transport, "sse");
+
+        let memory = connect_mcp_server(&conn, &home, &profile, "Memory MCP", None, None, &[], None, None).unwrap();
+        assert_eq!(memory.id, "mcp-memory");
+        let command: String = conn.query_row("SELECT command FROM mcp_servers WHERE id = 'mcp-memory'", [], |row| row.get(0)).unwrap();
+        assert_eq!(command, "npx");
+
+        install_catalog(&conn, &home, &profile, "filesystem-mcp", "Filesystem", "files").unwrap();
+        let args_json: String = conn.query_row("SELECT args_json FROM mcp_servers WHERE id = 'mcp-filesystem'", [], |row| row.get(0)).unwrap();
+        let args: Vec<String> = serde_json::from_str(&args_json).unwrap();
+        assert!(args.iter().any(|arg| arg == &home.display().to_string()), "{args:?}");
+        assert!(!args.iter().any(|arg| arg == "."));
+        let _ = fs::remove_dir_all(&home);
+    }
+
+fn quoted(block: &str, key: &str) -> String {
+    let needle = format!("{key}: \"");
+    let start = block.find(&needle).unwrap_or_else(|| panic!("missing {key}")) + needle.len();
+    let rest = &block[start..];
+    rest[..rest.find('"').unwrap()].to_string()
+}
+
+fn quoted_list(block: &str, key: &str) -> Vec<String> {
+    let start = block.find(&format!("{key}:")).unwrap_or_else(|| panic!("missing {key}"));
+    let rest = &block[start..];
+    let open = rest.find('[').unwrap();
+    let close = rest.find(']').unwrap();
+    let mut out = Vec::new();
+    let mut chars = rest[open + 1..close].chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '"' {
+            continue;
+        }
+        let mut value = String::new();
+        for item in chars.by_ref() {
+            if item == '"' {
+                break;
+            }
+            value.push(item);
+        }
+        out.push(value);
+    }
+    out
+}
 }

@@ -7,13 +7,36 @@ use rusqlite::{params, Connection};
 pub fn system_for(conn: &Connection, home: &std::path::Path, profile_id: &str, soul: &str, user_prompt: &str, memory: &str) -> Result<String> {
     let view = capabilities::view(conn, home, profile_id)?;
     let delta = capabilities::take_delta(conn, profile_id)?;
-    let playbook = slash_body(user_prompt, &view.skills, profile_id, &view.plugins);
+    let visible: Vec<&Skill> = view
+        .skills
+        .iter()
+        .filter(|skill| in_index(skill, profile_id, capabilities::plugin_agent_on(&view.plugins, &skill.plugin_id, profile_id)))
+        .collect();
+    let playbook = crate::capabilities::skill_use::playbook(user_prompt, &visible, &view.plugins, profile_id);
+    let mcp = crate::capabilities::skill_use::mcp_turn(user_prompt, &view.mcp_servers, profile_id);
     let (project, computer, browser, code, cap) = profile_context(conn, profile_id)?;
     let index = view_index(&view.skills, profile_id, &view.plugins);
+    if crate::coworker::is_greeting(&user_prompt.trim().to_ascii_lowercase()) {
+        return Ok(vec![
+            soul.trim().to_string(),
+            format!("Project: {project}"),
+            format!(
+                "Skill index:\n{}\nUse a matching skill from this bot's directory, the shared catalog, or an enabled plugin. Naming a skill, plugin, or MCP server loads it for this turn. If a skill is only listed here, call load_skill with its slug before you answer.",
+                if index.is_empty() { "none".into() } else { index }
+            ),
+            format!("Relevant memory:\n{memory}"),
+        ]
+        .join("\n\n"));
+    }
+    let injection = crate::workspace_bridge::format_injection_brief(&project, home);
     let mut tiers = vec![
         soul.trim().to_string(),
         format!("Project: {project}\nComputer use: {computer}. Browser use: {browser}. Code execution: {code}. Daily wallet cap: ${cap}."),
-        format!("Skill index:\n{}", if index.is_empty() { "none".into() } else { index }),
+        injection,
+        format!(
+            "Skill index:\n{}\nUse a matching skill from this bot's directory, the shared catalog, or an enabled plugin. Naming a skill, plugin, or MCP server loads it for this turn. If a skill is only listed here, call load_skill with its slug before you answer.",
+            if index.is_empty() { "none".into() } else { index }
+        ),
     ];
     let mut turn = String::new();
     if !delta.trim().is_empty() {
@@ -24,8 +47,14 @@ pub fn system_for(conn: &Connection, home: &std::path::Path, profile_id: &str, s
         if !turn.is_empty() {
             turn.push('\n');
         }
-        turn.push_str("Skill playbook for this turn:\n");
+        turn.push_str("Skill playbook for this turn. Follow it:\n");
         turn.push_str(&body);
+    }
+    if let Some(note) = mcp {
+        if !turn.is_empty() {
+            turn.push('\n');
+        }
+        turn.push_str(&note);
     }
     if !turn.is_empty() {
         tiers.push(turn);
@@ -56,7 +85,7 @@ pub fn system_for(conn: &Connection, home: &std::path::Path, profile_id: &str, s
 
     let format_guidance = "RESPONSE FORMAT:\n- For technical analysis, implementation plans, code, and structured data: Use clean, well-formatted Markdown with section headers (### Section), bullet points, and tables where appropriate.\n- For conversational replies or simple answers: Keep your response direct, friendly, and natural without unnecessary headings or tables.";
 
-    let tool_instruction = "You are running inside Ronic OS with access to tools when tasks require them. You have direct access to the terminal: call terminal_command or sandbox_command to run git, npm, pnpm, cargo, python, bun, and test commands in the project folder with live terminal streaming. Report only what a tool returned. Do not claim you moved money, edited a file, ran a command, opened a page, or checked a service unless a tool card says so.\nFiles the user attaches are read for you and inlined into the request. To open any file on this computer — an attachment, a Desktop file, or any path the user named — call read_file with the full absolute path (or a project-relative path). Never claim you cannot open an attached or referenced file: read_file opens it.\nSkills, Plugins & MCP: You can download and install any skill or playbook directly (from a GitHub repository URL, raw file link, web URL, or catalog slug) using install_skill, install any plugin from GitHub or repo using install_plugin, and connect/trust any MCP server using connect_mcp. Call these immediately on your own whenever the user asks to add, install, or download skills, plugins, or MCP servers.\nWorkspace Webapps & Desktop apps: You HAVE FULL ACCESS and auto-control over both:\n1) In-workspace web apps (ChatGPT, Claude, Gemini, Perplexity, custom apps) running right beside you in the workspace stage via workspace_webapp (and inspect_page/read_page with target 'workspace' or app name). You can open them, inspect and read page contents, fill in credentials, submit prompts, and click buttons in the user's workspace session.\n2) Desktop applications (VS Code, Cursor, Claude Code, Obsidian, Ollama, etc.) via desktop_app. You can launch them and inspect/click/type their UI controls.\nNEVER tell the user you are isolated from their desktop or unable to see or control the webapps or desktop apps beside you.\nAction-First Principle: When the user asks you to check, test, access, open, or control an app, skill, plugin, or server (e.g. 'can you access desktop webapp', 'check if you can reach ChatGPT', 'open chatgpt', 'are you working'), DO NOT merely answer 'Yes I can, let me check...' or output thinking tags and stop. You MUST IMMEDIATELY invoke the appropriate tool (e.g. workspace_webapp, desktop_app, inspect_page, etc.) in the very first turn so real actions and results happen automatically.\nIf your API cannot call tools and a tool is required, reply with only a markdown fence tagged ronic-tool. The fence body is one JSON object with a tool field.";
+    let tool_instruction = "You are running inside Ronic OS with access to tools when tasks require them. The terminal (terminal_command, sandbox_command) runs inside this bot's own workspace folder. It cannot open the project folder. Use it for allowlisted commands whose inputs are already in that workspace. Read and list the project folder with read_file and list_files. Report only what a tool returned. Do not claim you moved money, edited a file, ran a command, opened a page, or checked a service unless a tool card says so.\nFiles the user attaches are read for you and inlined into the request. read_file and list_files open the project folder named in Context injection. An empty list_files path is that folder. A project-relative path stays inside it. An absolute path is opened only when it is a file the user attached in this chat. Do not ask the user to attach the project folder when Context injection names it. A browser login is the page session listed in Context injection. Use inspect_page and read_page on that session. Do not ask the user to sign in again. Context injection is on every tool result, not only Slack. Do not paste the workspace pack into a team message or an email.\nSkills, Plugins & MCP: You can download and install any skill or playbook directly (from a GitHub repository URL, raw file link, web URL, or catalog slug) using install_skill, install any plugin from GitHub or repo using install_plugin, and connect/trust any MCP server using connect_mcp. Call these immediately on your own whenever the user asks to add, install, or download skills, plugins, or MCP servers.\nWorkspace Webapps & Desktop apps: You HAVE FULL ACCESS and auto-control over both:\n1) In-workspace web apps (ChatGPT, Claude, Gemini, Perplexity, custom apps) running right beside you in the workspace stage via workspace_webapp (and inspect_page/read_page with target 'workspace' or app name). You can open them, inspect and read page contents, fill in credentials, submit prompts, and click buttons in the user's workspace session.\n2) Desktop applications (VS Code, Cursor, Claude Code, Obsidian, Ollama, etc.) via desktop_app. You can launch them and inspect/click/type their UI controls.\nNEVER tell the user you are isolated from their desktop or unable to see or control the webapps or desktop apps beside you.\nAction-First Principle: When the user asks you to check, test, access, open, or control an app, skill, plugin, or server (e.g. 'can you access desktop webapp', 'check if you can reach ChatGPT', 'open chatgpt', 'are you working'), DO NOT merely answer 'Yes I can, let me check...' or output thinking tags and stop. You MUST IMMEDIATELY invoke the appropriate tool (e.g. workspace_webapp, desktop_app, inspect_page, etc.) in the very first turn so real actions and results happen automatically.\nWhen the user says they logged in in your browser, read Context injection. If that site is listed, use the open page. If the project folder is named, list_files it. Do not answer that the terminal workspace is empty and stop.\nIf your API cannot call tools and a tool is required, reply with only a markdown fence tagged ronic-tool. The fence body is one JSON object with a tool field.";
 
     tiers.push(crate::coworker::PROTOCOL.to_string());
     tiers.push(conversational_guidance.into());
@@ -85,7 +114,10 @@ pub fn in_index(skill: &Skill, profile_id: &str, plugin_on: bool) -> bool {
     if !skill.hidden_reason.is_empty() {
         return false;
     }
-    let enabled = skill.enables.iter().any(|flag| flag.profile_id == profile_id && flag.enabled);
+    let enabled = match skill.enables.iter().find(|flag| flag.profile_id == profile_id) {
+        Some(flag) => flag.enabled,
+        None => skill.origin == "catalog",
+    };
     if !enabled {
         return false;
     }
@@ -104,16 +136,7 @@ fn view_index(skills: &[Skill], profile_id: &str, plugins: &[crate::models::Plug
         .join("\n")
 }
 
-fn slash_body(prompt: &str, skills: &[Skill], profile_id: &str, plugins: &[crate::models::PluginPackage]) -> Option<String> {
-    let token = prompt.split_whitespace().next()?;
-    if !token.starts_with('/') || token.len() < 2 {
-        return None;
-    }
-    skills.iter().find(|skill| {
-        in_index(skill, profile_id, capabilities::plugin_agent_on(plugins, &skill.plugin_id, profile_id))
-            && (skill.slash_command == token || skill.slash_command.trim_start_matches('/') == token.trim_start_matches('/') || format!("/{}", skill.slug) == token)
-    }).map(|skill| skill.body.clone())
-}
+
 
 fn profile_context(conn: &Connection, profile_id: &str) -> Result<(String, &'static str, &'static str, &'static str, String)> {
     let settings = db::settings_of(conn)?;

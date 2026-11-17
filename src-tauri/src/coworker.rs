@@ -14,7 +14,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
-pub const PROTOCOL: &str = "Co-worker protocol (binding):\n1. Outcome first. For actionable tasks requiring tools, Sentence 1 states what you actually did and what a tool verified. For conversational greetings, simple questions, or conceptual explanations, reply directly and conversationally without running unneeded tools. Never open with \"Certainly!\", \"I'd be happy to help\", or \"Here is how you can\".\n2. Action over advice. If the task can be done with your tools, do it and then report the result. For pure informational queries, explanations, or conversational greetings, provide the answer directly.\n3. On a tool error, follow the Pivot line in the tool result. Change approach. Do not paste a long stack trace into the chat. One sentence: what failed, what you did instead, and the verified result.\n4. Never repeat an identical failed call. The third identical failure is blocked. Never claim success while the definition of done is still open or the last action failed.\n5. Your mini computer is a real desktop: Files (your workspace + memory library), Chrome (tabbed, isolated profile), and Terminal (a live shell rooted at your workspace — terminal_write reaches that same session by default). computer_shell switches apps and tabs: open_app \"terminal\" to run shell work visibly, \"files\" to check your workspace, back to \"chrome\" when done. Browser tools act on the active Chrome tab; controls come back numbered, like [12] button Add to cart, and hidden or off-screen junk is already filtered out. click_control and type_text take an id; click_control also takes match: \"button text\" to pick and click the best visible match itself (it reports what it clicked). find_control ranks matches best-first. scroll_page reaches below the fold. After a click that opens or loads something, call wait_for once (query: \"next page text\", or media: \"playing\" for video) instead of re-reading in a loop. Do not guess pixel coordinates.\n6. Logins and forms: when a task needs a sign-in, fill the fields with credentials the user already gave in this chat. If none were provided, ask the user for them in one short message and stop that turn; never guess or invent passwords. After signing in, verify with read_page (the page shows the account or dashboard) before continuing.\n7. When the user wants a workflow, call save_workflow. When they want this chat to repeat on a timer, call schedule_routine. A workflow is saved idle until a person presses Run. A schedule runs only while Ronic OS is open.\n8. When a finished task took several steps, close with one short offer to save it as a workflow or schedule this chat.\n9. Expert craft (highest priority): answer like a senior specialist in the user's domain. Think and plan before building: state a short plan (2-4 bullets) for any multi-step build, then execute it step by step. Ask at most one targeted clarifying question when the request is genuinely ambiguous; otherwise act on the most reasonable interpretation and say which one. Stay strictly on the user's actual request — no tangents, no generic filler, no restating the question back. If you do not know a fact, say so in one line instead of guessing. Match the user's vocabulary: mirror the concrete nouns and tool names they used. For funnels, workflows, and builds, name real platforms, real fields, and real next actions — never vague placeholders like \"integrate with your CRM\"; say which CRM fields map where. When you produce a plan, it must be concrete enough that the user could hand it to a contractor unchanged.\n10. Structured output: Format technical plans, code, and structured answers cleanly using Markdown headers, lists, and tables where applicable. For casual conversation or simple answers, respond naturally without forcing artificial tables or headers.\n11. Autonomous execution: In Auto Approve mode for actionable tasks, research, plan, and build decisively without asking unnecessary questions. For conversational messages or simple questions, respond directly to the user.";
+pub const PROTOCOL: &str = "Co-worker protocol (binding):\n1. Outcome first. For actionable tasks requiring tools, Sentence 1 states what you actually did and what a tool verified. For conversational greetings, simple questions, or conceptual explanations, reply directly and conversationally without running unneeded tools. Never open with \"Certainly!\", \"I'd be happy to help\", or \"Here is how you can\".\n2. Action over advice. If the task can be done with your tools, do it and then report the result. For pure informational queries, explanations, or conversational greetings, provide the answer directly.\n3. On a tool error, follow the Pivot line in the tool result. Change approach. Do not paste a long stack trace into the chat. One sentence: what failed, what you did instead, and the verified result.\n4. Never repeat an identical failed call. The third identical failure is blocked. Never claim success while the definition of done is still open or the last action failed.\n5. Your mini computer is a real desktop: Files (your workspace + memory library), Chrome (tabbed, isolated profile), and Terminal (a live shell rooted at your workspace — terminal_write reaches that same session by default). computer_shell switches apps and tabs: open_app \"terminal\" to run shell work visibly, \"files\" to check your workspace, back to \"chrome\" when done. Browser tools act on the active Chrome tab; controls come back numbered, like [12] button Add to cart, and hidden or off-screen junk is already filtered out. click_control and type_text take an id; click_control also takes match: \"button text\" to pick and click the best visible match itself (it reports what it clicked). find_control ranks matches best-first. scroll_page reaches below the fold. After a click that opens or loads something, call wait_for once (query: \"next page text\", or media: \"playing\" for video) instead of re-reading in a loop. Do not guess pixel coordinates.\n6. Logins and forms: when a task needs a sign-in, fill the fields with credentials the user already gave in this chat. If none were provided, ask the user for them in one short message and stop that turn; never guess or invent passwords. After signing in, verify with read_page (the page shows the account or dashboard) before continuing.\n7. When the user wants a workflow, call save_workflow. When they want this chat to repeat on a timer, call schedule_routine. Pass the full job text. When the user improves that job or adds a requirement, call schedule_routine again with the same schedule and the complete new instruction. A job that only adds a requirement (also, and, add, plus, include) keeps the stored text and adds that line once. Omit job to leave the stored job unchanged. A schedule runs that stored job only while Ronic OS is open. A saved workflow with a trigger runs on that same timer while the app is open. Run still starts it by hand.\n8. When a finished task took several steps, close with one short offer to save it as a workflow or schedule this chat.\n9. Expert craft (highest priority): answer like a senior specialist in the user's domain. Think and plan before building: state a short plan (2-4 bullets) for any multi-step build, then execute it step by step. Ask at most one targeted clarifying question when the request is genuinely ambiguous; otherwise act on the most reasonable interpretation and say which one. Stay strictly on the user's actual request — no tangents, no generic filler, no restating the question back. If you do not know a fact, say so in one line instead of guessing. Match the user's vocabulary: mirror the concrete nouns and tool names they used. For funnels, workflows, and builds, name real platforms, real fields, and real next actions — never vague placeholders like \"integrate with your CRM\"; say which CRM fields map where. When you produce a plan, it must be concrete enough that the user could hand it to a contractor unchanged.\n10. Structured output: Format technical plans, code, and structured answers cleanly using Markdown headers, lists, and tables where applicable. For casual conversation or simple answers, respond naturally without forcing artificial tables or headers.\n11. Autonomous execution: In Auto Approve mode for actionable tasks, research, plan, and build decisively without asking unnecessary questions. For conversational messages or simple questions, respond directly to the user.";
 
 /// Stable signature of one tool invocation: same tool + same normalized
 /// arguments = same signature, regardless of JSON key order.
@@ -46,6 +46,12 @@ fn canonicalize(value: &Value) -> String {
 /// not count, so a successful grep or log read is never mistaken for one.
 /// A successful browser read, diff, workflow save, or schedule is never a failure.
 pub fn tool_failed(action: &str, payload: &Value, output: &str) -> bool {
+    let lower_head = output.trim_start().to_ascii_lowercase();
+    // A page that loaded but cannot take the prompt is still a failed step.
+    // browser_inspect used to swallow that, so the turn looked idle.
+    if lower_head.starts_with("stuck:") {
+        return true;
+    }
     if matches!(action, "workflow" | "routine" | "code_diff" | "browser_inspect") {
         return false;
     }
@@ -202,6 +208,7 @@ fn human_block(lower: &str) -> bool {
         "pending_approval",
         "held for your approval",
         "killswitch",
+        "finish signing in",
     ];
     MARKS.iter().any(|mark| lower.contains(mark))
 }
@@ -215,24 +222,45 @@ pub enum Proof {
     PageWorked,
     WorkflowSaved,
     RoutineScheduled,
+    McpCalled,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct Contract {
     pub checks: Vec<Proof>,
+    pub tools: Vec<String>,
 }
 
 impl Contract {
     pub fn requirement_line(&self) -> Option<String> {
-        if self.checks.is_empty() {
+        if self.checks.is_empty() && self.tools.is_empty() {
             return None;
         }
-        let lines = self.checks.iter().map(|check| format!("- {}", proof_label(*check))).collect::<Vec<_>>().join("\n");
-        Some(lines)
+        let mut lines = self.checks.iter().map(|check| format!("- {}", proof_label(*check))).collect::<Vec<_>>();
+        for tool in &self.tools {
+            lines.push(format!("- call {tool}"));
+        }
+        Some(lines.join("\n"))
     }
 
     pub fn unmet(&self, have: &[Proof]) -> Option<String> {
-        let missing: Vec<&str> = self.checks.iter().filter(|check| !have.contains(check)).map(|check| proof_label(*check)).collect();
+        self.unmet_with(have, &[])
+    }
+
+    /// Known tools count when their proof is already in `have`. Any other required tool stays open until that name ran.
+    pub fn unmet_with(&self, have: &[Proof], ran: &[String]) -> Option<String> {
+        let mut missing: Vec<String> = self.checks.iter().filter(|check| !have.contains(check)).map(|check| proof_label(*check).to_string()).collect();
+        for tool in &self.tools {
+            let ran_it = ran.iter().any(|name| name == tool);
+            if let Some(proof) = proof_for_tool(tool) {
+                if have.contains(&proof) || ran_it {
+                    continue;
+                }
+            } else if ran_it {
+                continue;
+            }
+            missing.push(format!("call {tool}"));
+        }
         if missing.is_empty() {
             None
         } else {
@@ -248,6 +276,7 @@ pub fn proof_label(proof: Proof) -> &'static str {
         Proof::PageWorked => "a browser read, click, or type that succeeded",
         Proof::WorkflowSaved => "a workflow saved on the Workflows screen",
         Proof::RoutineScheduled => "a schedule on this chat",
+        Proof::McpCalled => "a call to the MCP server named for this turn",
     }
 }
 
@@ -292,7 +321,7 @@ pub fn compile_contract(prompt: &str) -> Contract {
         checks.push(Proof::PageWorked);
     }
     checks.truncate(4);
-    Contract { checks }
+    Contract { checks, tools: Vec::new() }
 }
 
 pub fn question_only(lower: &str) -> bool {
@@ -416,8 +445,13 @@ pub fn proof_of(tool: &str, payload: &Value, failed: bool) -> Option<Proof> {
         "inspect_page" | "read_page" | "click_control" | "type_text" | "scroll_page" | "find_control" | "wait_for" => Some(Proof::PageWorked),
         "save_workflow" => Some(Proof::WorkflowSaved),
         "schedule_routine" => Some(Proof::RoutineScheduled),
+        "call_mcp" => Some(Proof::McpCalled),
         _ => None,
     }
+}
+
+fn proof_for_tool(tool: &str) -> Option<Proof> {
+    proof_of(tool, &serde_json::json!({"exitCode": 0}), false)
 }
 
 /// Turn a person's words into a schedule the job clock already understands.
@@ -444,6 +478,192 @@ pub fn normalize_schedule(raw: &str) -> Option<String> {
         return Some(captured);
     }
     None
+}
+
+/// Same due rule as the chat job clock. `armed_at` is when the schedule was saved.
+/// shortcut: the next daily slot is 24h later, upgrade when a DST boundary must land on the clock time.
+pub fn due(schedule: &str, armed_at: i64, fired_at: i64, now: i64) -> bool {
+    let Some(parsed) = parse_clock(schedule) else {
+        return false;
+    };
+    next_slot(&parsed, armed_at, fired_at, now) <= now
+}
+
+enum Clock {
+    Every { ms: i64 },
+    Daily { minutes: i64 },
+}
+
+fn parse_clock(raw: &str) -> Option<Clock> {
+    let text = raw.trim().to_ascii_lowercase();
+    if let Some(rest) = text.strip_prefix("every ") {
+        let rest = rest.trim();
+        let count_end = rest.find(|ch: char| !ch.is_ascii_digit()).unwrap_or(rest.len());
+        if count_end == 0 {
+            return None;
+        }
+        let count: i64 = rest[..count_end].parse().ok()?;
+        if count < 1 || count > 24 * 14 {
+            return None;
+        }
+        let unit = rest[count_end..].trim();
+        let ms = if unit.starts_with('h') {
+            count * 3_600_000
+        } else if unit.starts_with('m') {
+            count * 60_000
+        } else {
+            return None;
+        };
+        return Some(Clock::Every { ms });
+    }
+    if let Some(rest) = text.strip_prefix("daily ") {
+        let (hour_raw, minute_raw) = rest.trim().split_once(':')?;
+        if minute_raw.len() != 2 {
+            return None;
+        }
+        let hour: i64 = hour_raw.parse().ok()?;
+        let minute: i64 = minute_raw.parse().ok()?;
+        if hour > 23 || minute > 59 {
+            return None;
+        }
+        return Some(Clock::Daily { minutes: hour * 60 + minute });
+    }
+    if let Some(normalized) = regex_legacy_daily(&text) {
+        return parse_clock(&normalized);
+    }
+    None
+}
+
+fn next_slot(schedule: &Clock, armed_at: i64, fired_at: i64, now: i64) -> i64 {
+    match schedule {
+        Clock::Every { ms } => armed_at.max(fired_at) + ms,
+        Clock::Daily { minutes } => {
+            let midnight = local_midnight(now);
+            let today = midnight + minutes * 60_000;
+            if fired_at >= today {
+                today + 86_400_000
+            } else if now >= today && armed_at < today {
+                today
+            } else if now >= today {
+                today + 86_400_000
+            } else {
+                today
+            }
+        }
+    }
+}
+
+fn local_midnight(now_ms: i64) -> i64 {
+    midnight_with(now_ms, local_offset_ms())
+}
+
+fn midnight_with(now_ms: i64, offset: i64) -> i64 {
+    let local = now_ms + offset;
+    let day = 86_400_000i64;
+    let start_local = local - local.rem_euclid(day);
+    start_local - offset
+}
+
+fn local_offset_ms() -> i64 {
+    #[cfg(windows)]
+    {
+        windows_local_offset_ms()
+    }
+    #[cfg(not(windows))]
+    {
+        unix_local_offset_ms()
+    }
+}
+
+#[cfg(not(windows))]
+fn unix_local_offset_ms() -> i64 {
+    #[repr(C)]
+    struct Tm {
+        tm_sec: i32,
+        tm_min: i32,
+        tm_hour: i32,
+        tm_mday: i32,
+        tm_mon: i32,
+        tm_year: i32,
+        tm_wday: i32,
+        tm_yday: i32,
+        tm_isdst: i32,
+    }
+    extern "C" {
+        fn time(tloc: *mut i64) -> i64;
+        fn localtime_r(clock: *const i64, result: *mut Tm) -> *mut Tm;
+        fn gmtime_r(clock: *const i64, result: *mut Tm) -> *mut Tm;
+    }
+    unsafe {
+        let mut now = 0i64;
+        if time(&mut now) < 0 {
+            return 0;
+        }
+        // The C struct continues past tm_isdst. The extra bytes keep that write on the stack.
+        let mut local_buf = [0u8; 128];
+        let mut utc_buf = [0u8; 128];
+        let local_ptr = local_buf.as_mut_ptr() as *mut Tm;
+        let utc_ptr = utc_buf.as_mut_ptr() as *mut Tm;
+        if localtime_r(&now, local_ptr).is_null() || gmtime_r(&now, utc_ptr).is_null() {
+            return 0;
+        }
+        let local = &*local_ptr;
+        let utc = &*utc_ptr;
+        let local_secs = local.tm_hour as i64 * 3600 + local.tm_min as i64 * 60 + local.tm_sec as i64;
+        let utc_secs = utc.tm_hour as i64 * 3600 + utc.tm_min as i64 * 60 + utc.tm_sec as i64;
+        let mut diff = local_secs - utc_secs;
+        let local_ahead = local.tm_year > utc.tm_year || (local.tm_year == utc.tm_year && local.tm_yday > utc.tm_yday);
+        let utc_ahead = utc.tm_year > local.tm_year || (utc.tm_year == local.tm_year && utc.tm_yday > local.tm_yday);
+        if local_ahead {
+            diff += 86_400;
+        } else if utc_ahead {
+            diff -= 86_400;
+        }
+        diff * 1000
+    }
+}
+
+#[cfg(windows)]
+fn windows_local_offset_ms() -> i64 {
+    #[repr(C)]
+    struct SystemTime {
+        year: u16,
+        month: u16,
+        day_of_week: u16,
+        day: u16,
+        hour: u16,
+        minute: u16,
+        second: u16,
+        milliseconds: u16,
+    }
+    #[repr(C)]
+    struct TimeZoneInformation {
+        bias: i32,
+        standard_name: [u16; 32],
+        standard_date: SystemTime,
+        standard_bias: i32,
+        daylight_name: [u16; 32],
+        daylight_date: SystemTime,
+        daylight_bias: i32,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetTimeZoneInformation(info: *mut TimeZoneInformation) -> u32;
+    }
+    unsafe {
+        let mut info = std::mem::zeroed::<TimeZoneInformation>();
+        let kind = GetTimeZoneInformation(&mut info);
+        if kind == u32::MAX {
+            return 0;
+        }
+        let mut bias = info.bias;
+        if kind == 2 {
+            bias += info.daylight_bias;
+        } else if kind == 1 {
+            bias += info.standard_bias;
+        }
+        -(bias as i64) * 60_000
+    }
 }
 
 fn cron_daily(text: &str) -> Option<String> {
@@ -571,7 +791,7 @@ pub fn plan_workflow(name: &str, steps_text: &str, schedule: &str) -> Result<Pla
         })?;
         (
             vec![normalized.clone()],
-            format!("Trigger noted as \"{normalized}\". The workflow stays idle until Run. To repeat this chat on that timer, also call schedule_routine."),
+            format!("Trigger noted as \"{normalized}\". It runs while Ronic OS is open. Run still starts it by hand."),
         )
     };
     Ok(PlannedWorkflow { name, nodes, triggers, note })
@@ -737,8 +957,18 @@ mod tests {
         assert!(!tool_failed("pty_terminal", &json!({"exitCode": 0}), "warning: unused import\nexit 0"));
         assert!(tool_failed("message", &json!({}), "'python' is not on the allowed terminal tools list"));
         assert!(tool_failed("message", &json!({}), "Error: provider unreachable"));
+        assert!(tool_failed("browser_inspect", &json!({}), "Stuck: Google sign-in is on screen. Finish signing in in this bot's browser."));
+        assert!(!tool_failed("browser_inspect", &json!({}), "https://labs.google/fx/tools/flow\n[1] input prompt"));
         // Successful tool output that merely mentions the word error is NOT a failure.
         assert!(!tool_failed("read_file", &json!({}), "line 4: error handling added\nline 5: ok"));
+        let sign_in = pivot_for(
+            "type_text",
+            "Stuck: Google sign-in is on screen. Finish signing in in this bot's browser. This chat turn is still running. It is not a background job.",
+            1,
+            1,
+            Surfaces { computer: true, browser: true, files: true },
+        );
+        assert!(sign_in.stop);
     }
 
     #[test]
@@ -878,6 +1108,37 @@ mod tests {
         assert_eq!(normalize_schedule("daily 08:00").as_deref(), Some("daily 08:00"));
         assert!(normalize_schedule("0 8 * * 1").is_none());
         assert!(normalize_schedule("whenever").is_none());
+    }
+
+    #[test]
+    fn due_matches_the_job_clock() {
+        let minute = 60_000i64;
+        let armed = 1_700_000_000_000i64;
+        assert!(!due("every 15m", armed, 0, armed + minute));
+        assert!(due("every 15m", armed, 0, armed + 15 * minute));
+        assert!(!due("every 15m", armed, armed + 15 * minute, armed + 20 * minute));
+        assert!(!due("whenever", armed, 0, armed + 86_400_000));
+        let midnight = local_midnight(armed);
+        let slot = midnight + 8 * 3_600_000;
+        let now = slot + minute;
+        assert!(due("daily 08:00", midnight - 3_600_000, 0, now));
+        assert!(!due("daily 08:00", midnight - 3_600_000, now, now + minute));
+        assert!(!due("daily 08:00", now, 0, now + minute));
+        let east = 5 * 3_600_000;
+        let shifted = midnight_with(armed, east);
+        assert_ne!(shifted, midnight_with(armed, 0));
+        assert_eq!((shifted + east).rem_euclid(86_400_000), 0);
+    }
+
+    #[test]
+    fn a_required_tool_stays_open_until_that_name_ran() {
+        let mut contract = Contract::default();
+        contract.tools.push("scan_ledger".into());
+        assert!(contract.unmet_with(&[], &[]).unwrap().contains("scan_ledger"));
+        assert!(contract.unmet_with(&[], &["scan_ledger".into()]).is_none());
+        contract.tools = vec!["terminal_command".into()];
+        assert!(contract.unmet_with(&[Proof::CommandOk], &[]).is_none());
+        assert!(contract.unmet(&[]).unwrap().contains("terminal_command"));
     }
 
     #[test]

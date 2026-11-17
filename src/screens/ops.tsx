@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from "react";
+import React, { useState, useEffect, useMemo, useRef } from "react";
 import {
   AlertTriangle,
   ArrowLeft,
@@ -40,16 +40,20 @@ import { useRonic } from "../store";
 import { pickPaths, saveExportedFile } from "../api";
 import type { MemoryItem } from "../types";
 import {
+  cloudAuthNotice,
   cloudConfig,
   cloudSession,
   deleteUserAccount,
   getLocalProfile,
   getStoredVpsNode,
+  loadAccountProfile,
+  passwordRecoveryPending,
   resetPassword,
   saveDisplayName,
   saveLocalProfile,
   saveStoredVpsNode,
   signIn,
+  signInWithBrowser,
   signOut,
   signUp,
   subscribeCloud,
@@ -125,6 +129,7 @@ function generateBackupJson(memories: MemoryItem[], user: RonicUserProfile) {
         scopedBotId: m.scopedBotId,
         filePathOrUri: m.filePathOrUri,
         wikilinks: m.wikilinks || [],
+        relations: m.relations || [],
         updatedAt: m.updatedAt,
         engineOrigin: m.engineOrigin,
         syncedEngines: m.syncedEngines || [],
@@ -152,6 +157,7 @@ function generateBackupMarkdown(memories: MemoryItem[], user: RonicUserProfile) 
 - **Origin Engine**: \`${m.engineOrigin || "mem0_builtin"}\`
 - **Updated At**: ${new Date(m.updatedAt || Date.now()).toLocaleString()}
 - **Related Wikilinks**: ${wikilinksFormatted || "None"}
+- **Graph links**: ${(m.relations || []).map((edge) => `${edge.relation} ${edge.target}`).join(", ") || "None"}
 - **Scope / Source**: ${m.sourceType || "system"}${m.filePathOrUri ? ` (${m.filePathOrUri})` : ""}
 
 ${m.contentMarkdown}
@@ -172,6 +178,17 @@ type TunnelInfo = {
   note: string;
 };
 
+function licensePlanName(
+  license: { planTier: string; founderBadge: number | null } | null | undefined,
+  fallback: string,
+): string {
+  if (!license) return fallback;
+  if (license.planTier === "founder_lifetime") return license.founderBadge ? `Founder #${license.founderBadge}` : "Founder Pass";
+  if (license.planTier === "pro") return "Ronic Pro";
+  if (license.planTier === "team") return "Team";
+  return "Starter";
+}
+
 async function invokeTauri<T>(cmd: string, args?: Record<string, unknown>): Promise<T | null> {
   if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) return null;
   try {
@@ -189,6 +206,9 @@ export function ProfileScreen() {
 
   const [activeTab, setActiveTab] = useState<ProfileTab>("account");
   const [session, setSession] = useState(cloudSession());
+  const [recovery, setRecovery] = useState(passwordRecoveryPending());
+  const [authNotice, setAuthNotice] = useState(cloudAuthNotice());
+  const signingOut = useRef(false);
   const [profile, setProfile] = useState<RonicUserProfile>(getLocalProfile);
 
   // Auth form states
@@ -528,11 +548,44 @@ export function ProfileScreen() {
     const unsub = subscribeCloud(() => {
       setSession(cloudSession());
       setProfile(getLocalProfile());
+      setRecovery(passwordRecoveryPending());
+      setAuthNotice(cloudAuthNotice());
     });
     return () => {
       unsub();
     };
   }, []);
+
+  useEffect(() => {
+    if (signingOut.current) return;
+    const user = session?.user;
+    const email = user?.email?.trim();
+    if (!user || !email) return;
+    let alive = true;
+    void loadAccountProfile().then((cloud) => {
+      if (!alive || signingOut.current) return;
+      const current = getLocalProfile();
+      const metaName = String(user.user_metadata?.full_name ?? user.user_metadata?.display_name ?? "").trim();
+      const cloudName = cloud?.displayName?.trim() || metaName;
+      const sameAccount = current.email === email;
+      const keepLocalName = sameAccount && current.displayName.trim() !== "" && current.displayName !== "Workspace Operator";
+      const updated = saveLocalProfile({
+        id: user.id,
+        email,
+        displayName: keepLocalName ? current.displayName : cloudName || email.split("@")[0] || "Operator",
+        createdAt: sameAccount ? current.createdAt : Date.parse(user.created_at) || Date.now(),
+        lastLoginAt: Date.now(),
+        cloudProvider: "supabase",
+        cloudSyncEnabled: true,
+      });
+      setProfile(updated);
+      setEditingName(updated.displayName);
+      setEditingRole(updated.role);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [session?.user?.id, session?.user?.email]);
 
   useEffect(() => {
     void pollTunnel();
@@ -555,6 +608,21 @@ export function ProfileScreen() {
   }
 
   // --- Auth Handlers ---
+  async function handleBrowserAuth(provider: "github" | "google") {
+    setAuthBusy(true);
+    setAuthError("");
+    setAuthSuccess("");
+    try {
+      const message = await signInWithBrowser(provider);
+      if (message) setAuthError(message);
+      else setAuthSuccess("Signed in.");
+    } catch (err) {
+      setAuthError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setAuthBusy(false);
+    }
+  }
+
   async function handleAuthSubmit(e: React.FormEvent) {
     e.preventDefault();
     setAuthError("");
@@ -569,42 +637,47 @@ export function ProfileScreen() {
       if (isRegisterMode) {
         const name = authDisplayName.trim() || authEmail.split("@")[0] || "Operator";
         if (cloudConfig.supabase) {
-          const err = await signUp(authEmail, authPassword, name);
-          if (err) {
-            setAuthError(err);
-            setAuthBusy(false);
+          const result = await signUp(authEmail, authPassword, name);
+          if (result.status === "error") {
+            setAuthError(result.message);
             return;
           }
+          if (result.status === "confirm_email") {
+            setAuthSuccess("Account created. Open the confirmation link in that email. It comes back into Ronic OS.");
+            setAuthPassword("");
+            return;
+          }
+        } else {
+          const updated = saveLocalProfile({
+            email: authEmail.trim(),
+            displayName: name,
+            lastLoginAt: Date.now(),
+            cloudProvider: "local_only",
+          });
+          setProfile(updated);
         }
-        const updated = saveLocalProfile({
-          email: authEmail.trim(),
-          displayName: name,
-          tier: "Pro Studio",
-          lastLoginAt: Date.now(),
-          cloudProvider: cloudConfig.supabase ? "supabase" : "local_only",
-        });
-        setProfile(updated);
-        setAuthSuccess("Account created successfully!");
+        setAuthSuccess(cloudConfig.supabase ? "Account created. You are signed in." : "Account saved on this machine.");
         setAuthEmail("");
         setAuthPassword("");
         setAuthDisplayName("");
-      } else {
-        if (cloudConfig.supabase) {
-          const err = await signIn(authEmail, authPassword);
-          if (err) {
-            setAuthError(err);
-            setAuthBusy(false);
-            return;
-          }
+      } else if (cloudConfig.supabase) {
+        const err = await signIn(authEmail, authPassword);
+        if (err) {
+          setAuthError(err);
+          return;
         }
+        setAuthSuccess("Signed in.");
+        setAuthEmail("");
+        setAuthPassword("");
+      } else {
         const updated = saveLocalProfile({
           email: authEmail.trim(),
-          displayName: profile.displayName || authEmail.split("@")[0] || "Operator",
+          displayName: profile.displayName === "Workspace Operator" ? authEmail.split("@")[0] || "Operator" : profile.displayName,
           lastLoginAt: Date.now(),
-          cloudProvider: cloudConfig.supabase ? "supabase" : "local_only",
+          cloudProvider: "local_only",
         });
         setProfile(updated);
-        setAuthSuccess("Signed in successfully!");
+        setAuthSuccess("Signed in on this machine.");
         setAuthEmail("");
         setAuthPassword("");
       }
@@ -616,19 +689,34 @@ export function ProfileScreen() {
   }
 
   async function handleSignOut() {
-    await signOut();
-    saveLocalProfile({
-      email: "",
-      cloudProvider: "local_only",
-    });
-    setToast("Signed out from Ronic OS account.");
+    signingOut.current = true;
+    try {
+      await signOut();
+      const cleared = saveLocalProfile({
+        email: "",
+        displayName: "Workspace Operator",
+        cloudProvider: "local_only",
+      });
+      setProfile(cleared);
+      setEditingName(cleared.displayName);
+      setEditingRole(cleared.role);
+      setSession(cloudSession());
+      setToast("Signed out from Ronic OS account.");
+    } finally {
+      signingOut.current = false;
+    }
   }
 
   async function handleSaveProfileInfo() {
     if (!editingName.trim()) return;
     setEditBusy(true);
     if (cloudConfig.supabase && session) {
-      await saveDisplayName(editingName.trim());
+      const err = await saveDisplayName(editingName.trim());
+      if (err) {
+        setEditBusy(false);
+        setToast(err);
+        return;
+      }
     }
     const updated = saveLocalProfile({
       displayName: editingName.trim(),
@@ -652,7 +740,7 @@ export function ProfileScreen() {
       return;
     }
     setPwdBusy(true);
-    const err = await updatePassword(newPassword);
+    const err = await updatePassword(newPassword, currentPassword);
     setPwdBusy(false);
     if (err) {
       setPwdMessage({ kind: "err", text: err });
@@ -776,15 +864,23 @@ export function ProfileScreen() {
       return;
     }
     setDeleteBusy(true);
-    await deleteUserAccount();
+    const err = await deleteUserAccount();
     setDeleteBusy(false);
+    if (err) {
+      setToast(err);
+      return;
+    }
     setShowDeleteModal(false);
     setDeleteConfirmText("");
     setProfile(getLocalProfile());
-    setToast("Account permanently deleted. All local credentials cleared.");
+    setSession(cloudSession());
+    setToast("Account deleted. Local credentials for it were cleared.");
   }
 
-  const isAuthenticated = Boolean(profile.email || session?.user);
+  const isAuthenticated = cloudConfig.supabase ? Boolean(session?.user) : Boolean(profile.email);
+  const accountEmail = session?.user.email || profile.email;
+  const license = snap?.license;
+  const planName = licensePlanName(license, profile.tier);
   const initials = (profile.displayName || profile.email || "OP")
     .split(" ")
     .map((w) => w[0])
@@ -793,9 +889,9 @@ export function ProfileScreen() {
     .slice(0, 2);
 
   return (
-    <div className="flex-1 h-full bg-[#eceef2] p-3 sm:p-5 lg:p-6 overflow-y-auto select-none flex flex-col">
+    <div className="flex-1 h-full min-h-0 bg-[#eceef2] p-3 sm:p-5 lg:p-6 overflow-y-auto select-none flex flex-col">
       {/* ─── MAIN MODAL CONTAINER (MARKETPLACE DESIGN SYSTEM) ─── */}
-      <div className="w-full max-w-[1560px] flex-1 min-h-[660px] bg-white rounded-3xl shadow-[0_12px_40px_-8px_rgba(0,0,0,0.06),0_2px_8px_-1px_rgba(0,0,0,0.03)] border border-slate-200/70 flex flex-col mx-auto overflow-hidden transition-all duration-300">
+      <div className="w-full max-w-[1560px] flex-1 min-h-0 bg-white rounded-3xl shadow-[0_12px_40px_-8px_rgba(0,0,0,0.06),0_2px_8px_-1px_rgba(0,0,0,0.03)] border border-slate-200/70 flex flex-col mx-auto overflow-hidden transition-all duration-300">
         
         {/* ─── TOP HEADER ─── */}
         <div className="p-5 sm:p-7 pb-3.5 space-y-4 border-b border-slate-100">
@@ -819,11 +915,11 @@ export function ProfileScreen() {
                   <h1 className="text-sm font-bold text-slate-900 flex items-center gap-2 leading-tight">
                     <span>{profile.displayName || "Ronic Operator"}</span>
                     <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200">
-                      {profile.tier}
+                      {planName}
                     </span>
                   </h1>
                   <p className="text-[11px] text-slate-500 leading-tight">
-                    {isAuthenticated ? profile.email : "Local-first sovereign workspace profile"}
+                    {isAuthenticated ? accountEmail : "Local-first sovereign workspace profile"}
                   </p>
                 </div>
               </div>
@@ -922,9 +1018,15 @@ export function ProfileScreen() {
                     </p>
                   </div>
 
-                  {authError && (
+                  {cloudConfig.supabase ? (
+                    <div className="grid grid-cols-2 gap-2">
+                      <button type="button" disabled={authBusy} onClick={() => void handleBrowserAuth("github")} className="py-2 px-3 bg-slate-100 hover:bg-slate-200 text-slate-800 border border-slate-200 rounded-xl text-xs font-bold cursor-pointer disabled:opacity-50">GitHub</button>
+                      <button type="button" disabled={authBusy} onClick={() => void handleBrowserAuth("google")} className="py-2 px-3 bg-slate-100 hover:bg-slate-200 text-slate-800 border border-slate-200 rounded-xl text-xs font-bold cursor-pointer disabled:opacity-50">Google</button>
+                    </div>
+                  ) : null}
+                  {(authError || (!authSuccess && authNotice)) && (
                     <div className="p-3 text-xs bg-rose-50 border border-rose-200 rounded-xl text-rose-700">
-                      {authError}
+                      {authError || authNotice}
                     </div>
                   )}
                   {authSuccess && (
@@ -1028,16 +1130,29 @@ export function ProfileScreen() {
                         <div className="flex items-center justify-center sm:justify-start gap-2">
                           <h2 className="text-xl font-bold">{profile.displayName}</h2>
                           <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-400/30">
-                            {profile.tier}
+                            {planName}
                           </span>
                         </div>
                         <p className="text-xs text-slate-300 flex items-center justify-center sm:justify-start gap-1.5">
                           <Mail size={13} className="text-slate-400" />
-                          <span>{profile.email}</span>
+                          <span>{accountEmail}</span>
                         </p>
                         <p className="text-[11px] text-slate-400">
-                          Workspace ID: <span className="font-mono text-slate-300">{profile.id}</span>
+                          Workspace ID: <span className="font-mono text-slate-300">{session?.user.id || profile.id}</span>
                         </p>
+                        {license ? (
+                          <p className="text-[11px] text-slate-400">
+                            {license.status === "active"
+                              ? `License active · ${license.maxDevices} machine${license.maxDevices === 1 ? "" : "s"}`
+                              : license.status === "local"
+                                ? "Registered on this machine"
+                                : license.status === "unsigned_dev"
+                                  ? "Dev build — the plan is not enforced"
+                                  : license.status === "expired"
+                                    ? "License expired — open Plan & setup and sign in to refresh"
+                                    : license.status}
+                          </p>
+                        ) : null}
                       </div>
                     </div>
 
@@ -1045,6 +1160,13 @@ export function ProfileScreen() {
                       <div className="text-[11px] text-slate-400">
                         Member since: {new Date(profile.createdAt).toLocaleDateString()}
                       </div>
+                      <button
+                        type="button"
+                        onClick={() => go("billing")}
+                        className="px-3.5 py-1.5 rounded-xl bg-white text-slate-900 text-xs font-semibold cursor-pointer"
+                      >
+                        Change plan
+                      </button>
                       <button
                         type="button"
                         onClick={handleSignOut}
@@ -1613,6 +1735,11 @@ export function ProfileScreen() {
                     </div>
                   )}
 
+                  {recovery ? (
+                    <p className="p-3 text-xs bg-amber-50 border border-amber-200 rounded-xl text-amber-900">
+                      The reset link worked. Set a new password below. The current password is not required.
+                    </p>
+                  ) : null}
                   <form onSubmit={handleChangePassword} className="space-y-3">
                     <div>
                       <label className="block text-xs font-semibold text-slate-700 mb-1">Current Password</label>
@@ -1693,14 +1820,14 @@ export function ProfileScreen() {
                       <label className="block text-xs font-semibold text-slate-700 mb-1">Registered Email Address</label>
                       <input
                         type="email"
-                        value={recoveryEmail || profile.email}
+                        value={recoveryEmail}
                         onChange={(e) => setRecoveryEmail(e.target.value)}
-                        placeholder="you@domain.com"
+                        placeholder={accountEmail || "you@domain.com"}
                         className="w-full px-3.5 py-2 text-xs bg-slate-50/70 border border-slate-200 rounded-xl outline-none focus:bg-white focus:border-slate-400"
                       />
                     </div>
                     <p className="text-[11px] text-slate-500">
-                      A cryptographically verified one-time recovery token will be sent to confirm your identity.
+                      Supabase emails a reset link. Open it on this computer and it comes back into Ronic OS.
                     </p>
                     <button
                       type="submit"

@@ -64,34 +64,30 @@ export function ShellBody({
 
   const reportLayout = useCallback(() => {
     // The embedded chat panel is rendered in the main webview. Its Chrome
-    // page, when present, belongs to the bot's standalone mini-computer
-    // window, so main-window coordinates must never be sent to the native
-    // child webview. The standalone shell still reports its own geometry,
-    // but only when the Chrome app is actually active.
-    if (compact || shell?.app !== "chrome") return;
+    // page belongs to the bot's standalone window, so those coordinates must
+    // never be sent to the native child webview.
+    if (compact) return;
     const el = pageAreaRef.current;
     if (!el) return;
     const rect = el.getBoundingClientRect();
     if (rect.width > 1 && rect.height > 1) {
       void ipc.layout(rect.left, rect.top, rect.width, rect.height).catch(() => {});
     }
-  }, [compact, shell?.app]);
+  }, [compact]);
 
   useEffect(() => {
-    if (compact || shell?.app !== "chrome") return;
-    const frame = requestAnimationFrame(reportLayout);
-    return () => cancelAnimationFrame(frame);
-  }, [boot.botId, compact, shell?.app, reportLayout]);
-
-  useEffect(() => {
-    if (shell?.app !== "chrome") return;
+    if (compact) return;
+    const el = pageAreaRef.current;
     const frame = requestAnimationFrame(reportLayout);
     window.addEventListener("resize", reportLayout);
+    const observer = el && typeof ResizeObserver !== "undefined" ? new ResizeObserver(() => reportLayout()) : null;
+    if (el && observer) observer.observe(el);
     return () => {
       cancelAnimationFrame(frame);
       window.removeEventListener("resize", reportLayout);
+      observer?.disconnect();
     };
-  }, [shell?.app, shell?.tabs.length, reportLayout]);
+  }, [boot.botId, compact, shell?.app, shell?.tabs.length, reportLayout]);
 
   useEffect(() => {
     if (compact) return; // embedded in chat: no global keyboard takeover

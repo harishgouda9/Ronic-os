@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-gateway-remember-owner"
+description = "Enables the gateway_remember_owner command without any pre-configured scope."
+commands.allow = ["gateway_remember_owner"]
+
+[[permission]]
+identifier = "deny-gateway-remember-owner"
+description = "Denies the gateway_remember_owner command without any pre-configured scope."
+commands.deny = ["gateway_remember_owner"]

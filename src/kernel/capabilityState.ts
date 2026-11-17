@@ -1,6 +1,7 @@
 import type { McpServer, PluginPackage, Skill, SkillProposal, Snapshot } from "../types";
 import { rememberSecret } from "./liveChat";
 import { INCLUDED } from "./includedCatalog";
+import { keepDesktop } from "./pluginScreen";
 import { hiddenReason, indexLine, knownToolNames, parseFront, rebuildRegistry, sanitizeSlug } from "./skillIndex";
 
 type Draft = {
@@ -173,7 +174,8 @@ export function savePlugin(state: Snapshot, draft: Partial<PluginPackage> & { sk
   plugin.tools = draft.tools ?? plugin.tools;
   plugin.hooks = (draft.hooks ?? plugin.hooks).filter((hook) => ["session_start", "before_model_call", "before_tool_call", "after_tool_call", "session_end"].includes(hook));
   plugin.bundledSkills = (draft.bundledSkills ?? draft.skills ?? plugin.bundledSkills).map((skill) => sanitizeSlug(skill)).filter(Boolean);
-  plugin.desktop = (draft.desktop ?? plugin.desktop).filter((bit) => bit.kind === "status" || bit.kind === "command" || bit.kind === "pane");
+  plugin.desktop = keepDesktop(draft.desktop ?? plugin.desktop);
+  if (plugin.desktop.length) plugin.hasDesktop = true;
   if (!existing) state.plugins.unshift(plugin);
   for (const name of plugin.bundledSkills) {
     const qualified = `${plugin.slug}:${name}`;

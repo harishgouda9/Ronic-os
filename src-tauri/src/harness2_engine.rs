@@ -157,43 +157,50 @@ pub struct FlagPatch {
     components: Option<Vec<String>>,
 }
 
-pub fn arm_chat(conn: &Connection, home: &Path, prompt: &str, attachments: &[String]) {
-    if let Err(error) = arm_inner(conn, home, prompt, attachments) {
-        let thread = db::kv_get(conn, "active_thread").ok().flatten().unwrap_or_default();
-        if !thread.is_empty() {
-            let _ = db::insert_step(conn, &thread, "tool", "harness2", &error, "message", &json!({}), 0);
+pub const LIVE_PLAN_PREFIX: &str = "Harness² local plan for this turn. Follow it as a checklist. It is a plan, not a finished edit.";
+
+/// Attaches a sandbox plan to the prompt the model is about to answer.
+/// An empty plan leaves the prompt unchanged.
+pub fn compose_with_plan(composed: String, proposal: Option<&str>) -> String {
+    match proposal.map(str::trim).filter(|text| !text.is_empty()) {
+        Some(text) => format!("{composed}\n\n---\n{LIVE_PLAN_PREFIX}\n{text}"),
+        None => composed,
+    }
+}
+
+pub fn arm_chat(conn: &Connection, home: &Path, thread_id: &str, turn_id: &str, bot_id: &str, prompt: &str, attachments: &[String]) -> Option<String> {
+    match arm_inner(conn, home, thread_id, turn_id, bot_id, prompt, attachments) {
+        Ok(proposal) => proposal,
+        Err(error) => {
+            if !thread_id.is_empty() {
+                let _ = db::insert_step(conn, thread_id, "tool", "harness2", &error, "message", &json!({}), 0);
+            }
+            None
         }
     }
 }
 
-pub fn note_mid_run(conn: &Connection, home: &Path, thread_id: &str, turn_id: &str) {
-    let _ = note_mid_run_inner(conn, home, thread_id, turn_id);
+pub fn note_mid_run(conn: &Connection, home: &Path, thread_id: &str, turn_id: &str, bot_id: &str) {
+    let _ = note_mid_run_inner(conn, home, thread_id, turn_id, bot_id);
 }
 
-fn arm_inner(conn: &Connection, home: &Path, prompt: &str, attachments: &[String]) -> Result<(), String> {
+fn arm_inner(conn: &Connection, home: &Path, thread_id: &str, turn_id: &str, bot_id: &str, prompt: &str, attachments: &[String]) -> Result<Option<String>, String> {
     let flags = load_flags(conn);
     let covered = skill_covered(conn, prompt);
     let squad = prompt.to_ascii_lowercase().contains("#squad") || prompt.to_ascii_lowercase().contains("squad");
     let mut score = score_prompt(prompt, attachments.len(), squad, covered);
     score.threshold = flags.threshold;
     let armed = flags.mode == "force" || (flags.mode == "auto" && score.value >= flags.threshold);
-    if !armed {
-        return Ok(());
-    }
-    let thread_id = db::kv_get(conn, "active_thread").map_err(|e| e.to_string())?.unwrap_or_default();
-    let turn_id = latest_turn(conn, &thread_id);
-    let bot_id = db::kv_get(conn, "active_profile").map_err(|e| e.to_string())?.unwrap_or_default();
-    if thread_id.is_empty() || bot_id.is_empty() {
-        return Ok(());
+    if !armed || thread_id.is_empty() || turn_id.is_empty() || bot_id.is_empty() {
+        return Ok(None);
     }
     let started = Instant::now();
     let trigger = if flags.mode == "force" { "manual_force_on" } else { "auto_pre_flight" };
-    let card = plan_run(conn, home, &bot_id, &thread_id, &turn_id, prompt, trigger, &flags, &score, started.elapsed().as_millis() as i64)?;
-    let _ = card;
-    Ok(())
+    let card = plan_run(conn, home, bot_id, thread_id, turn_id, prompt, trigger, &flags, &score, started.elapsed().as_millis() as i64)?;
+    Ok(Some(card.proposal))
 }
 
-fn note_mid_run_inner(conn: &Connection, home: &Path, thread_id: &str, turn_id: &str) -> Result<(), String> {
+fn note_mid_run_inner(conn: &Connection, home: &Path, thread_id: &str, turn_id: &str, bot_id: &str) -> Result<(), String> {
     let flags = load_flags(conn);
     if !flags.escalate || flags.mode == "off" {
         return Ok(());
@@ -227,7 +234,6 @@ fn note_mid_run_inner(conn: &Connection, home: &Path, thread_id: &str, turn_id: 
     if existing > 0 {
         return Ok(());
     }
-    let bot_id = db::kv_get(conn, "active_profile").ok().flatten().unwrap_or_default();
     if bot_id.is_empty() {
         return Ok(());
     }
@@ -440,15 +446,6 @@ fn domain_of(prompt: &str) -> &'static str {
     } else {
         "general"
     }
-}
-
-fn latest_turn(conn: &Connection, thread_id: &str) -> String {
-    conn.query_row(
-        "SELECT turn_id FROM execution_steps WHERE thread_id=?1 AND role='user' ORDER BY created_at DESC LIMIT 1",
-        params![thread_id],
-        |row| row.get(0),
-    )
-    .unwrap_or_default()
 }
 
 fn load_flags(conn: &Connection) -> Flags {
@@ -1101,6 +1098,7 @@ pub async fn harness2_keep(state: State<'_, AppState>, run_id: String) -> Result
             scoped_bot_id: Some(card.bot_id.clone()),
             file_path_or_uri: path.display().to_string(),
             engine_id: Some("mem0_builtin".into()),
+            keep_identity: false,
         },
     ) {
         Ok(saved) => card.probe_note = format!("{}. {}", card.probe_note, saved.note),
@@ -1199,6 +1197,23 @@ mod tests {
         assert!(lower.contains("was not modified"));
         assert!(!lower.contains("tests passed"));
         assert!(!lower.contains("probe succeeded"));
+    }
+
+    #[test]
+    fn a_live_plan_is_attached_without_claiming_a_probe() {
+        let score = score_prompt("refactor the parser", 0, false, true);
+        let flags = Flags::default();
+        let proposal = proposal_text("refactor the parser", &score, &flags, &flags.components, Path::new("sandbox"));
+        let text = compose_with_plan("do the work".into(), Some(&proposal));
+        let lower = text.to_ascii_lowercase();
+        assert!(text.starts_with("do the work\n\n---\n"));
+        assert!(lower.contains("not a finished edit"));
+        assert!(lower.contains("not an executed edit"));
+        assert!(lower.contains("was not modified"));
+        assert!(!lower.contains("tests passed"));
+        assert!(!lower.contains("probe succeeded"));
+        assert_eq!(compose_with_plan("do the work".into(), None), "do the work");
+        assert_eq!(compose_with_plan("do the work".into(), Some("  ")), "do the work");
     }
 
     #[test]

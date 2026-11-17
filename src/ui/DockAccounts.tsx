@@ -18,7 +18,7 @@ const SITES: { id: string; providerId: string; title: string; detail: string }[]
   { id: "copilot", providerId: "", title: "Copilot", detail: "Microsoft Copilot subscription. Sign in on the site." },
 ];
 
-export function DockAccounts({ models, selectedId, ollamaReady, onOpenSite, onSelectModel, onModelsChanged }: { models: ChatModel[]; selectedId: string; ollamaReady: boolean; onOpenSite: (app: WebApp) => void; onSelectModel: (id: string) => void; onModelsChanged: (id?: string) => void }) {
+export function DockAccounts({ models, selectedId, ollamaReady, onOpenSite, onSelectModel, onModelsChanged, onRefresh }: { models: ChatModel[]; selectedId: string; ollamaReady: boolean; onOpenSite: (app: WebApp) => void; onSelectModel: (id: string) => void; onModelsChanged: (id?: string) => void; onRefresh?: () => void }) {
   const snap = useRonic((s) => s.snap)!;
   const run = useRonic((s) => s.run);
   const busy = useRonic((s) => s.busy);
@@ -54,8 +54,8 @@ export function DockAccounts({ models, selectedId, ollamaReady, onOpenSite, onSe
           onSelect={onSelectModel}
           busy={busy}
           onToggle={() => setOpenId((current) => current === provider.id ? "" : provider.id)}
-          onSaveKey={(secret) => void run("set_provider_secret", { id: provider.id, secret })}
-          onTest={() => void run("test_provider", { id: provider.id })}
+          onSaveKey={(secret) => void run("set_provider_secret", { id: provider.id, secret }).then(() => onRefresh?.())}
+          onTest={() => void run("test_provider", { id: provider.id }).then(() => onRefresh?.())}
           onAdd={(draft) => {
             const created = addCustom(draft);
             onModelsChanged(created.id);
@@ -93,7 +93,7 @@ function AccountCard({ provider, open, models, selectedId, ollamaReady, busy, on
               </div>
             </>
           )}
-          <p className="muted">{models.length === 0 ? "No models for this account yet." : `${models.length} models in this chat.`}</p>
+          <p className="muted">{models.length === 0 ? "No models for this account yet. Save a key, then Test ping." : `${models.length} models in this chat. The one you pick belongs to this bot only.`}</p>
           {models.slice(0, 8).map((model) => (
             <button type="button" key={model.id} className={`dock-model ${model.id === selectedId ? "on" : ""}`} onClick={() => onSelect(model.id)}>
               <span>{model.label}</span>

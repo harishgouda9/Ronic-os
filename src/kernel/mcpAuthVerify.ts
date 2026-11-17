@@ -23,7 +23,7 @@ const GOOGLE_IDS = new Set([
   "mcp-gmail",
 ]);
 
-const MICROSOFT_IDS = new Set(["mcp-outlook", "mcp-onedrive", "mcp-email"]);
+const MICROSOFT_IDS = new Set(["mcp-outlook", "mcp-onedrive"]);
 
 /**
  * Check a credential with the provider, or a local daemon/path with the desktop app.
@@ -79,6 +79,19 @@ export async function verifyMcpCredentials(
       jsonIdentity,
     );
   }
+  if (item.id === "mcp-email") return verifyEmail(config);
+  if (item.id === "mcp-redis") return verifyRedis(item, config, secret, run);
+  if (item.id === "mcp-qdrant") return verifyQdrant(config);
+  if (item.id === "mcp-x") return verifyBearer("https://api.x.com/2/users/me", secret || config.apiKey || "", "X", xIdentity);
+  if (item.id === "mcp-canva") return verifyBearer("https://api.canva.com/rest/v1/users/me", secret || config.apiKey || "", "Canva", canvaIdentity);
+  if (item.id === "mcp-klaviyo") return verifyKlaviyo(secret || config.apiKey || "");
+  if (item.id === "mcp-brevo") return verifyHeader("https://api.brevo.com/v3/account", "api-key", secret || config.apiKey || "", "Brevo", jsonIdentity);
+  if (item.id === "mcp-mailerlite") return verifyMailerLite(secret || config.apiKey || "");
+  if (item.id === "mcp-ahrefs") return verifyBearer("https://api.ahrefs.com/v3/subscription-info/limits-and-usage", secret || config.apiKey || "", "Ahrefs", () => "Ahrefs");
+  if (item.id === "mcp-pinecone") return verifyHeader("https://api.pinecone.io/indexes", "Api-Key", secret || config.apiKey || "", "Pinecone", () => "Pinecone");
+  if (item.id === "mcp-link") return verifyLink(secret || config.apiKey || "");
+  if (item.id === "mcp-atlassian") return verifyAtlassian(secret || config.apiKey || config.accessToken || "", input.identity || "", input.advanced?.endpointUrl);
+  if (item.id === "mcp-1password") return probeLocal(item, run, { kind: "op", path: secret || config.apiKey || "" });
 
   throw new Error(
     `${item.name} has no live credential check in this build, so it stays unauthenticated. A saved form is not a connection.`,
@@ -375,4 +388,116 @@ async function requestJson(url: string, init: RequestInit): Promise<Record<strin
   } catch {
     throw new Error("The provider answer was not JSON. It was not marked connected.");
   }
+}
+
+async function verifyEmail(config: Record<string, string>): Promise<McpVerifyResult> {
+  const host = (config.smtpHost || "").trim();
+  const port = (config.smtpPort || "").trim();
+  const email = (config.email || "").trim();
+  const password = (config.password || "").trim();
+  if (!host || !/^\d+$/.test(port) || !email.includes("@") || isPlaceholderCredential(email) || !password || isPlaceholderCredential(password)) {
+    throw new Error("Email needs an SMTP host, a numeric port, an address, and a password. It was not marked connected.");
+  }
+  // shortcut: browser fetch cannot AUTH over STARTTLS, and this build has no SMTP client. Upgrade when a checked mail probe exists.
+  throw new Error("This build does not check SMTP passwords, so Email was not marked connected.");
+}
+
+async function verifyRedis(item: MarketplaceCatalogItem, config: Record<string, string>, secret: string, run?: Run): Promise<McpVerifyResult> {
+  let url = (config.connectionUrl || secret || "").trim();
+  const password = (config.password || "").trim();
+  if (!url || isPlaceholderCredential(url)) {
+    throw new Error("Redis needs a redis:// URL. It was not marked connected.");
+  }
+  if (password && !isPlaceholderCredential(password) && !url.includes("@") && url.toLowerCase().startsWith("redis://")) {
+    url = `redis://:${encodeURIComponent(password)}@${url.slice("redis://".length)}`;
+  }
+  return probeLocal(item, run, { kind: "redis", path: url });
+}
+
+async function verifyQdrant(config: Record<string, string>): Promise<McpVerifyResult> {
+  const raw = (config.clusterUrl || "").trim();
+  const key = requireSecret(config.apiKey || "", "Qdrant");
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error("Qdrant needs a cluster URL such as https://your-cluster.qdrant.tech.");
+  }
+  const local = parsed.hostname === "127.0.0.1" || parsed.hostname === "localhost" || parsed.hostname === "[::1]";
+  if (parsed.protocol !== "https:" && !local) {
+    throw new Error("Qdrant needs an https cluster URL.");
+  }
+  const body = await requestJson(`${parsed.origin}/collections`, {
+    method: "GET",
+    headers: { "api-key": key, Accept: "application/json" },
+  });
+  if (!body.result && body.status !== "ok" && body.items === undefined) {
+    throw new Error("Qdrant did not list collections. It was not marked connected.");
+  }
+  return { identity: parsed.host, detail: `Qdrant accepted the key for ${parsed.host}.` };
+}
+
+function xIdentity(body: Record<string, unknown>): string {
+  const data = body.data as { username?: string; name?: string; id?: string } | undefined;
+  return String(data?.username || data?.name || data?.id || "");
+}
+
+function canvaIdentity(body: Record<string, unknown>): string {
+  const team = body.team_user as { user_id?: string } | undefined;
+  return String(body.display_name || body.email || body.id || team?.user_id || "");
+}
+
+async function verifyKlaviyo(secret: string): Promise<McpVerifyResult> {
+  const key = requireSecret(secret, "Klaviyo");
+  const body = await requestJson("https://a.klaviyo.com/api/accounts/", {
+    method: "GET",
+    headers: {
+      Authorization: `Klaviyo-API-Key ${key}`,
+      revision: "2024-10-15",
+      Accept: "application/json",
+    },
+  });
+  const rows = Array.isArray(body.data) ? body.data : [];
+  const first = rows[0] as { attributes?: { contact_information?: { organization_name?: string } } } | undefined;
+  const identity = first?.attributes?.contact_information?.organization_name || "Klaviyo";
+  return { identity, detail: `Klaviyo accepted the key for ${identity}.` };
+}
+
+async function verifyMailerLite(secret: string): Promise<McpVerifyResult> {
+  const token = requireSecret(secret, "MailerLite");
+  const body = await requestJson("https://connect.mailerlite.com/api/account", {
+    method: "GET",
+    headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+  });
+  const data = body.data as { email?: string } | undefined;
+  const identity = String(data?.email || body.email || "MailerLite");
+  if (isPlaceholderCredential(identity)) throw new Error("MailerLite answered without an account. It was not marked connected.");
+  return { identity, detail: `MailerLite accepted the token for ${identity}.` };
+}
+
+async function verifyLink(secret: string): Promise<McpVerifyResult> {
+  const key = requireSecret(secret, "Link");
+  if (!key.startsWith("sk_")) {
+    throw new Error("Link needs a Stripe secret key (sk_). It was not marked connected.");
+  }
+  return verifyStripe(key);
+}
+
+async function verifyAtlassian(secret: string, identity: string, endpoint?: string): Promise<McpVerifyResult> {
+  const token = requireSecret(secret, "Atlassian");
+  const siteRaw = [endpoint || "", identity].find((value) => value.includes("atlassian.net")) || "";
+  const email = [identity, endpoint || ""].find((value) => value.includes("@")) || "";
+  if (token.startsWith("ATATT") && (!siteRaw || !email)) {
+    throw new Error("An Atlassian API token needs the account email and the site (your-site.atlassian.net). It was not marked connected.");
+  }
+  if (siteRaw && email) {
+    const host = siteRaw.replace(/^https?:\/\//, "").replace(/\/.*$/, "");
+    const body = await requestJson(`https://${host}/rest/api/3/myself`, {
+      method: "GET",
+      headers: { Authorization: `Basic ${btoa(`${email}:${token}`)}`, Accept: "application/json" },
+    });
+    const account = String(body.emailAddress || body.displayName || email);
+    return { identity: account, detail: `Atlassian accepted the token for ${account}.` };
+  }
+  return verifyBearer("https://api.atlassian.com/me", token, "Atlassian", (row) => String(row.email || row.name || row.account_id || ""));
 }

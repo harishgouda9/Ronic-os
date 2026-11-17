@@ -189,6 +189,14 @@ pub struct LinkedApp {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct CuratedEntry {
+    pub id: String,
+    pub store: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MemoryItem {
     pub id: String,
     pub source_type: String,
@@ -202,6 +210,14 @@ pub struct MemoryItem {
     pub synced_engines: Vec<String>,
     pub valid_from: Option<i64>,
     pub invalid_at: Option<i64>,
+    pub relations: Vec<MemoryRelation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryRelation {
+    pub relation: String,
+    pub target: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -741,6 +757,8 @@ pub struct Snapshot {
     pub providers: Vec<Provider>,
     pub apps: Vec<LinkedApp>,
     pub memories: Vec<MemoryItem>,
+    #[serde(default)]
+    pub curated: Vec<CuratedEntry>,
     pub memory_engines: Vec<MemoryEngine>,
     pub memory_route: MemoryRoute,
     pub memory_routes: Vec<MemoryRoute>,

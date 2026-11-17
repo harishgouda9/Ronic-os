@@ -64,7 +64,7 @@ function pageBounds(el: HTMLElement): WebAppBounds | null {
     const edge = thread.getBoundingClientRect().right + 8;
     if (x < edge) x = edge;
   }
-  for (const selector of ["[data-edge-rail]", "[data-jobs-panel]", ".chat-side", ".preview-col"]) {
+  for (const selector of ["[data-edge-rail]", "[data-jobs-panel]", "[data-copy-panel]", "[data-plugin-panel]", ".chat-side", ".preview-col"]) {
     const neighbor = document.querySelector(selector);
     if (!neighbor || neighbor.contains(el)) continue;
     const edge = neighbor.getBoundingClientRect().left;
@@ -227,6 +227,8 @@ export function LiveBrowser({ botName, onAsk, onClose }: { botName: string; onAs
     watch("[data-pane=thread]");
     watch("[data-edge-rail]");
     watch("[data-jobs-panel]");
+    watch("[data-copy-panel]");
+    watch("[data-plugin-panel]");
     watch(".chat-side");
     watch(".preview-col");
     let frame2 = 0;

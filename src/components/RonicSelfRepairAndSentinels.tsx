@@ -93,7 +93,8 @@ export default function RonicSelfRepairAndSentinels() {
   const incidents = snap.sentinels.filter((s) => s.status === "incident_detected" && !s.acknowledged).length;
   const watching = snap.sentinels.filter((s) => s.status === "watching").length;
   const scanned = snap.sentinels.filter((s) => s.lastScan > 0).length;
-  const heartbeatHealthy = snap.heartbeatAgeMs < 4000;
+  const preview = snap.kernel === "browser";
+  const heartbeatHealthy = !preview && snap.heartbeatAgeMs < 4000;
   const repairsDone = snap.remediation.filter((r) => r.status === "repaired").length;
   const lastSweep = snap.sentinels.reduce((max, s) => Math.max(max, s.lastScan), 0);
 
@@ -125,9 +126,9 @@ export default function RonicSelfRepairAndSentinels() {
             <div className="min-w-0">
               <div className="flex items-center gap-2.5 flex-wrap">
                 <h1 className="text-lg sm:text-xl font-bold text-slate-900 tracking-tight">Self-Repair &amp; Autonomous Sentinel Center</h1>
-                <Chip tone={heartbeatHealthy ? "emerald" : "amber"}>
+                <Chip tone={preview ? "slate" : heartbeatHealthy ? "emerald" : "amber"}>
                   <Activity size={10} />
-                  {heartbeatHealthy ? "WATCHDOG ONLINE" : "WATCHDOG STALE"}
+                  {preview ? "PREVIEW" : heartbeatHealthy ? "WATCHDOG ONLINE" : "WATCHDOG STALE"}
                 </Chip>
               </div>
               <p className="text-xs text-slate-500 mt-1.5 max-w-2xl leading-relaxed">
@@ -135,8 +136,8 @@ export default function RonicSelfRepairAndSentinels() {
               </p>
               <div className="flex items-center gap-2 mt-2 text-[11px] font-mono text-slate-400 flex-wrap" aria-live="polite">
                 <span className="flex items-center gap-1.5">
-                  <span className={`w-1.5 h-1.5 rounded-full ${heartbeatHealthy ? "bg-emerald-500" : "bg-amber-500"}`} />
-                  IPC heartbeat {snap.heartbeatAgeMs}ms
+                  <span className={`w-1.5 h-1.5 rounded-full ${preview ? "bg-slate-400" : heartbeatHealthy ? "bg-emerald-500" : "bg-amber-500"}`} />
+                  {preview ? "browser preview" : `IPC heartbeat ${snap.heartbeatAgeMs}ms`}
                 </span>
                 <span>•</span>
                 <span>{snap.sentinels.length} sentinels armed</span>
@@ -161,6 +162,14 @@ export default function RonicSelfRepairAndSentinels() {
                 className="text-xs font-semibold px-3.5 py-2 rounded-full border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 hover:text-slate-900 transition-all cursor-pointer active:scale-95 disabled:opacity-40"
               >
                 Report a bug
+              </button>
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => void run("run_repair")}
+                className="text-xs font-semibold px-3.5 py-2 rounded-full border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 hover:text-slate-900 transition-all cursor-pointer active:scale-95 disabled:opacity-40 flex items-center gap-1.5"
+              >
+                <Wrench size={12} /> Run doctor
               </button>
               <button
                 type="button"
@@ -328,7 +337,7 @@ export default function RonicSelfRepairAndSentinels() {
                       </span>
                       <div className="min-w-0 space-y-1">
                         <div className="flex items-center gap-2 flex-wrap">
-                          <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${openIncident ? "bg-amber-500" : "bg-emerald-500"}`} />
+                          <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${openIncident ? "bg-amber-500" : watchingState ? "bg-slate-400" : "bg-emerald-500"}`} />
                           <span className="text-sm font-semibold text-slate-800">{sentinel.name}</span>
                           <Chip tone={severityChip(sentinel.severity)}>{sentinel.severity}</Chip>
                           <Chip tone="slate">{sentinel.source}</Chip>
@@ -341,7 +350,7 @@ export default function RonicSelfRepairAndSentinels() {
                           </span>
                           <span>{sentinel.finding || "No scan recorded yet — run a scan to collect the first finding."}</span>
                         </div>
-                        {incident && sentinel.stagedFix ? (
+                        {sentinel.stagedFix ? (
                           <div className="flex items-center gap-1.5 text-[10.5px] font-mono text-slate-600 bg-white/80 border border-slate-200/70 rounded-lg px-2 py-1 w-fit">
                             <Wrench size={11} className="text-slate-400" />
                             <span><strong>Proposed action:</strong> {sentinel.stagedFix}</span>
@@ -355,7 +364,7 @@ export default function RonicSelfRepairAndSentinels() {
                         <button
                           type="button"
                           disabled={busy}
-                          title="Acknowledge this incident so it stops flashing until the next scan re-verifies it"
+                          title="Silence this incident while the same finding remains. It flashes again if the finding changes or the incident returns."
                           onClick={() => void run("acknowledge_sentinel", { sentinelId: sentinel.id })}
                           className="text-xs font-semibold px-3 py-1.5 rounded-full border border-slate-200 bg-white text-slate-600 hover:bg-slate-50 transition-all cursor-pointer active:scale-95 disabled:opacity-40 flex items-center gap-1"
                         >
@@ -470,9 +479,13 @@ export default function RonicSelfRepairAndSentinels() {
         {/* ─── FOOTER STATUS BAR ─── */}
         <div className="px-6 py-3 bg-slate-50 border-t border-slate-100 flex items-center justify-between text-xs text-slate-500">
           <div className="flex items-center gap-2 truncate pr-4">
-            <span className={`w-2 h-2 rounded-full shrink-0 ${heartbeatHealthy ? "bg-emerald-500" : "bg-amber-500"}`} />
+            <span className={`w-2 h-2 rounded-full shrink-0 ${preview ? "bg-slate-400" : heartbeatHealthy ? "bg-emerald-500" : "bg-amber-500"}`} />
             <span className="truncate">
-              {heartbeatHealthy ? "Watchdog online — local monitors sweep every 30 seconds" : "Watchdog heartbeat is stale — refresh the workspace to re-arm it"}
+              {preview
+                ? "Preview checks this tab's threads and channels. File repair and git drift run in the desktop app."
+                : heartbeatHealthy
+                  ? "Watchdog online — local monitors sweep every 30 seconds"
+                  : "Watchdog heartbeat is stale — refresh the workspace to re-arm it"}
             </span>
           </div>
           <div className="shrink-0 flex items-center gap-3 text-[11px] font-medium text-slate-400">

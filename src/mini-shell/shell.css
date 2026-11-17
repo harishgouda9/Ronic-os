@@ -82,6 +82,9 @@ html.msh-window[data-msh-theme="dark"] body {
 .msh-appview.on {
   visibility: visible;
 }
+.msh-appview:not(.on) {
+  pointer-events: none;
+}
 
 .msh-boot-hint {
   color: var(--msh-muted);

@@ -58,9 +58,10 @@ export interface Mem0GraphEdge {
   sourceType: "note";
   relation: string;
   target: string;
-  targetType: "wikilink";
+  targetType: "wikilink" | "entity";
   memoryId: string;
   appliesTo: string;
+  stored: boolean;
 }
 
 interface JournalRow {
@@ -290,6 +291,8 @@ export function Memory() {
   const [statusBanner, setStatusBanner] = useState<string>(
     "Mem0 is the local vault in state.db. Notes you save here are the notes chat can recall."
   );
+  const [curatedTarget, setCuratedTarget] = useState<"user" | "memory" | "bot">("memory");
+  const [curatedDraft, setCuratedDraft] = useState("");
 
   const handleSelectMemory = (mem: Mem0AtomicMemory) => {
     setIsCreatingNew(false);
@@ -392,21 +395,49 @@ export function Memory() {
   }, [playgroundQuery, minScoreThreshold]);
 
   const graphEdges: Mem0GraphEdge[] = useMemo(() => {
+    const titleOf = (name: string) => {
+      const note = (snap.memories || []).find((item) => item.title.toLowerCase() === name.toLowerCase());
+      return note?.title || name;
+    };
     const edges: Mem0GraphEdge[] = [];
+    const seen = new Set<string>();
     for (const item of snap.memories || []) {
       if (DEMO_MEMORY_IDS.has(item.id)) continue;
-      for (const link of item.wikilinks || []) {
-        const name = link.trim();
+      const source = item.title || item.id;
+      for (const link of item.relations || []) {
+        const name = titleOf(link.target.trim());
         if (!name) continue;
+        const key = `${item.id}:${name.toLowerCase()}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        edges.push({
+          id: `edge:${item.id}:${name}`,
+          source,
+          sourceType: "note",
+          relation: link.relation || "RELATES",
+          target: name,
+          targetType: "entity",
+          memoryId: item.id,
+          appliesTo: item.scopedBotId || "Workspace default",
+          stored: true,
+        });
+      }
+      for (const link of item.wikilinks || []) {
+        const name = titleOf(link.trim());
+        if (!name) continue;
+        const key = `${item.id}:${name.toLowerCase()}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
         edges.push({
           id: `${item.id}:${name}`,
-          source: item.title || item.id,
+          source,
           sourceType: "note",
           relation: "LINKS",
           target: name,
           targetType: "wikilink",
           memoryId: item.id,
           appliesTo: item.scopedBotId || "Workspace default",
+          stored: false,
         });
       }
     }
@@ -484,15 +515,18 @@ export function Memory() {
     if (!selectedMemory) return;
     const name = target.replace(/[\[\]]/g, "").trim();
     if (!name) return;
-    const content = selectedMemory.fact.includes(`[[${name}]]`) ? selectedMemory.fact : `${selectedMemory.fact.trim()}\n[[${name}]]`;
-    const targetBotProfile = snap.profiles.find((p) => p.handle === selectedMemory.appliesTo || p.id === selectedMemory.appliesTo);
-    const scopedBotId = selectedMemory.appliesTo === "Workspace default" ? null : targetBotProfile?.id || null;
-    const res = await saveNote(selectedMemory.id, selectedMemory.title, content, selectedMemory.source, selectedMemory.fileOrUri, scopedBotId);
-    setStatusBanner(res?.toast || `Linked [[${name}]] on "${selectedMemory.title}".`);
+    const res = await run("memory_vault", { action: "link", memoryId: selectedMemory.id, target: name, relation: "RELATES" });
+    setStatusBanner(res?.toast || `Linked ${name} on "${selectedMemory.title}".`);
     await loadJournal();
   }
 
   async function unlinkEdge(edge: Mem0GraphEdge) {
+    if (edge.stored) {
+      const res = await run("memory_vault", { action: "unlink", memoryId: edge.memoryId, target: edge.target });
+      setStatusBanner(res?.toast || `Removed the link to ${edge.target}.`);
+      await loadJournal();
+      return;
+    }
     const note = (snap.memories || []).find((item) => item.id === edge.memoryId);
     if (!note) return;
     const content = note.contentMarkdown.split(`[[${edge.target}]]`).join("").replace(/\n{3,}/g, "\n\n").trim();
@@ -546,7 +580,7 @@ export function Memory() {
     const nodeNames = Array.from(new Set(graphEdges.flatMap((e) => [e.source, e.target])));
     const centerX = 360;
     const centerY = 175;
-    const radius = 130;
+    const radius = Math.min(150, 80 + nodeNames.length * 8);
 
     const nodes = nodeNames.map((name, idx) => {
       if (idx === 0) {
@@ -765,6 +799,28 @@ export function Memory() {
         })}
       </div>
 
+      <CuratedNotes
+        rows={snap.curated ?? []}
+        botStore={`bot:${snap.activeProfileId || ""}`}
+        target={curatedTarget}
+        draft={curatedDraft}
+        onTarget={setCuratedTarget}
+        onDraft={setCuratedDraft}
+        onAdd={async () => {
+          const content = curatedDraft.trim();
+          if (!content) return;
+          const res = await run("memory_vault", { action: "curate", query: "add", target: curatedTarget, content });
+          if (res?.toast) {
+            if (res.toast.startsWith("Added")) setCuratedDraft("");
+            setStatusBanner(res.toast);
+          }
+        }}
+        onDrop={async (id) => {
+          const res = await run("memory_vault", { action: "curate", query: "drop", memoryId: id });
+          if (res?.toast) setStatusBanner(res.toast);
+        }}
+      />
+
       {/* =====================================================================
           3. UPGRADED MEM0 (BUILT IN) INTERACTIVE VAULT STUDIO (`state.db`)
          ===================================================================== */}
@@ -779,7 +835,7 @@ export function Memory() {
                   {atomicMemories.length} atomic memories
                 </span>
                 <span className="px-2 py-0.5 text-[11px] font-mono bg-[#F8FAFC] text-[#0F172A] border border-[#E5E5E5] rounded-full">
-                  {graphEdges.length} wikilinks
+                  {graphEdges.length} links
                 </span>
               </div>
               <div className="text-[11px] font-mono text-[#64748B] mt-0.5">
@@ -1072,7 +1128,7 @@ export function Memory() {
             <div className="lg:col-span-8 bg-[#F8FAFC] border border-[#E5E5E5] rounded-[6px] p-3 flex flex-col justify-between">
               <div className="flex items-center justify-between text-xs mb-2">
                 <span className="font-bold text-[#0F172A] flex items-center gap-1.5">
-                  <Network size={14} /> Wikilinks saved on these notes (<code>state.db</code>)
+                  <Network size={14} /> Graph links in <code>state.db</code>
                 </span>
                 <span className="text-[11px] font-mono text-[#64748B]">Click any node to inspect connected facts</span>
               </div>
@@ -1125,7 +1181,7 @@ export function Memory() {
                         fontWeight="600"
                         fill="#0F172A"
                       >
-                        {node.name}
+                        {node.name.length > 22 ? `${node.name.slice(0, 21)}…` : node.name}
                       </text>
                     </g>
                   );
@@ -1170,7 +1226,7 @@ export function Memory() {
                 <div className="font-bold text-[#0F172A] flex items-center gap-1.5">
                   <Plus size={14} /> Link the selected note
                 </div>
-                <p className="text-[11px] text-[#64748B]">Writes [[name]] into {selectedMemory ? selectedMemory.title : "the open note"} and saves it in state.db.</p>
+                <p className="text-[11px] text-[#64748B]">Adds a graph link on {selectedMemory ? selectedMemory.title : "the open note"}. The note text stays as it is.</p>
                 <input
                   value={newEdgeTarget}
                   onChange={(e) => setNewEdgeTarget(e.target.value)}
@@ -1188,7 +1244,7 @@ export function Memory() {
                   className="w-full py-1.5 font-semibold bg-zinc-800 hover:bg-zinc-700 text-white border border-zinc-700/50 shadow-xs rounded-[6px] transition text-xs shadow-xs disabled:opacity-40"
                   style={{ color: "#ffffff" }}
                 >
-                  <span className="text-white" style={{ color: "#ffffff" }}>Save wikilink</span>
+                  <span className="text-white" style={{ color: "#ffffff" }}>Save link</span>
                 </button>
               </div>
             </div>
@@ -1598,6 +1654,76 @@ export function Memory() {
       )}
         </div>
       </div>
+    </div>
+  );
+}
+
+function CuratedNotes({
+  rows,
+  botStore,
+  target,
+  draft,
+  onTarget,
+  onDraft,
+  onAdd,
+  onDrop,
+}: {
+  rows: { id: string; store: string; content: string }[];
+  botStore: string;
+  target: "user" | "memory" | "bot";
+  draft: string;
+  onTarget: (target: "user" | "memory" | "bot") => void;
+  onDraft: (value: string) => void;
+  onAdd: () => void;
+  onDrop: (id: string) => void;
+}) {
+  const groups = [
+    { store: "user", title: "User", limit: 1375 },
+    { store: "memory", title: "Environment", limit: 2200 },
+    { store: botStore, title: "This bot", limit: 1800 },
+  ];
+  const known = new Set(groups.map((group) => group.store));
+  const extras = [...new Set(rows.map((row) => row.store))].filter((store) => !known.has(store));
+  const used = (store: string) => rows.filter((row) => row.store === store).reduce((sum, row) => sum + [...row.content].length, 0);
+  return (
+    <div className="bg-white border border-[#E5E5E5] rounded-[10px] p-5 space-y-3 shadow-sm">
+      <div>
+        <h2 className="text-sm font-bold text-[#0F172A]">Always-on notes</h2>
+        <p className="text-[11px] font-mono text-[#64748B] mt-0.5">Included in every chat turn. User 1,375 characters, environment 2,200, this bot 1,800. A fact past the cap is refused.</p>
+      </div>
+      <div className="flex flex-wrap gap-2">
+        <select value={target} onChange={(event) => onTarget(event.target.value as "user" | "memory" | "bot")} className="px-2 py-1.5 text-xs border border-[#E5E5E5] rounded-[6px] bg-white">
+          <option value="user">User</option>
+          <option value="memory">Environment</option>
+          <option value="bot">This bot</option>
+        </select>
+        <input value={draft} onChange={(event) => onDraft(event.target.value)} placeholder="One short fact" className="flex-1 min-w-[12rem] px-2 py-1.5 text-xs border border-[#E5E5E5] rounded-[6px]" />
+        <button type="button" onClick={onAdd} className="px-3 py-1.5 text-xs font-semibold border border-slate-300 rounded-[6px] hover:bg-slate-100">Add</button>
+      </div>
+      {groups.map((group) => (
+        <CuratedGroup key={group.store} title={group.title} limit={group.limit} used={used(group.store)} rows={rows.filter((row) => row.store === group.store)} onDrop={onDrop} />
+      ))}
+      {extras.map((store) => (
+        <CuratedGroup key={store} title={store} limit={1800} used={used(store)} rows={rows.filter((row) => row.store === store)} onDrop={onDrop} />
+      ))}
+    </div>
+  );
+}
+
+function CuratedGroup({ title, limit, used, rows, onDrop }: { title: string; limit: number; used: number; rows: { id: string; content: string }[]; onDrop: (id: string) => void }) {
+  return (
+    <div>
+      <div className="text-[11px] font-mono text-[#64748B]">{title} [{used}/{limit}]</div>
+      {rows.length === 0 ? <div className="text-xs text-[#94A3B8] mt-1">None</div> : (
+        <ul className="mt-1 space-y-1">
+          {rows.map((row) => (
+            <li key={row.id} className="flex items-start justify-between gap-2 text-xs">
+              <span>{row.content}</span>
+              <button type="button" onClick={() => onDrop(row.id)} className="text-[#64748B] hover:text-slate-900" title="Remove"><Trash2 size={12} /></button>
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
   );
 }

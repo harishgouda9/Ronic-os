@@ -1,31 +1,44 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowLeft, ChevronRight, Eye, EyeOff, Lock, QrCode, RefreshCw, Search, Shield, ShieldCheck, Trash2 } from "lucide-react";
+import { ArrowLeft, Camera, ChevronRight, Eye, EyeOff, Lock, QrCode, RefreshCw, Search, Shield, ShieldCheck, Trash2, Upload } from "lucide-react";
 import { invokeRaw, isTauri } from "../api";
-import { inboundChiefAction } from "../kernel/chiefDelegation";
+import { runGatewayTurn } from "../kernel/gatewayTurn";
 import { pairingQrDataUrl } from "../kernel/pairingQr";
 import { useRonic } from "../store";
 import {
   allowlistFromDraft,
+  allowOwner,
   applySaveCredentials,
+  applyStoredCredentials,
+  clearBlockedSender,
+  draftsFromSaved,
+  GATEWAY_CREDENTIALS_KEY,
+  GATEWAY_ROUTE_KEY,
   canSendPush,
   channelUsesQrPairing,
   connectTokenFor,
   draftFor,
   fleetMembers,
+  inboundAllowlist,
+  lastBlockedSender,
   liveStateToStatus,
-  newPairingCode,
-  pairingUri,
   pruneChannelRouting,
+  pushBlockReason,
   pushButtonsForEvent,
+  removeAllowedOwner,
   resolveInboundRoute,
+  interpretScannedGatewayQr,
+  parseSavedCredentials,
+  syncChannelFromLive,
   toggleRoutableBot,
+  upsertSavedCredential,
   usableExtras,
+  whatsappLinkInstructions,
   type CredentialDraft,
   type ExtraCredential,
   type FleetMember,
   type GatewayConnectionInfo,
-  type IncomingGatewayMessage,
   type RouteDecision,
+  type SavedGatewayCredential,
 } from "../kernel/messagingGateway";
 
 export interface MessagingPlatformItem {
@@ -47,7 +60,7 @@ export interface MessagingPlatformItem {
 
 type ChannelStatus = MessagingPlatformItem["status"];
 
-const ROUTE_KEY = "ronic.gateway.routing.v1";
+const ROUTE_KEY = GATEWAY_ROUTE_KEY;
 
 const STATUS_META: Record<
   ChannelStatus,
@@ -85,7 +98,7 @@ const INITIAL_CHANNELS: MessagingPlatformItem[] = [
     status: "disconnected",
     botTokenMasked: "",
     ownerUserId: "",
-    setupHint: "Bot API long-polling. Paste a @BotFather token below to connect.",
+    setupHint: "Bot API long-polling. Paste a @BotFather token, or scan a QR that contains it.",
     defaultBot: "",
     routableBots: [],
     extraCredentials: [],
@@ -99,7 +112,7 @@ const INITIAL_CHANNELS: MessagingPlatformItem[] = [
     status: "disconnected",
     botTokenMasked: "",
     ownerUserId: "",
-    setupHint: "Phone pairing. A QR code appears on this page. A Cloud API token is optional.",
+    setupHint: "Open WhatsApp, then Linked devices, then Link a device, and scan the code. A Cloud API token is optional.",
     defaultBot: "",
     routableBots: [],
     extraCredentials: [],
@@ -183,7 +196,7 @@ const INITIAL_CHANNELS: MessagingPlatformItem[] = [
     status: "disconnected",
     botTokenMasked: "",
     ownerUserId: "",
-    setupHint: "High-privacy remote command channel via signal-cli local socket.",
+    setupHint: "Scan the QR this gateway shows, or paste its token. Save keeps it on this computer.",
     defaultBot: "",
     routableBots: [],
     extraCredentials: [],
@@ -197,7 +210,7 @@ const INITIAL_CHANNELS: MessagingPlatformItem[] = [
     status: "disconnected",
     botTokenMasked: "",
     ownerUserId: "",
-    setupHint: "Connect iMessage via BlueBubbles server webhook.",
+    setupHint: "Scan the QR this gateway shows, or paste its token. Save keeps it on this computer.",
     defaultBot: "",
     routableBots: [],
     extraCredentials: [],
@@ -281,7 +294,7 @@ const INITIAL_CHANNELS: MessagingPlatformItem[] = [
     status: "disconnected",
     botTokenMasked: "",
     ownerUserId: "",
-    setupHint: "WeChat official account / WeCom robot webhook integration.",
+    setupHint: "Scan the QR this gateway shows, or paste its token. Save keeps it on this computer.",
     defaultBot: "",
     routableBots: [],
     extraCredentials: [],
@@ -311,6 +324,44 @@ function extraPlaceholder(channelId: string): string {
 
 function stamp(): string {
   return new Date().toTimeString().slice(0, 8);
+}
+
+function readPreviewCredentials(): Record<string, SavedGatewayCredential> {
+  try {
+    return parseSavedCredentials(JSON.parse(localStorage.getItem(GATEWAY_CREDENTIALS_KEY) ?? "null"));
+  } catch {
+    return {};
+  }
+}
+
+async function persistGatewayCredentials(channelId: string, draft: CredentialDraft, reconnect?: boolean): Promise<void> {
+  const extras = usableExtras(draft.extras);
+  const stored = { ...draft, token: draft.token.trim(), ownerId: draft.ownerId.trim(), extras };
+  if (isTauri()) {
+    await invokeRaw<string>("gateway_save_credentials", {
+      channelId,
+      token: stored.token,
+      ownerId: stored.ownerId,
+      extras,
+      reconnect: reconnect ?? null,
+    });
+    return;
+  }
+  const next = upsertSavedCredential(readPreviewCredentials(), channelId, stored, reconnect);
+  localStorage.setItem(GATEWAY_CREDENTIALS_KEY, JSON.stringify(next));
+}
+
+type BarcodeHit = { rawValue?: string };
+type BarcodeReader = { detect: (source: CanvasImageSource) => Promise<BarcodeHit[]> };
+
+function barcodeReader(): BarcodeReader | null {
+  const ctor = (window as unknown as { BarcodeDetector?: new (options: { formats: string[] }) => BarcodeReader }).BarcodeDetector;
+  if (!ctor) return null;
+  try {
+    return new ctor({ formats: ["qr_code"] });
+  } catch {
+    return null;
+  }
 }
 
 function loadStoredRoutes(): Record<string, { defaultBot?: string; routableBots?: unknown }> {
@@ -355,13 +406,20 @@ export default function RonicMessagingGateway() {
   const snap = useRonic((s) => s.snap);
   const run = useRonic((s) => s.run);
 
-  const [channels, setChannels] = useState<MessagingPlatformItem[]>(() => withStoredRoutes(INITIAL_CHANNELS));
+  const [channels, setChannels] = useState<MessagingPlatformItem[]>(() => {
+    const routed = withStoredRoutes(INITIAL_CHANNELS);
+    if (typeof window === "undefined" || isTauri()) return routed;
+    return applyStoredCredentials(routed, readPreviewCredentials());
+  });
   const [selectedChannelId, setSelectedChannelId] = useState<string>("telegram");
   const [searchQuery, setSearchQuery] = useState<string>("");
   const [statusFilter, setStatusFilter] = useState<"all" | "connected" | "attention">("all");
 
-  // Per-channel draft credentials
-  const [credentialDrafts, setCredentialDrafts] = useState<Record<string, CredentialDraft>>({});
+  // Per-channel draft credentials. Desktop values load from the vault.
+  const [credentialDrafts, setCredentialDrafts] = useState<Record<string, CredentialDraft>>(() => {
+    if (typeof window === "undefined" || isTauri()) return {};
+    return draftsFromSaved(readPreviewCredentials());
+  });
 
   // Live backend connection state — polled from gateway_connections.rs
   const [liveConnections, setLiveConnections] = useState<Record<string, GatewayConnectionInfo>>({});
@@ -373,11 +431,21 @@ export default function RonicMessagingGateway() {
   const [qrError, setQrError] = useState<string>("");
   const [showSecretToken, setShowSecretToken] = useState<boolean>(false);
   const [savingCredentials, setSavingCredentials] = useState<boolean>(false);
+  const [scanning, setScanning] = useState(false);
+  const [scanNote, setScanNote] = useState("");
+  const [scanPaste, setScanPaste] = useState("");
+  const scanVideoRef = useRef<HTMLVideoElement>(null);
+  const scanStreamRef = useRef<MediaStream | null>(null);
+  const credentialsReady = useRef(!isTauri());
+  const reconnectSaved = useRef<Set<string>>(new Set());
+  const reconnectPending = useRef<Set<string>>(new Set());
   const [connecting, setConnecting] = useState<boolean>(false);
   const [sendingPush, setSendingPush] = useState<boolean>(false);
   const [simulating, setSimulating] = useState<boolean>(false);
   const [delegating, setDelegating] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
+  const [allowDraft, setAllowDraft] = useState("");
+  const [allowlistVersion, setAllowlistVersion] = useState(0);
   const pollRef = useRef<number>(0);
 
   // Push alert builder
@@ -400,10 +468,10 @@ export default function RonicMessagingGateway() {
     () => fleetMembers(snap?.profiles ?? [], snap?.botGroups ?? []),
     [snap?.profiles, snap?.botGroups],
   );
-  const fleetRef = useRef(fleet);
-  fleetRef.current = fleet;
   const draftsRef = useRef(credentialDrafts);
   draftsRef.current = credentialDrafts;
+  const selectedIdRef = useRef(selectedChannelId);
+  selectedIdRef.current = selectedChannelId;
   const deliverRef = useRef<(decision: Extract<RouteDecision, { ok: true }>, channelName: string) => Promise<void>>(async () => {});
 
   const pollBackend = useCallback(async () => {
@@ -424,58 +492,68 @@ export default function RonicMessagingGateway() {
         }
       }
       setLiveConnections(map);
+      if (credentialsReady.current) {
+        for (const info of infos) {
+          if (info.state !== "Connected") continue;
+          if (reconnectSaved.current.has(info.channel_id) || reconnectPending.current.has(info.channel_id)) continue;
+          const channel = channelsRef.current.find((item) => item.id === info.channel_id);
+          if (!channel) continue;
+          const draft = draftFor(draftsRef.current, channel);
+          const token = (draft.token.trim() || channel.botTokenMasked.trim()).replace(/^pair$/, "");
+          if (!token && info.channel_id !== "whatsapp") continue;
+          reconnectPending.current.add(info.channel_id);
+          const saved = { ...draft, token };
+          void persistGatewayCredentials(info.channel_id, saved, true)
+            .then(() => {
+              reconnectSaved.current.add(info.channel_id);
+            })
+            .finally(() => {
+              reconnectPending.current.delete(info.channel_id);
+            });
+        }
+      }
 
-      // Sync channel statuses with live backend state
+      // The listener can already be Connected when this screen mounts.
+      // Copy that into `enabled`, or every route is refused as if it were off.
       setChannels((prev) =>
         prev.map((ch) => {
           const live = map[ch.id];
           if (!live) return ch;
-          return {
-            ...ch,
-            status: liveStateToStatus(live.state),
-            conflictError: live.error ?? undefined,
-          };
+          const synced = syncChannelFromLive(ch, live);
+          const ownerUserId = ch.ownerUserId.trim() || (live.owner_id || "").trim();
+          if (
+            synced.status === ch.status
+            && synced.enabled === ch.enabled
+            && ownerUserId === ch.ownerUserId
+            && (synced.conflictError ?? "") === (ch.conflictError ?? "")
+          ) return ch;
+          return { ...synced, ownerUserId };
         })
       );
-
-      // Drain incoming messages only while at least one channel is live
-      const anyConnected = infos.some((info) => info.state === "Connected");
-      if (!anyConnected) return;
-      const messages = await invokeRaw<IncomingGatewayMessage[]>("gateway_poll_messages", {});
-      for (const msg of messages) {
-        pushLog(`[${msg.channel_id} ← ${msg.sender_display}] ${msg.text}`);
-        const channel = channelsRef.current.find((item) => item.id === msg.channel_id);
+      const ownerPatch: Record<string, CredentialDraft> = {};
+      for (const info of infos) {
+        const stored = (info.owner_id || "").trim();
+        if (!stored) continue;
+        const channel = channelsRef.current.find((item) => item.id === info.channel_id);
         if (!channel) continue;
-        const allow = allowlistFromDraft(draftFor(draftsRef.current, channel));
-        const sender = msg.sender_id.trim();
-        if (!allow.length || !allow.includes(sender)) {
-          pushLog(`[BLOCKED] ${msg.channel_id} message from ${sender || "unknown"} is not on the owner allowlist.`);
-          continue;
-        }
-        const trimmed = msg.text.trim();
-        const action = inboundChiefAction(trimmed);
-        const chiefCommand = Boolean(action && (action.callback || trimmed === "/chief" || trimmed.startsWith("/chief ")));
-        if (chiefCommand && action) {
-          const res = await useRonic.getState().run("handle_mobile_chief_command", {
-            channelId: msg.channel_id,
-            senderId: msg.sender_id,
-            chatId: msg.chat_id,
-            text: action.text,
-            callback: action.callback,
-          });
-          const payload = res?.payload as { card?: string; delivered?: boolean; deliveryError?: string | null } | undefined;
-          if (payload?.card) pushLog(payload.card);
-          else pushLog(res?.toast || useRonic.getState().toast || "Chief delegation did not run.");
-          if (payload && payload.delivered === false && payload.deliveryError) pushLog(`Phone delivery: ${payload.deliveryError}`);
-          continue;
-        }
-        const decision = resolveInboundRoute(trimmed, channel, fleetRef.current);
-        if (!decision.ok) {
-          pushLog(`[${channel.name}] ${decision.reason}`);
-          continue;
-        }
-        await deliverRef.current(decision, channel.name);
+        const draft = draftFor(draftsRef.current, channel);
+        if (draft.ownerId.trim()) continue;
+        ownerPatch[info.channel_id] = { ...draft, ownerId: stored };
       }
+      if (Object.keys(ownerPatch).length) {
+        draftsRef.current = { ...draftsRef.current, ...ownerPatch };
+        setCredentialDrafts((prev) => {
+          let changed = false;
+          const next = { ...prev };
+          for (const [id, draft] of Object.entries(ownerPatch)) {
+            if (prev[id]?.ownerId.trim()) continue;
+            next[id] = { ...(prev[id] ?? draft), ownerId: draft.ownerId };
+            changed = true;
+          }
+          return changed ? next : prev;
+        });
+      }
+
     } catch {
       // Backend not ready yet
     }
@@ -488,6 +566,78 @@ export default function RonicMessagingGateway() {
     return () => window.clearInterval(pollRef.current);
   }, [pollBackend]);
 
+  useEffect(() => {
+    if (!isTauri()) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const saved = await invokeRaw<Record<string, SavedGatewayCredential>>("gateway_load_credentials", {});
+        if (cancelled || !saved) return;
+        const file = parseSavedCredentials(saved);
+        setCredentialDrafts((prev) => {
+          const next = { ...prev };
+          for (const [id, draft] of Object.entries(draftsFromSaved(file))) {
+            const existing = prev[id];
+            if (existing && (existing.token.trim() || existing.ownerId.trim() || existing.extras.length > 0)) continue;
+            next[id] = draft;
+          }
+          return next;
+        });
+        setChannels((prev) => applyStoredCredentials(prev, file));
+        credentialsReady.current = true;
+      } catch (error) {
+        if (!cancelled) pushLog(`Saved credentials did not load: ${String(error)}`);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [pushLog]);
+
+  useEffect(() => {
+    return () => {
+      scanStreamRef.current?.getTracks().forEach((track) => track.stop());
+      scanStreamRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!scanning) return;
+    const video = scanVideoRef.current;
+    const stream = scanStreamRef.current;
+    const reader = barcodeReader();
+    if (!video || !stream || !reader) return;
+    video.srcObject = stream;
+    void video.play().catch(() => undefined);
+    const watch = window.setInterval(() => {
+      void reader.detect(video).then((codes) => {
+        const value = codes[0]?.rawValue?.trim() ?? "";
+        if (!value) return;
+        window.clearInterval(watch);
+        scanStreamRef.current?.getTracks().forEach((track) => track.stop());
+        scanStreamRef.current = null;
+        setScanning(false);
+        void applyScannedText(value);
+      }).catch(() => undefined);
+    }, 400);
+    return () => window.clearInterval(watch);
+  }, [scanning]);
+
+  useEffect(() => {
+    const onLog = (event: Event) => {
+      const detail = (event as CustomEvent<string>).detail;
+      if (typeof detail === "string" && detail.trim()) pushLog(detail);
+    };
+    window.addEventListener("ronic-gateway-log", onLog);
+    return () => window.removeEventListener("ronic-gateway-log", onLog);
+  }, [pushLog]);
+
+  useEffect(() => {
+    const bump = () => setAllowlistVersion((version) => version + 1);
+    window.addEventListener("ronic-gateway-allowlist", bump);
+    return () => window.removeEventListener("ronic-gateway-allowlist", bump);
+  }, []);
+
   // ── Derived state ───────────────────────────────────────────
 
   const activeChannel = useMemo(
@@ -497,6 +647,19 @@ export default function RonicMessagingGateway() {
 
   const activeLive = liveConnections[activeChannel.id];
   const activeDraft = draftFor(credentialDrafts, activeChannel);
+  const liveOwnerId = (activeLive?.owner_id || activeChannel.ownerUserId || "").trim();
+  const allowedOwners = useMemo(
+    () => inboundAllowlist(activeChannel.id, liveOwnerId),
+    [activeChannel.id, liveOwnerId, allowlistVersion],
+  );
+  const blockedSender = useMemo(
+    () => lastBlockedSender(activeChannel.id),
+    [activeChannel.id, allowlistVersion],
+  );
+  const blockedStillOut = Boolean(
+    blockedSender
+    && !allowedOwners.some((id) => id.toLowerCase() === blockedSender.senderId.toLowerCase()),
+  );
   const activeQr = localQr[activeChannel.id];
   const routableFleet = fleet.filter((member) =>
     activeChannel.routableBots.some((handle) => handle.toLowerCase() === member.handle.toLowerCase()),
@@ -569,40 +732,52 @@ export default function RonicMessagingGateway() {
   // Handlers — wired to the real gateway_connections backend
   // ─────────────────────────────────────────────────────────────
 
-  const openPairingQr = useCallback(async (channelId: string) => {
+  const openPairingQr = useCallback(async (channelId: string, force = false) => {
     setShowQrPanel(true);
     setQrError("");
-    const uri = pairingUri(channelId, newPairingCode());
-    try {
-      const dataUrl = await pairingQrDataUrl(uri);
-      setLocalQr((prev) => ({ ...prev, [channelId]: { uri, dataUrl } }));
-    } catch (error) {
-      setQrError(error instanceof Error ? error.message : String(error));
+    if (!isTauri()) {
+      setQrError(
+        channelId === "whatsapp"
+          ? "WhatsApp linking runs in the desktop app. Open this channel there, then scan from WhatsApp → Linked devices → Link a device."
+          : "Pairing runs in the desktop app. Open this channel there, then scan from a phone on the same Wi-Fi.",
+      );
+      return;
     }
-    if (!isTauri()) return;
     try {
-      const info = await invokeRaw<GatewayConnectionInfo>("gateway_pairing_qr", { channelId });
+      const info = await invokeRaw<GatewayConnectionInfo>("gateway_pairing_qr", { channelId, force });
       setLiveConnections((prev) => ({ ...prev, [channelId]: info }));
       if (info.qr_png_base64) {
         setLocalQr((prev) => ({
           ...prev,
           [channelId]: {
-            uri: info.qr_uri || uri,
+            uri: info.qr_uri || "",
             dataUrl: `data:image/png;base64,${info.qr_png_base64}`,
           },
         }));
+        return;
       }
-    } catch {
-      // Desktop builds from before this command still show the code generated above.
+      if (info.qr_uri) {
+        const dataUrl = await pairingQrDataUrl(info.qr_uri);
+        setLocalQr((prev) => ({ ...prev, [channelId]: { uri: info.qr_uri || "", dataUrl } }));
+        return;
+      }
+      setLocalQr((prev) => {
+        if (!prev[channelId]) return prev;
+        const next = { ...prev };
+        delete next[channelId];
+        return next;
+      });
+    } catch (error) {
+      setQrError(error instanceof Error ? error.message : String(error));
     }
   }, []);
 
   const pairingStarted = useRef<Set<string>>(new Set());
   useEffect(() => {
-    if (!channelUsesQrPairing(selectedChannelId)) return;
-    if (pairingStarted.current.has(selectedChannelId)) return;
-    pairingStarted.current.add(selectedChannelId);
-    void openPairingQr(selectedChannelId);
+    if (selectedChannelId !== "whatsapp") return;
+    if (pairingStarted.current.has("whatsapp")) return;
+    pairingStarted.current.add("whatsapp");
+    void openPairingQr("whatsapp");
   }, [selectedChannelId, openPairingQr]);
 
   const deliverRouted = useCallback(async (
@@ -619,31 +794,15 @@ export default function RonicMessagingGateway() {
       pushLog(`${decision.handle} has no profile to receive this message.`);
       return;
     }
-    const prevThread = current.activeThreadId;
-    const prevProfile = current.activeProfileId;
     const title = `Gateway · ${channelName}`;
     try {
-      await run("switch_profile", { profileId: decision.botId });
-      const after = useRonic.getState().snap;
-      const existing = after?.threads.find((thread) =>
-        thread.botProfileId === decision.botId && thread.title === title && thread.targetType !== "bot_group",
-      );
-      if (existing) await run("select_thread", { threadId: existing.id });
-      else await run("create_thread", { title });
       const prompt = decision.kind === "group"
         ? `[${channelName} → ${decision.handle}] ${decision.prompt}`
         : `[${channelName}] ${decision.prompt}`;
-      await run("send_message", { prompt });
+      await runGatewayTurn(run, () => useRonic.getState().snap, bot, channelName, prompt);
       pushLog(`Routed to ${decision.handle}. The reply is in that bot's "${title}" task.`);
     } catch (error) {
       pushLog(`Route to ${decision.handle} failed: ${String(error)}`);
-    } finally {
-      const latest = useRonic.getState().snap;
-      if (prevThread && latest?.threads.some((thread) => thread.id === prevThread)) {
-        await run("select_thread", { threadId: prevThread });
-      } else if (prevProfile && prevProfile !== decision.botId) {
-        await run("switch_profile", { profileId: prevProfile });
-      }
     }
   }, [pushLog, run]);
   deliverRef.current = deliverRouted;
@@ -743,13 +902,25 @@ export default function RonicMessagingGateway() {
             )
           );
 
+          if (ownerId.trim()) allowOwner(ch.id, ownerId, ownerId);
+          const savedToken = token === "pair" ? "" : token;
+          try {
+            await persistGatewayCredentials(ch.id, { token: savedToken, ownerId, extras }, info.state === "Connected");
+          } catch (saveError) {
+            pushLog(`[${ch.name}] Connected, but the credentials were not saved: ${String(saveError)}`);
+          }
           if (info.state === "Connected") {
+            reconnectSaved.current.add(ch.id);
             pushLog(
               `[${ch.name}] ✓ Connected as ${info.platform_user ?? "unknown"} — real-time message listener active.`
             );
             showToast(`${ch.name} connected`);
-          } else if (info.state === "AwaitingQrScan") {
-            pushLog(`[${ch.name}] QR pairing is ready — scan the code with your phone.`);
+          } else if (info.state === "AwaitingQrScan" || (ch.id === "whatsapp" && info.state === "Connecting")) {
+            pushLog(
+              ch.id === "whatsapp"
+                ? `[${ch.name}] Linked-device QR is starting. On the phone: WhatsApp → Linked devices → Link a device.`
+                : `[${ch.name}] QR pairing is ready — scan the code with your phone.`,
+            );
             showToast("Scan the pairing QR");
           } else if (info.error) {
             pushLog(`[${ch.name}] ✗ Connection failed: ${info.error}`);
@@ -780,16 +951,165 @@ export default function RonicMessagingGateway() {
     setConnecting(false);
   };
 
+  const handleAllowOwner = (raw: string) => {
+    const id = raw.trim();
+    if (!id) {
+      showToast("Enter the sender id to allow");
+      return;
+    }
+    const live = (liveConnections[activeChannel.id]?.owner_id || activeChannel.ownerUserId || "").trim();
+    const next = allowOwner(activeChannel.id, live, id);
+    clearBlockedSender(activeChannel.id, id);
+    if (!activeDraft.ownerId.trim()) updateDraft(activeChannel.id, { ownerId: id });
+    setAllowDraft("");
+    setAllowlistVersion((version) => version + 1);
+    pushLog(`[${activeChannel.name}] Owner allowlist now includes ${next.join(", ")}. Send a new message from ${id}.`);
+    showToast(`${id} is on the owner allowlist`);
+  };
+
+  const handleRemoveOwner = (id: string) => {
+    const live = (liveConnections[activeChannel.id]?.owner_id || activeChannel.ownerUserId || "").trim();
+    const next = removeAllowedOwner(activeChannel.id, live, id);
+    setAllowlistVersion((version) => version + 1);
+    pushLog(
+      next.length
+        ? `[${activeChannel.name}] Removed ${id} from the owner allowlist.`
+        : `[${activeChannel.name}] Owner allowlist is empty. The next person who messages the bot is allowed.`,
+    );
+    showToast(`Removed ${id}`);
+  };
+
   const handleSaveCredentials = async () => {
     setSavingCredentials(true);
-    await new Promise((r) => setTimeout(r, 240));
-    setChannels((prev) =>
-      prev.map((c) => (c.id === activeChannel.id ? applySaveCredentials(c, activeDraft) : c))
-    );
-    const extraCount = usableExtras(activeDraft.extras).length;
-    pushLog(`[${activeChannel.name}] Credentials kept for this session.${extraCount ? ` ${extraCount} optional extra${extraCount === 1 ? "" : "s"} included.` : ""}`);
-    showToast("Credentials saved");
-    setSavingCredentials(false);
+    try {
+      const reconnect = activeDraft.token.trim() || activeChannel.id === "whatsapp" ? undefined : false;
+      await persistGatewayCredentials(activeChannel.id, activeDraft, reconnect);
+      setChannels((prev) =>
+        prev.map((c) => (c.id === activeChannel.id ? applySaveCredentials(c, activeDraft) : c))
+      );
+      const live = (liveConnections[activeChannel.id]?.owner_id || "").trim();
+      for (const id of allowlistFromDraft(activeDraft)) allowOwner(activeChannel.id, live, id);
+      setAllowlistVersion((version) => version + 1);
+      const extraCount = usableExtras(activeDraft.extras).length;
+      pushLog(`[${activeChannel.name}] Credentials saved on this computer.${extraCount ? ` ${extraCount} optional extra${extraCount === 1 ? "" : "s"} included.` : ""}`);
+      showToast("Credentials saved");
+    } catch (error) {
+      pushLog(`[${activeChannel.name}] Credentials were not saved: ${String(error)}`);
+      showToast("Credentials were not saved");
+    } finally {
+      setSavingCredentials(false);
+    }
+  };
+
+  const stopScanner = () => {
+    scanStreamRef.current?.getTracks().forEach((track) => track.stop());
+    scanStreamRef.current = null;
+    setScanning(false);
+  };
+
+  const applyScannedText = async (text: string) => {
+    const result = interpretScannedGatewayQr(text, selectedIdRef.current);
+    if (!result.ok) {
+      setScanNote(result.reason);
+      return;
+    }
+    if (result.kind === "whatsapp_link") {
+      try {
+        const dataUrl = await pairingQrDataUrl(result.token);
+        setSelectedChannelId("whatsapp");
+        setLocalQr((prev) => ({ ...prev, whatsapp: { uri: "", dataUrl } }));
+        setShowQrPanel(true);
+        setScanNote(result.note);
+        showToast("Scan this code from WhatsApp");
+      } catch (error) {
+        setScanNote(error instanceof Error ? error.message : String(error));
+      }
+      return;
+    }
+    const channel = channelsRef.current.find((item) => item.id === result.channelId);
+    const current = channel
+      ? draftFor(draftsRef.current, channel)
+      : { token: "", ownerId: "", extras: [] as ExtraCredential[] };
+    const draft = { ...current, token: result.token };
+    updateDraft(result.channelId, { token: result.token });
+    setSelectedChannelId(result.channelId);
+    try {
+      await persistGatewayCredentials(result.channelId, draft);
+      setChannels((prev) => prev.map((item) => (item.id === result.channelId ? applySaveCredentials(item, draft) : item)));
+      setScanNote(result.note);
+      showToast("QR saved");
+    } catch (error) {
+      setScanNote(`The QR was read, but it was not saved: ${String(error)}`);
+      return;
+    }
+    if (!isTauri() || !["telegram", "discord", "slack", "whatsapp"].includes(result.channelId)) return;
+    if (channel?.status === "connected") return;
+    try {
+      const info = await invokeRaw<GatewayConnectionInfo>("gateway_connect", {
+        channelId: result.channelId,
+        token: result.token,
+        ownerId: draft.ownerId,
+      });
+      setLiveConnections((prev) => ({ ...prev, [result.channelId]: info }));
+      setChannels((prev) => prev.map((item) => (
+        item.id === result.channelId
+          ? { ...item, status: liveStateToStatus(info.state), enabled: info.state === "Connected", conflictError: info.error ?? undefined }
+          : item
+      )));
+      if (info.state === "Connected") {
+        await persistGatewayCredentials(result.channelId, draft, true);
+        reconnectSaved.current.add(result.channelId);
+        showToast("Gateway connected");
+      } else if (info.error) {
+        setScanNote(info.error);
+      }
+    } catch (error) {
+      setScanNote(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const startScanner = async () => {
+    const reader = barcodeReader();
+    if (!reader) {
+      setScanNote("This view cannot open a camera decoder. Paste the text from the QR below, or choose an image.");
+      return;
+    }
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setScanNote("This view has no camera. Paste the text from the QR, or choose an image.");
+      return;
+    }
+    try {
+      stopScanner();
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }, audio: false });
+      scanStreamRef.current = stream;
+      setScanning(true);
+      setScanNote("Point the camera at the QR code.");
+    } catch (error) {
+      stopScanner();
+      setScanNote(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const scanImageFile = async (file: File | undefined) => {
+    if (!file) return;
+    const reader = barcodeReader();
+    if (!reader) {
+      setScanNote("This view cannot read a QR image. Paste the text from the QR below.");
+      return;
+    }
+    try {
+      const bitmap = await createImageBitmap(file);
+      const codes = await reader.detect(bitmap);
+      bitmap.close();
+      const value = codes[0]?.rawValue?.trim() ?? "";
+      if (!value) {
+        setScanNote("No QR code was found in that image.");
+        return;
+      }
+      await applyScannedText(value);
+    } catch (error) {
+      setScanNote(error instanceof Error ? error.message : String(error));
+    }
   };
 
   const handleToggleBotOnChannel = (botHandle: string) => {
@@ -811,9 +1131,9 @@ export default function RonicMessagingGateway() {
     if (sendingPush) return;
     if (!canSendPush(activeChannel)) {
       pushLog(
-        `[BLOCKED • NOT CONNECTED] Push alert to ${activeChannel.name} dropped — channel is '${activeChannel.status}'.`
+        `[BLOCKED] Push alert to ${activeChannel.name} dropped — ${pushBlockReason(activeChannel)}.`
       );
-      showToast(`${activeChannel.name} is not connected`);
+      showToast(`${activeChannel.name} is not ready`);
       return;
     }
 
@@ -869,9 +1189,9 @@ export default function RonicMessagingGateway() {
     }
     if (!canSendPush(activeChannel)) {
       pushLog(
-        `[BLOCKED • NOT CONNECTED] ${decision.handle} is routable, but ${activeChannel.name} is '${activeChannel.status}'.`
+        `[BLOCKED] ${decision.handle} is routable, but ${activeChannel.name}: ${pushBlockReason(activeChannel)}.`
       );
-      showToast(`${activeChannel.name} is not connected`);
+      showToast(`${activeChannel.name} is not ready`);
       return;
     }
     setSimulating(true);
@@ -895,6 +1215,7 @@ export default function RonicMessagingGateway() {
       const res = await useRonic.getState().run("handle_mobile_chief_command", {
         channelId: activeChannel.id,
         senderId,
+        senderDisplay: "",
         chatId: senderId,
         text,
         callback: "",
@@ -1107,14 +1428,10 @@ export default function RonicMessagingGateway() {
                   type="button"
                   onClick={() => {
                     if (channelUsesQrPairing(activeChannel.id)) {
-                      void openPairingQr(activeChannel.id);
+                      void openPairingQr(activeChannel.id, true);
                       return;
                     }
-                    setShowQrPanel((open) => {
-                      const next = !open;
-                      if (next) void openPairingQr(activeChannel.id);
-                      return next;
-                    });
+                    setShowQrPanel((open) => !open);
                   }}
                   className="px-4 py-2 text-xs font-semibold bg-white border border-slate-200 text-slate-700 rounded-full hover:bg-slate-50 hover:text-slate-900 transition-all cursor-pointer shadow-xs active:scale-95 flex items-center gap-1.5"
                 >
@@ -1123,8 +1440,8 @@ export default function RonicMessagingGateway() {
                     {channelUsesQrPairing(activeChannel.id)
                       ? "Refresh QR"
                       : showQrPanel
-                      ? "Hide pairing"
-                      : "Pair mobile"}
+                      ? "Hide"
+                      : "How to connect"}
                   </span>
                 </button>
                 <button
@@ -1200,8 +1517,20 @@ export default function RonicMessagingGateway() {
               </div>
             )}
 
+            {showQrPanel && !channelUsesQrPairing(activeChannel.id) && (
+              <div className="rounded-2xl border border-slate-200 bg-slate-50 p-5 space-y-2">
+                <div className="text-sm font-bold text-slate-900">
+                  Connect {activeChannel.name}
+                </div>
+                <p className="text-xs text-slate-600 leading-relaxed">
+                  Paste the bot token or scan a QR that contains it. Save stores it on this computer.
+                  Then choose Connect gateway and turn on one bot. If the owner field is empty, the first person who messages the bot is saved as the owner.
+                </p>
+              </div>
+            )}
+
             {/* QR Pairing Panel */}
-            {(showQrPanel || channelUsesQrPairing(activeChannel.id)) && (
+            {channelUsesQrPairing(activeChannel.id) && (
               <div className="rounded-2xl border border-slate-200 bg-slate-50 p-5 space-y-4">
                 <div className="flex flex-wrap items-center gap-5">
                   {activeQr?.dataUrl ? (
@@ -1214,7 +1543,14 @@ export default function RonicMessagingGateway() {
                     <div className="w-44 h-44 shrink-0 rounded-2xl border-2 border-dashed border-slate-300 bg-white flex flex-col items-center justify-center p-4 text-center">
                       <QrCode className="text-slate-300 mb-1" size={28} />
                       <span className="text-[11px] text-slate-400">
-                        {qrError || "Generating pairing QR…"}
+                        {activeLive?.state === "Connected"
+                          ? "This channel is connected."
+                          : activeLive?.state === "Error" && activeLive.error
+                          ? activeLive.error
+                          : qrError
+                          || (activeChannel.id === "whatsapp"
+                            ? "Asking WhatsApp for a link code…"
+                            : "Press New code for a same-Wi-Fi page, or scan the gateway QR below.")}
                       </span>
                     </div>
                   )}
@@ -1223,9 +1559,21 @@ export default function RonicMessagingGateway() {
                       Pairing QR for {activeChannel.name}
                     </div>
                     <p className="text-xs text-slate-600 leading-relaxed">
-                      Point your phone camera at this code. It is a scannable pairing link for this channel. WhatsApp, Signal, WeChat, and iMessage show a code as soon as you open them. A bot token is optional on those channels.
+                      {activeChannel.id === "whatsapp"
+                        ? whatsappLinkInstructions()
+                        : "Open the camera on a phone that is on the same Wi-Fi as this computer and tap the link. Confirm on the page that opens. This channel connects when that page says the phone is paired. The code pairs Ronic OS. It does not log in to Signal, WeChat, or iMessage."}
                     </p>
-                    {activeQr?.uri && (
+                    {activeChannel.id !== "whatsapp" && activeQr?.uri?.includes("127.0.0.1") && (
+                      <p className="text-xs text-amber-800 leading-relaxed">
+                        This computer has no network address a phone can reach. Join Wi-Fi and press Refresh QR.
+                      </p>
+                    )}
+                    {activeChannel.id !== "whatsapp" && (
+                      <p className="text-xs text-slate-500 leading-relaxed">
+                        If the phone cannot open the page, allow Ronic OS on private networks when Windows asks.
+                      </p>
+                    )}
+                    {activeChannel.id !== "whatsapp" && activeQr?.uri && (
                       <p className="text-xs text-slate-500 break-all font-mono bg-white p-2 rounded-xl border border-slate-200">
                         {activeQr.uri}
                       </p>
@@ -1233,7 +1581,7 @@ export default function RonicMessagingGateway() {
                     <div className="flex flex-wrap items-center gap-2">
                       <button
                         type="button"
-                        onClick={() => void openPairingQr(activeChannel.id)}
+                        onClick={() => void openPairingQr(activeChannel.id, true)}
                         className="px-3.5 py-1.5 text-xs font-semibold bg-white border border-slate-200 text-slate-700 rounded-full hover:bg-slate-50 cursor-pointer"
                       >
                         New code
@@ -1241,16 +1589,86 @@ export default function RonicMessagingGateway() {
                       <p className="text-xs text-emerald-700 font-semibold flex items-center gap-1.5">
                         <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
                         {activeLive?.state === "AwaitingQrScan"
-                          ? "Desktop listener is waiting for a scan."
+                          ? activeChannel.id === "whatsapp"
+                            ? "Waiting for WhatsApp to accept the scan."
+                            : "Waiting for the phone to confirm."
+                          : activeLive?.state === "Connecting" && activeChannel.id === "whatsapp"
+                          ? "Asking WhatsApp for a link code…"
                           : activeLive?.state === "Connected"
                           ? "This channel is already connected."
-                          : "The code is ready to scan."}
+                          : activeQr?.dataUrl
+                          ? "The code is ready to scan."
+                          : "No code on screen yet."}
                       </p>
                     </div>
                   </div>
                 </div>
               </div>
             )}
+
+            <div className="rounded-2xl border border-slate-200 bg-slate-50 p-5 space-y-3">
+              <div>
+                <h3 className="text-sm font-bold text-slate-900">Scan a gateway QR</h3>
+                <p className="text-xs text-slate-600 mt-1 leading-relaxed">
+                  Point the camera at the QR that Telegram, WhatsApp, or the other gateway shows. A bot token is saved and used to connect. A WhatsApp linked-device code is shown here so the phone can scan it from Linked devices.
+                </p>
+              </div>
+              {scanning && (
+                <video
+                  ref={scanVideoRef}
+                  className="w-full max-w-xs rounded-2xl border border-slate-300 bg-black"
+                  muted
+                  playsInline
+                />
+              )}
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => { if (scanning) stopScanner(); else void startScanner(); }}
+                  className="px-3.5 py-1.5 text-xs font-semibold bg-zinc-800 text-white rounded-full cursor-pointer inline-flex items-center gap-1.5"
+                >
+                  <Camera size={13} />
+                  {scanning ? "Stop camera" : "Use camera"}
+                </button>
+                <label className="px-3.5 py-1.5 text-xs font-semibold bg-white border border-slate-200 text-slate-700 rounded-full cursor-pointer inline-flex items-center gap-1.5">
+                  <Upload size={13} />
+                  Choose image
+                  <input
+                    type="file"
+                    accept="image/*"
+                    className="hidden"
+                    onChange={(event) => {
+                      const file = event.target.files?.[0];
+                      event.target.value = "";
+                      void scanImageFile(file);
+                    }}
+                  />
+                </label>
+              </div>
+              <div className="flex flex-col sm:flex-row gap-2">
+                <input
+                  type="text"
+                  value={scanPaste}
+                  onChange={(event) => setScanPaste(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      void applyScannedText(scanPaste);
+                    }
+                  }}
+                  placeholder="Or paste the QR text"
+                  className="flex-1 px-3.5 py-2 text-xs font-mono bg-white border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-slate-200"
+                />
+                <button
+                  type="button"
+                  onClick={() => void applyScannedText(scanPaste)}
+                  className="px-4 py-2 text-xs font-semibold bg-white border border-slate-200 text-slate-700 rounded-full cursor-pointer"
+                >
+                  Use text
+                </button>
+              </div>
+              {scanNote && <p className="text-xs text-slate-600 leading-relaxed">{scanNote}</p>}
+            </div>
 
             {/* Credentials Card */}
             <div className="rounded-2xl border border-slate-200/90 bg-white p-5 sm:p-6 shadow-xs space-y-4">
@@ -1262,7 +1680,7 @@ export default function RonicMessagingGateway() {
                   </p>
                 </div>
                 <span className="text-[11px] font-mono font-semibold px-2.5 py-1 bg-slate-50 text-slate-600 border border-slate-200 rounded-full flex items-center gap-1">
-                  <Lock size={10} /> This session
+                  <Lock size={10} /> Saved on this computer
                 </span>
               </div>
 
@@ -1310,12 +1728,82 @@ export default function RonicMessagingGateway() {
                     type="text"
                     value={activeDraft.ownerId}
                     onChange={(e) => updateDraft(activeChannel.id, { ownerId: e.target.value })}
-                    placeholder="e.g. 6194820194 or +91-98XXXXXX10"
+                    placeholder="e.g. 6194820194 or @username"
                     className="w-full px-3.5 py-2 text-xs font-mono bg-slate-50 border border-slate-200 rounded-xl focus:bg-white focus:outline-none focus:ring-2 focus:ring-slate-200 transition-all"
                   />
                   <span className="block text-[11px] text-slate-400 mt-1">
-                    Strict owner firewall: unlisted senders are automatically ignored.
+                    Used when you connect. To let a blocked sender through now, use Owner allowlist below.
                   </span>
+                </div>
+              </div>
+
+              <div className="rounded-2xl border border-slate-200 bg-slate-50/80 p-4 space-y-3">
+                <div>
+                  <h4 className="text-xs font-bold text-slate-900">Owner allowlist</h4>
+                  <p className="text-[11px] text-slate-500 mt-0.5 leading-relaxed">
+                    People on this list can message the bot. Allowing someone takes effect on the next message. You do not need to reconnect.
+                  </p>
+                </div>
+                {blockedStillOut && blockedSender && (
+                  <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2">
+                    <p className="text-xs text-amber-950">
+                      <span className="font-mono font-semibold">{blockedSender.senderId}</span>
+                      {blockedSender.senderDisplay ? ` · ${blockedSender.senderDisplay}` : ""} is blocked.
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => handleAllowOwner(blockedSender.senderId)}
+                      className="px-3.5 py-1.5 text-xs font-semibold bg-zinc-800 hover:bg-zinc-700 text-white rounded-full cursor-pointer"
+                    >
+                      Allow
+                    </button>
+                  </div>
+                )}
+                <div className="flex flex-col sm:flex-row gap-2">
+                  <input
+                    type="text"
+                    value={allowDraft}
+                    onChange={(event) => setAllowDraft(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") {
+                        event.preventDefault();
+                        handleAllowOwner(allowDraft.trim() || (blockedStillOut ? blockedSender?.senderId ?? "" : ""));
+                      }
+                    }}
+                    placeholder={blockedStillOut && blockedSender ? blockedSender.senderId : "Numeric id or @username"}
+                    className="flex-1 px-3.5 py-2 text-xs font-mono bg-white border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-slate-200"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => handleAllowOwner(allowDraft.trim() || (blockedStillOut ? blockedSender?.senderId ?? "" : ""))}
+                    className="px-5 py-2 text-xs font-semibold bg-zinc-800 hover:bg-zinc-700 text-white rounded-full cursor-pointer shadow-xs active:scale-95"
+                  >
+                    Owner allowlist
+                  </button>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {allowedOwners.length === 0 ? (
+                    <p className="text-[11px] text-slate-500">
+                      No owner yet. The next person who messages the bot is allowed, or type an id and press Owner allowlist.
+                    </p>
+                  ) : (
+                    allowedOwners.map((id) => (
+                      <span
+                        key={id}
+                        className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-white border border-slate-200 text-xs font-mono text-slate-800"
+                      >
+                        {id}
+                        <button
+                          type="button"
+                          onClick={() => handleRemoveOwner(id)}
+                          className="text-slate-400 hover:text-rose-600 cursor-pointer"
+                          aria-label={`Remove ${id} from the owner allowlist`}
+                        >
+                          <Trash2 size={12} />
+                        </button>
+                      </span>
+                    ))
+                  )}
                 </div>
               </div>
 
@@ -1393,7 +1881,7 @@ export default function RonicMessagingGateway() {
                       Add credential
                     </button>
                     <p className="text-[11px] text-slate-500 leading-relaxed">
-                      Name a Slack row “App token” to include it in Socket Mode. Name a row “Allowlisted sender” or “Chat ID” to let that id through the owner firewall. Name a WhatsApp row “Cloud API token” to use it when the bot token is empty. Any other row is kept for this session and is not required to connect.
+                      Name a Slack row “App token” to include it in Socket Mode. Name a row “Allowlisted sender” or “Chat ID” to let that id through the owner firewall. Name a WhatsApp row “Cloud API token” to use it when the bot token is empty. Save keeps every row on this computer.
                     </p>
                   </div>
                 )}

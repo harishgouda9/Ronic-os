@@ -57,6 +57,113 @@ fn clip80(text: &str) -> String {
     text.chars().take(80).collect()
 }
 
+fn fold_name(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+/// Exact name, or the clipped 80-character prefix the registry stored.
+fn names_match(stored: &str, live: &str) -> bool {
+    let stored_folded = fold_name(stored);
+    let live_folded = fold_name(live);
+    if stored_folded.is_empty() || live_folded.is_empty() {
+        return false;
+    }
+    if stored_folded == live_folded {
+        return true;
+    }
+    // clip80 keeps the first 80 characters, so that stored name is a prefix of the live one.
+    stored.chars().count() >= 80 && live_folded.starts_with(&stored_folded)
+}
+
+fn pick_mark(nodes: &[UIAControlNode], query: &str) -> std::result::Result<u32, String> {
+    let wanted = fold_name(query);
+    if wanted.is_empty() {
+        return Err("name the desktop control to use".into());
+    }
+    let mut best: Vec<(u32, String)> = Vec::new();
+    let mut top = 0i32;
+    for node in nodes {
+        if node.origin == "simulated" {
+            continue;
+        }
+        let name = fold_name(&node.name);
+        if name.is_empty() {
+            continue;
+        }
+        let score = if name == wanted {
+            100
+        } else if name.split(' ').any(|word| word == wanted) {
+            80
+        } else if name.contains(&wanted) {
+            50
+        } else {
+            0
+        };
+        if score == 0 {
+            continue;
+        }
+        if score > top {
+            top = score;
+            best.clear();
+        }
+        if score == top {
+            best.push((node.mark_id, node.name.clone()));
+        }
+    }
+    if best.is_empty() {
+        return Err(format!("no desktop control matching '{query}'. Inspect the window first."));
+    }
+    if best.len() > 1 {
+        let names = best.iter().map(|(id, name)| format!("#{id} {name}")).collect::<Vec<_>>().join(", ");
+        return Err(format!("more than one control matches '{query}': {names}. Pass its mark id."));
+    }
+    Ok(best[0].0)
+}
+
+fn json_u32(value: &serde_json::Value) -> Option<u32> {
+    value.as_u64().and_then(|n| u32::try_from(n).ok()).or_else(|| value.as_str().and_then(|text| text.trim().parse().ok()))
+}
+
+/// Mark number, or the cached live control named by match / name / query.
+/// Never guesses mark 1.
+pub fn resolve_desktop_mark(args: &serde_json::Value) -> std::result::Result<u32, String> {
+    const ID_KEYS: [&str; 4] = ["mark_id", "markId", "mark", "id"];
+    for key in ID_KEYS {
+        if let Some(id) = args.get(key).and_then(json_u32) {
+            if id == 0 {
+                return Err("mark id 0 is not a control. Inspect the window and use the mark number it returned.".into());
+            }
+            return Ok(id);
+        }
+    }
+    let mut query = String::new();
+    for key in ["match", "name", "query"] {
+        if let Some(text) = args.get(key).and_then(|value| value.as_str()) {
+            let text = text.trim();
+            if !text.is_empty() {
+                query = text.to_string();
+                break;
+            }
+        }
+    }
+    if query.is_empty() {
+        for key in ID_KEYS {
+            if let Some(text) = args.get(key).and_then(|value| value.as_str()) {
+                let text = text.trim();
+                if !text.is_empty() {
+                    query = text.to_string();
+                    break;
+                }
+            }
+        }
+    }
+    if query.is_empty() {
+        return Err("pass a mark id from the last inspect, or match the control's name".into());
+    }
+    let nodes: Vec<UIAControlNode> = som_marks().values().cloned().collect();
+    pick_mark(&nodes, &query)
+}
+
 // ---------------------------------------------------------------------------
 // Data model
 // ---------------------------------------------------------------------------
@@ -123,6 +230,9 @@ pub struct MiniWindowMedia {
     pub current_time: f64,
     pub duration: f64,
     pub muted: bool,
+    /// "" | "skipped" | "waiting" | "unskippable". An ad is not the video.
+    #[serde(default)]
+    pub ad: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,6 +250,9 @@ pub struct MiniWindowHit {
     /// What a smart action picked, e.g. "clicked [12] button Add to cart".
     #[serde(default)]
     pub note: Option<String>,
+    /// "sign-in" | "no-composer" | "composer-ready" | "" — why a prompt cannot be written yet.
+    #[serde(default)]
+    pub blocker: String,
     pub ms: i64,
 }
 
@@ -236,13 +349,14 @@ pub const BOT_MINI_WINDOW_HUD_SCRIPT: &str = r#"(function(){
     if (!document.body) return;
     var cursor = document.createElement('div');
     cursor.id = 'ronic-virtual-bot-cursor';
-    cursor.style.cssText = 'position:fixed;left:50%;top:50%;width:16px;height:16px;border-radius:999px;background:rgba(16,185,129,0.85);border:2px solid #111111;z-index:2147483646;pointer-events:none;transition:all 140ms cubic-bezier(0.22,1,0.36,1);box-shadow:0 0 0 4px rgba(16,185,129,0.25);transform:translate(-50%,-50%);';
+    cursor.style.cssText = 'position:fixed;left:-40px;top:-40px;width:16px;height:16px;border-radius:999px;background:rgba(16,185,129,0.85);border:2px solid #111111;z-index:2147483646;pointer-events:none;display:none;transition:left 140ms cubic-bezier(0.22,1,0.36,1),top 140ms cubic-bezier(0.22,1,0.36,1);box-shadow:0 0 0 4px rgba(16,185,129,0.25);transform:translate(-50%,-50%);';
     document.body.appendChild(cursor);
     var label = document.createElement('div');
     label.style.cssText = 'position:fixed;z-index:2147483646;pointer-events:none;background:#111111;color:#10B981;font:600 9px/1 monospace;padding:3px 5px;border-radius:4px;transform:translate(10px,-4px);display:none;';
     document.body.appendChild(label);
     document.addEventListener('ronic-virtual-cursor', function (e) {
       var d = e.detail || {};
+      cursor.style.display = 'block';
       cursor.style.left = d.x + 'px';
       cursor.style.top = d.y + 'px';
       label.style.left = d.x + 'px';
@@ -397,7 +511,7 @@ fn spawn_mini_window(
                 window_label: label.clone(),
                 current_url_or_app: String::new(),
                 mode: "pip_isolated".into(),
-                virtual_cursor_xy: [490, 330],
+                virtual_cursor_xy: [24, 24],
                 active_driver: "Synthetic DOM (<15ms)".into(),
                 status: "running_isolated".into(),
             },
@@ -457,7 +571,7 @@ fn spawn_mini_window(
         window_label: label,
         current_url_or_app: current,
         mode: "pip_isolated".into(),
-        virtual_cursor_xy: [490, 330],
+        virtual_cursor_xy: [24, 24],
         active_driver: "Synthetic DOM (<15ms)".into(),
         status: "running_isolated".into(),
     };
@@ -509,8 +623,11 @@ pub fn ensure_chrome(app: &AppHandle, home: &std::path::Path, bot_id: &str, url:
         let blank = url::Url::parse("about:blank").expect("static url");
         let nav_bot = bot_id.trim().to_string();
         let nav_app = app.clone();
+        let export_label = label.clone();
+        let export_app = app.clone();
         let builder = WebviewBuilder::new(label.clone(), WebviewUrl::External(url.clone().unwrap_or(blank)))
             .initialization_script(BOT_MINI_WINDOW_HUD_SCRIPT)
+            .initialization_script(crate::workspace_bridge::PAGE_SCRIPT)
             .data_directory(dir)
             .on_navigation(move |nav_url| {
                 // The webview IS the active tab's surface — keep the tab strip,
@@ -536,6 +653,9 @@ pub fn ensure_chrome(app: &AppHandle, home: &std::path::Path, bot_id: &str, url:
                     sync_instance_summary(&nav_app, &nav_bot);
                     broadcast_shell(&nav_app, &nav_bot, "chrome");
                 }
+                if crate::site_session::worth_sharing(nav_url.as_str()) {
+                    crate::site_session::schedule_export(&export_app, &export_label);
+                }
                 true
             });
         let state = shell_state(bot_id);
@@ -549,15 +669,23 @@ pub fn ensure_chrome(app: &AppHandle, home: &std::path::Path, bot_id: &str, url:
         let webview = window
             .add_child(builder, tauri::PhysicalPosition::new(px, py), tauri::PhysicalSize::new(pw, ph))
             .map_err(|e| err(format!("failed to open the mini computer browser: {e}")))?;
+        let _ = webview.eval(crate::workspace_bridge::PAGE_SCRIPT);
         apply_chrome_visibility(app, bot_id);
+        // Sign-in from any other bot is applied before the first request.
+        crate::site_session::import_shared(&webview);
         if let Some(target) = url {
             let _ = webview.navigate(target);
         }
     } else if let Some(target) = url {
         let webview = app.get_webview(&label).ok_or_else(|| err("the mini computer browser vanished"))?;
+        // The page script no-ops once this document already has bridge v5.
+        let _ = webview.eval(crate::workspace_bridge::PAGE_SCRIPT);
+        crate::site_session::import_shared(&webview);
         let needs_nav = webview.url().ok().map(|current| current.as_str() != target.as_str()).unwrap_or(false);
         if needs_nav {
             let _ = webview.navigate(target);
+        } else if crate::site_session::should_reload_for_session(&label, target.as_str()) {
+            let _ = webview.reload();
         }
     }
     Ok(label)
@@ -889,13 +1017,29 @@ fn drive_labeled_window(
                     let id = control_index.ok_or_else(|| err("pick an input to type into"))?;
                     let text = text.unwrap_or_default();
                     if text.is_empty() {
-                        return Err(err("type the text to enter"));
+                        return Err(err("Stuck: there is no prompt text to write. This chat turn is still running. It is not a background job."));
                     }
-                    mini_type_js(id, &crate::util::prefix_utf8(text, 2000))
+                    let host = win.url().and_then(|page| page.host_str().map(|item| item.to_string())).unwrap_or_default();
+                    let pack = if crate::workspace_bridge::composer_injection_host(&host) {
+                        crate::workspace_bridge::live_context_pack(app)
+                    } else {
+                        String::new()
+                    };
+                    let injected = crate::workspace_bridge::inject_composer_text(&host, &pack, text);
+                    // A normal keystroke stays short. A context pack is appended for a
+                    // real prompt on any composer that is not a team-message site.
+                    let limit = if injected.contains("[Ronic OS connection]") { 12_000 } else { 2000 };
+                    mini_type_js(id, &crate::util::prefix_utf8(&injected, limit))
                 }
             };
-            act_eval(&win, &script)?;
-            poll_read_hit(&win, label, started, None, Duration::from_millis(1500))
+            let acted = act_eval(&win, &script)?;
+            let goto = acted.get("goto").and_then(|value| value.as_str()).filter(|url| !url.is_empty());
+            follow_link(&win, goto);
+            let mut hit = poll_read_hit(&win, label, started, goto, Duration::from_millis(if goto.is_some() { 2400 } else { 1200 }))?;
+            if let Some(note) = acted.get("note").and_then(|value| value.as_str()).filter(|note| !note.is_empty()) {
+                hit.note = Some(note.to_string());
+            }
+            Ok(hit)
         }
         "scroll" => {
             act_eval(&win, &mini_scroll_js(extra.unwrap_or("down")))?;
@@ -914,24 +1058,32 @@ fn drive_labeled_window(
     }
 }
 
-/// One action eval: surface the in-page error message, never retry.
-fn act_eval(win: &DriveSurface, script: &str) -> Result<()> {
-    let raw = eval_window_json(win, script, Duration::from_secs(3))?;
-    let value: serde_json::Value = serde_json::from_str(&raw).map_err(|_| err("the page did not answer with usable JSON"))?;
-    if value.get("ok").and_then(|v| v.as_bool()) == Some(false) {
-        let message = value.get("error").and_then(|v| v.as_str()).unwrap_or("the action failed");
-        return Err(err(message));
+/// A synthetic click does not follow `<a href>`. Open the address the page
+/// returned, under the same http/https rule as inspect_page.
+fn follow_link(win: &DriveSurface, goto: Option<&str>) {
+    let Some(raw) = goto else { return };
+    if let Ok(url) = agent_url_allowed(raw) {
+        win.navigate(url);
     }
-    Ok(())
+}
+
+/// One action eval: surface the in-page error message, never retry.
+/// The returned object carries a `note` when the action has something to say.
+fn act_eval(win: &DriveSurface, script: &str) -> Result<serde_json::Value> {
+    let raw = eval_window_json(win, script, Duration::from_secs(3)).map_err(|error| explain_stuck(&error.0))?;
+    let value: serde_json::Value = serde_json::from_str(&raw).map_err(|_| explain_stuck("the page did not answer with usable JSON"))?;
+    if value.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+        return Err(err(explain_from_value(&value)));
+    }
+    Ok(value)
 }
 
 /// Wraps a successful drive JSON (already carrying url/title/text/nodes) into
 /// a MiniWindowHit with the window label and latency attached.
 fn hit_from_json(raw: &str, label: &str, started: std::time::Instant) -> Result<MiniWindowHit> {
-    let mut value: serde_json::Value = serde_json::from_str(raw).map_err(|_| err("the page did not answer with usable JSON"))?;
+    let mut value: serde_json::Value = serde_json::from_str(raw).map_err(|_| explain_stuck("the page did not answer with usable JSON"))?;
     if value.get("ok").and_then(|v| v.as_bool()) == Some(false) {
-        let message = value.get("error").and_then(|v| v.as_str()).unwrap_or("the action failed");
-        return Err(err(message));
+        return Err(err(explain_from_value(&value)));
     }
     if let Some(object) = value.as_object_mut() {
         object.insert("windowLabel".into(), serde_json::json!(label));
@@ -970,28 +1122,138 @@ fn eval_window_json(win: &DriveSurface, script: &str, timeout: std::time::Durati
 /// zero-size elements — the junk that once made the bot type into YouTube's
 /// hidden file input), a rich label extractor, a relevance score, and the
 /// page collector (text, numbered controls, readyState, media state).
-const MINI_COLLECT_FN: &str = r#"function __ronicLabel(el){
-  var label = el.getAttribute("aria-label") || el.innerText || el.getAttribute("placeholder") || el.getAttribute("title") || el.getAttribute("name") || el.value || "";
-  return String(label).replace(/\s+/g, " ").trim().slice(0, 80);
+const MINI_COLLECT_FN: &str = r#"function __ronicIsEditor(el){
+  if (!el) return false;
+  var tag = String(el.tagName || "").toLowerCase();
+  if (tag === "textarea" || el.id === "PINHOLE_TEXT_AREA_ELEMENT_ID") return true;
+  if (el.getAttribute("data-slate-editor") === "true") return true;
+  if (el.isContentEditable || el.getAttribute("contenteditable") === "true") return true;
+  if (String(el.getAttribute("role") || "") === "textbox") return true;
+  if (tag === "input") {
+    var type = String(el.getAttribute("type") || "text").toLowerCase();
+    return type === "text" || type === "search" || type === "email" || type === "url" || type === "tel" || type === "password" || type === "";
+  }
+  return false;
+}
+function __ronicLabel(el){
+  var label = el.getAttribute("aria-label") || el.getAttribute("placeholder") || el.getAttribute("aria-placeholder") || el.getAttribute("data-placeholder") || el.innerText || el.getAttribute("title") || el.getAttribute("name") || el.value || "";
+  label = String(label).replace(/\s+/g, " ").trim().slice(0, 80);
+  if (!label && __ronicIsEditor(el)) label = "prompt";
+  return label;
+}
+function __ronicPushControl(out, el){
+  if (!el || out.length > 400) return;
+  var tag = String(el.tagName || "").toLowerCase();
+  var type = String(el.getAttribute("type") || "").toLowerCase();
+  if (tag === "input" && (type === "hidden" || type === "file")) return;
+  if (el.disabled) return;
+  if (!el.getClientRects().length) return;
+  var r = el.getBoundingClientRect();
+  if (r.width < 2 || r.height < 2) return;
+  if (__ronicIsEditor(el)) tag = "input";
+  out.push({ i: out.length + 1, el: el, tag: tag, label: __ronicLabel(el), x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) });
+}
+function __ronicWalk(root, out, depth){
+  if (!root || depth > 6 || out.length > 400) return;
+  var list;
+  try { list = root.querySelectorAll("a,button,input,select,textarea,[role=button],[role=textbox],[role=searchbox],[role=combobox],[role=tab],[contenteditable=true],[data-slate-editor=true]"); }
+  catch (e) { return; }
+  for (var i = 0; i < list.length; i++) __ronicPushControl(out, list[i]);
+  var hosts;
+  try { hosts = root.querySelectorAll("*"); } catch (e2) { return; }
+  var cap = hosts.length < 1500 ? hosts.length : 1500;
+  for (var j = 0; j < cap; j++) {
+    if (hosts[j].shadowRoot) __ronicWalk(hosts[j].shadowRoot, out, depth + 1);
+  }
 }
 function __ronicControls(){
   var out = [];
-  var list = document.querySelectorAll("a,button,input,select,textarea,[role=button],[role=textbox],[role=searchbox],[role=combobox],[role=tab],[contenteditable=true]");
-  for (var i = 0; i < list.length; i++) {
-    var el = list[i];
-    var tag = String(el.tagName || "").toLowerCase();
-    var type = String(el.getAttribute("type") || "").toLowerCase();
-    if (tag === "input" && (type === "hidden" || type === "file")) continue;
-    if (el.disabled) continue;
-    if (!el.getClientRects().length) continue;
-    var r = el.getBoundingClientRect();
-    if (r.width < 2 || r.height < 2) continue;
-    if (el.isContentEditable || el.getAttribute("contenteditable") === "true") {
-      tag = "input";
-    }
-    out.push({ i: out.length + 1, el: el, tag: tag, label: __ronicLabel(el), x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) });
-  }
+  __ronicWalk(document, out, 0);
   return out;
+}
+function __ronicIsFlow(){
+  var href = String(location.href || "");
+  return href.indexOf("labs.google") !== -1 && href.indexOf("/flow") !== -1;
+}
+function __ronicComposerScore(el){
+  if (!__ronicIsEditor(el)) return 0;
+  if (el.id === "PINHOLE_TEXT_AREA_ELEMENT_ID") return 100;
+  if (el.getAttribute("data-slate-editor") === "true") return 90;
+  var hint = String((el.getAttribute("placeholder") || "") + " " + (el.getAttribute("aria-label") || "") + " " + (el.getAttribute("aria-placeholder") || "")).toLowerCase();
+  if (hint.indexOf("video") !== -1 || hint.indexOf("generate") !== -1 || hint.indexOf("prompt") !== -1 || hint.indexOf("describe") !== -1) return 80;
+  if (String(el.getAttribute("role") || "") === "textbox") return 50;
+  if (String(el.tagName || "").toLowerCase() === "textarea") return 40;
+  return 10;
+}
+function __ronicBestComposer(list){
+  var best = null, score = 0;
+  for (var i = 0; i < list.length; i++) {
+    var s = __ronicComposerScore(list[i].el);
+    if (s > score) { score = s; best = list[i].el; }
+  }
+  return best ? { el: best, score: score } : null;
+}
+function __ronicBlocker(list){
+  var host = String(location.hostname || "");
+  if (host === "accounts.google.com" || host.indexOf(".accounts.google.com") !== -1) return "sign-in";
+  var best = __ronicBestComposer(list);
+  var score = best ? best.score : 0;
+  if (__ronicIsFlow() && score < 40) return "no-composer";
+  if (score >= 40) return "composer-ready";
+  for (var i = 0; i < list.length; i++) {
+    var label = String(list[i].label || "").toLowerCase();
+    if (label === "sign in" || label === "sign in with google") return "sign-in";
+  }
+  return "";
+}
+function __ronicFailCode(code){
+  return { ok: false, error: String(code), url: String(location.href || ""), title: String(document.title || "") };
+}
+function __ronicTypeTarget(list, index){
+  var direct = list[index];
+  if (direct && __ronicIsEditor(direct.el)) return { el: direct.el, via: "control" };
+  var best = __ronicBestComposer(list);
+  if (best && best.score >= 80) return { el: best.el, via: "composer" };
+  return null;
+}
+function __ronicHolds(got, wanted){
+  var have = String(got || "").replace(/\s+/g, " ").trim();
+  var need = String(wanted || "").replace(/\s+/g, " ").trim();
+  if (!need) return false;
+  var slice = need.slice(0, need.length < 48 ? need.length : 48);
+  return have.indexOf(slice) !== -1;
+}
+function __ronicWrite(el, value){
+  try { el.scrollIntoView({ block: "nearest", inline: "nearest" }); } catch (_) {}
+  var rect = el.getBoundingClientRect();
+  document.dispatchEvent(new CustomEvent("ronic-virtual-cursor", { detail: { x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2), tag: "input" } }));
+  el.focus();
+  var tag = String(el.tagName || "").toLowerCase();
+  var editable = el.isContentEditable || el.getAttribute("contenteditable") === "true" || el.getAttribute("data-slate-editor") === "true";
+  if ((tag === "textarea" || tag === "input") && !editable) {
+    var proto = tag === "textarea" ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+    var desc = Object.getOwnPropertyDescriptor(proto, "value");
+    if (desc && desc.set) desc.set.call(el, value); else el.value = value;
+    try { el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: value })); }
+    catch (e) { el.dispatchEvent(new Event("input", { bubbles: true })); }
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+    return String(el.value || "");
+  }
+  var sel = window.getSelection();
+  if (sel) {
+    var range = document.createRange();
+    range.selectNodeContents(el);
+    sel.removeAllRanges();
+    sel.addRange(range);
+  }
+  try { document.execCommand("insertText", false, value); } catch (e2) {}
+  var live = String(el.innerText || el.textContent || "");
+  if (!__ronicHolds(live, value)) {
+    try { el.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, cancelable: true, inputType: "insertText", data: value })); } catch (e3) {}
+    try { document.execCommand("insertText", false, value); } catch (e4) {}
+    live = String(el.innerText || el.textContent || "");
+  }
+  return live;
 }
 function __ronicScore(q, label, tag){
   var l = String(label).toLowerCase(), t = String(tag).toLowerCase();
@@ -1003,22 +1265,186 @@ function __ronicScore(q, label, tag){
   if ((t + " " + l).indexOf(q) !== -1) return 30;
   return 0;
 }
+function __ronicAdDecision(inAd, label, disabled) {
+  if (!inAd) return "";
+  var text = String(label || "").toLowerCase().replace(/\s+/g, " ").trim();
+  if (!text || disabled || text.indexOf("skip in") !== -1) return "waiting";
+  if (text === "skip" || text === "skip ad" || text === "skip ads" || text.indexOf("skip ad") === 0) return "skip";
+  return "waiting";
+}
+function __ronicFindSkip() {
+  var direct = document.querySelector(".ytp-ad-skip-button-modern, .ytp-ad-skip-button, .ytp-skip-ad-button, .videoAdUiSkipButton");
+  if (direct) return direct;
+  var root = document.querySelector(".html5-video-player.ad-showing, .ad-showing, .ima-ad-container, .videoAdUi, .ytp-ad-player-overlay");
+  if (!root) return null;
+  var list = root.querySelectorAll("button, [role=button]");
+  for (var i = 0; i < list.length; i++) {
+    var label = __ronicLabel(list[i]).toLowerCase();
+    if (label === "skip" || label === "skip ad" || label === "skip ads" || label.indexOf("skip ad") === 0 || label.indexOf("skip in") === 0) return list[i];
+  }
+  return null;
+}
+function __ronicFire(el, x, y) {
+  if (!el) return;
+  var rect = el.getBoundingClientRect();
+  if (x == null) {
+    x = Math.round(rect.left + rect.width / 2);
+    y = Math.round(rect.top + rect.height / 2);
+  }
+  document.dispatchEvent(new CustomEvent("ronic-virtual-cursor", { detail: { x: x, y: y, tag: String(el.tagName || "bot").toLowerCase() } }));
+  var common = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, button: 0 };
+  var types = ["pointerover", "pointerdown", "mousedown", "pointerup", "mouseup"];
+  for (var i = 0; i < types.length; i++) {
+    var type = types[i];
+    try { el.dispatchEvent(type.indexOf("pointer") === 0 ? new PointerEvent(type, common) : new MouseEvent(type, common)); } catch (e) {}
+  }
+  try { el.click(); } catch (e2) {}
+}
+function __ronicShown(el) {
+  if (!el || !el.getClientRects().length) return false;
+  var r = el.getBoundingClientRect();
+  return r.width > 2 && r.height > 2;
+}
+function __ronicInAd() {
+  if (document.querySelector(".html5-video-player.ad-showing")) return true;
+  var overlay = document.querySelector(".ytp-ad-player-overlay, .videoAdUi");
+  if (overlay && __ronicShown(overlay)) return true;
+  var skip = document.querySelector(".ytp-ad-skip-button-modern, .ytp-ad-skip-button, .ytp-skip-ad-button, .videoAdUiSkipButton");
+  return !!(skip && __ronicShown(skip));
+}
+function __ronicAdState() {
+  if (!__ronicInAd()) { window.__ronicAdSeen = 0; return ""; }
+  if (!window.__ronicAdSeen) window.__ronicAdSeen = Date.now();
+  var skip = __ronicFindSkip();
+  var disabled = !!(skip && (skip.disabled || skip.getAttribute("aria-disabled") === "true" || !skip.getClientRects().length));
+  if (__ronicAdDecision(true, skip ? __ronicLabel(skip) : "", disabled) === "skip" && skip) {
+    __ronicFire(skip);
+    window.__ronicAdSeen = 0;
+    return "skipped";
+  }
+  if (!skip && (Date.now() - window.__ronicAdSeen) > 5000) return "unskippable";
+  return "waiting";
+}
+function __ronicArmAdWatch() {
+  if (window.__ronicAdWatch) return;
+  window.__ronicAdWatch = setInterval(function () { try { __ronicAdState(); } catch (e) {} }, 400);
+}
+function __ronicCanScroll(el) {
+  if (!el || el === document.body || el === document.documentElement) return false;
+  var style;
+  try { style = getComputedStyle(el); } catch (e) { return false; }
+  var oy = style.overflowY;
+  if (oy !== "auto" && oy !== "scroll" && oy !== "overlay") return false;
+  return el.scrollHeight > el.clientHeight + 8;
+}
+function __ronicScroll(sign) {
+  var dy = sign * Math.max(320, Math.round((window.innerHeight || 800) * 0.75));
+  var x = Math.round((window.innerWidth || 800) / 2);
+  var y = Math.round((window.innerHeight || 600) / 2);
+  var el = document.elementFromPoint(x, y);
+  var guard = 0;
+  while (el && guard < 25) {
+    if (__ronicCanScroll(el)) {
+      var before = el.scrollTop;
+      el.scrollTop = before + dy;
+      if (el.scrollTop !== before) return;
+    }
+    el = el.parentElement;
+    guard++;
+  }
+  var root = document.scrollingElement || document.documentElement;
+  if (root) root.scrollTop = (root.scrollTop || 0) + dy;
+}
+function __ronicPageMoves() {
+  var root = document.scrollingElement || document.documentElement;
+  if (root && root.scrollHeight > (window.innerHeight || 800) + 160) return true;
+  var x = Math.round((window.innerWidth || 800) / 2);
+  var y = Math.round((window.innerHeight || 600) / 2);
+  var el = document.elementFromPoint(x, y);
+  var guard = 0;
+  while (el && guard < 25) {
+    if (__ronicCanScroll(el)) return true;
+    el = el.parentElement;
+    guard++;
+  }
+  return false;
+}
+function __ronicPlace(el) {
+  try { el.scrollIntoView({ block: "nearest", inline: "nearest" }); } catch (_) {}
+  var r = el.getBoundingClientRect();
+  var x = Math.round(r.left + r.width / 2);
+  var y = Math.round(r.top + Math.min(r.height / 2, 20));
+  var maxX = Math.max(1, (window.innerWidth || 1) - 2);
+  var maxY = Math.max(1, (window.innerHeight || 1) - 2);
+  if (x < 1) x = 1;
+  if (y < 1) y = 1;
+  if (x > maxX) x = maxX;
+  if (y > maxY) y = maxY;
+  var skip = __ronicFindSkip();
+  for (var step = 0; step < 5; step++) {
+    var top = document.elementFromPoint(x, y);
+    if (!top || top === el || (el.contains && el.contains(top)) || (top.contains && top.contains(el))) break;
+    if (skip && (skip === top || (skip.contains && skip.contains(top)))) break;
+    y = Math.min(maxY, y + 24);
+  }
+  return { x: x, y: y };
+}
+function __ronicSameTabLink(el) {
+  if (!el || !el.closest) return null;
+  var tag = String(el.tagName || "").toLowerCase();
+  if (tag === "button" || tag === "input" || tag === "textarea" || tag === "select") return null;
+  if (el.closest("button, input, textarea, select")) return null;
+  var anchor = el.closest("a[href]");
+  if (!anchor) return null;
+  if (String(anchor.getAttribute("target") || "").toLowerCase() === "_blank") return null;
+  var href = String(anchor.href || "");
+  if (!/^https?:/i.test(href) || href === String(location.href)) return null;
+  return anchor;
+}
+function __ronicPress(el) {
+  var ad = __ronicAdState();
+  if (ad === "skipped") return { note: "skipped the ad", goto: "" };
+  var place = __ronicPlace(el);
+  var top = document.elementFromPoint(place.x, place.y);
+  var skip = __ronicFindSkip();
+  if (top && skip && el !== top && !(el.contains && el.contains(top)) && (skip === top || (skip.contains && skip.contains(top)))) {
+    __ronicFire(top, place.x, place.y);
+    return { note: "skipped the ad covering that control", goto: "" };
+  }
+  var anchor = __ronicSameTabLink(el);
+  if (anchor) {
+    var href = String(anchor.href || "");
+    document.dispatchEvent(new CustomEvent("ronic-virtual-cursor", { detail: { x: place.x, y: place.y, tag: "a" } }));
+    // shortcut: a synthetic click does not follow the link. Rust opens `goto`. Upgrade when element.click() navigates on its own.
+    return { note: "opened " + href.slice(0, 180), goto: href };
+  }
+  __ronicFire(el, place.x, place.y);
+  return { note: "", goto: "" };
+}
 function __ronicCollect(){
   try {
+    __ronicArmAdWatch();
+    var ad = __ronicAdState();
     var nodes = [];
     var controls = __ronicControls();
-    for (var i = 0; i < controls.length && nodes.length < 40; i++) {
-      nodes.push({ id: controls[i].i, tag: controls[i].tag, label: controls[i].label, x: controls[i].x, y: controls[i].y });
+    var editors = [];
+    var rest = [];
+    for (var i = 0; i < controls.length; i++) {
+      if (__ronicIsEditor(controls[i].el)) editors.push(controls[i]); else rest.push(controls[i]);
+    }
+    var picked = editors.concat(rest);
+    for (var n = 0; n < picked.length && nodes.length < 40; n++) {
+      nodes.push({ id: picked[n].i, tag: picked[n].tag, label: picked[n].label, x: picked[n].x, y: picked[n].y });
     }
     var text = document.body && document.body.innerText ? String(document.body.innerText) : "";
     text = text.replace(/\s+/g, " ").trim();
     if (text.length > 1200) text = text.slice(0, 1200);
     var media = null;
     var video = document.querySelector("video");
-    if (video) {
-      media = { playing: video.paused === false && video.currentTime > 0, paused: video.paused === true, currentTime: Math.round((video.currentTime || 0) * 10) / 10, duration: Math.round((video.duration || 0) * 10) / 10, muted: video.muted === true };
+    if (video || ad) {
+      media = { playing: !ad && !!video && video.paused === false && video.currentTime > 0, paused: !!video && video.paused === true && !ad, currentTime: video ? Math.round((video.currentTime || 0) * 10) / 10 : 0, duration: video ? Math.round((video.duration || 0) * 10) / 10 : 0, muted: !!(video && video.muted === true), ad: ad };
     }
-    return { url: String(location.href || ""), title: String(document.title || ""), text: text, nodes: nodes, ready: String(document.readyState || ""), media: media };
+    return { url: String(location.href || ""), title: String(document.title || ""), text: text, nodes: nodes, ready: String(document.readyState || ""), media: media, blocker: __ronicBlocker(controls) };
   } catch (error) {
     return { url: "", title: "", text: "", nodes: [], ready: "error", media: null, error: String(error) };
   }
@@ -1044,12 +1470,8 @@ fn mini_click_js(id: i64) -> String {
     var list = __ronicControls();
     var c = list[{index}];
     if (!c) return {{ ok: false, error: "no control at that index — read the page again for fresh ids" }};
-    try {{ c.el.scrollIntoView({{ block: "center" }}); }} catch (_) {{}}
-    var r = c.el.getBoundingClientRect();
-    var x = Math.round(r.left + r.width / 2), y = Math.round(r.top + r.height / 2);
-    document.dispatchEvent(new CustomEvent("ronic-virtual-cursor", {{ detail: {{ x: x, y: y, tag: c.tag }} }}));
-    c.el.click();
-    return {{ ok: true }};
+    var pressed = __ronicPress(c.el);
+    return {{ ok: true, note: (pressed && pressed.note) || "", goto: (pressed && pressed.goto) || "" }};
   }} catch (error) {{
     return {{ ok: false, error: String(error) }};
   }}
@@ -1065,31 +1487,23 @@ fn mini_type_js(id: i64, text: &str) -> String {
   {MINI_COLLECT_FN}
   try {{
     var list = __ronicControls();
-    var c = list[{index}];
-    if (!c) return {{ ok: false, error: "no control at that index — read the page again for fresh ids" }};
-    var isInput = c.tag === "input" || c.tag === "textarea";
-    var isEditable = c.el.isContentEditable || c.el.getAttribute("contenteditable") === "true";
-    if (!isInput && !isEditable) return {{ ok: false, error: "not a text field" }};
-    try {{ c.el.scrollIntoView({{ block: "center" }}); }} catch (_) {{}}
-    var r = c.el.getBoundingClientRect();
-    document.dispatchEvent(new CustomEvent("ronic-virtual-cursor", {{ detail: {{ x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2), tag: c.tag }} }}));
-    var value = {encoded};
-    c.el.focus();
-    if (isInput) {{
-      c.el.value = value;
-      c.el.dispatchEvent(new Event("input", {{ bubbles: true }}));
-      c.el.dispatchEvent(new Event("change", {{ bubbles: true }}));
-    }} else {{
-      c.el.textContent = value;
-      try {{
-        c.el.dispatchEvent(new InputEvent("input", {{ bubbles: true, inputType: "insertText", data: value }}));
-      }} catch (_) {{
-        c.el.dispatchEvent(new Event("input", {{ bubbles: true }}));
-      }}
+    var chosen = __ronicTypeTarget(list, {index});
+    if (!chosen) {{
+      var blocker = __ronicBlocker(list);
+      if (blocker === "sign-in" || blocker === "no-composer") return __ronicFailCode(blocker);
+      if (!list[{index}]) return __ronicFailCode("no control at that index — read the page again for fresh ids");
+      return __ronicFailCode("not a text field");
     }}
-    return {{ ok: true }};
+    var value = {encoded};
+    var wrote = __ronicWrite(chosen.el, value);
+    if (!__ronicHolds(wrote, value)) return __ronicFailCode("prompt-rejected");
+    var note = chosen.via === "composer"
+      ? "Wrote the prompt into the page composer. The numbered control was not a text field."
+      : "Wrote the prompt into the text field.";
+    if (__ronicIsFlow()) note += " Click Create to start generation.";
+    return {{ ok: true, note: note }};
   }} catch (error) {{
-    return {{ ok: false, error: String(error) }};
+    return __ronicFailCode(String(error));
   }}
 }})()"#
     )
@@ -1112,11 +1526,8 @@ fn mini_smart_click_js(query: &str) -> String {
       if (s > bestScore || (s === bestScore && best && controls[i].y < best.y)) {{ best = controls[i]; bestScore = s; }}
     }}
     if (!best || bestScore < 30) return {{ ok: false, error: "no visible control matching \"" + q + "\" — read the page and click by id instead" }};
-    try {{ best.el.scrollIntoView({{ block: "center" }}); }} catch (_) {{}}
-    var r = best.el.getBoundingClientRect();
-    document.dispatchEvent(new CustomEvent("ronic-virtual-cursor", {{ detail: {{ x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2), tag: best.tag }} }}));
-    best.el.click();
-    return {{ ok: true, chosen: {{ id: best.i, tag: best.tag, label: best.label }} }};
+    var pressed = __ronicPress(best.el);
+    return {{ ok: true, note: (pressed && pressed.note) || "", goto: (pressed && pressed.goto) || "", chosen: {{ id: best.i, tag: best.tag, label: best.label }} }};
   }} catch (error) {{
     return {{ ok: false, error: String(error) }};
   }}
@@ -1129,8 +1540,9 @@ fn mini_scroll_js(direction: &str) -> String {
     let sign = if direction == "up" { -1 } else { 1 };
     format!(
         r#"(function(){{
+  {MINI_COLLECT_FN}
   try {{
-    window.scrollBy(0, {sign} * Math.max(400, (window.innerHeight || 800) * 0.8));
+    __ronicScroll({sign});
     return {{ ok: true }};
   }} catch (error) {{
     return {{ ok: false, error: String(error) }};
@@ -1161,7 +1573,7 @@ fn mini_find_js(query: &str) -> String {
       hits.push({{ id: scored[j].c.i, tag: scored[j].c.tag, label: scored[j].c.label, x: scored[j].c.x, y: scored[j].c.y }});
     }}
     if (hits.length === 0) {{
-      var scrollable = document.body && document.body.scrollHeight > (window.innerHeight || 800) + 200;
+      var scrollable = __ronicPageMoves();
       return {{ ok: false, error: "no visible control matching \"" + q + "\"" + (scrollable ? " — the page scrolls; try scroll_page then find_control again, or click_control with match" : " — try a shorter word") }};
     }}
     var page = __ronicCollect();
@@ -1208,14 +1620,16 @@ fn collect_once(win: &DriveSurface, label: &str, started: std::time::Instant, ex
 /// and — when an expected url is given — that page has committed.
 fn poll_read_hit(win: &DriveSurface, label: &str, started: std::time::Instant, expected: Option<&str>, cap: std::time::Duration) -> Result<MiniWindowHit> {
     let deadline = std::time::Instant::now() + cap;
-    let mut last_error = err("the page did not answer");
     loop {
-        match collect_once(win, label, started, expected) {
-            Some(hit) => return Ok(hit),
-            None => last_error = err("the page did not answer"),
+        if let Some(hit) = collect_once(win, label, started, expected) {
+            return Ok(hit);
         }
         if std::time::Instant::now() >= deadline {
-            return Err(last_error);
+            let live = win.url().map(|url| url.to_string()).unwrap_or_default();
+            let where_now = if live.is_empty() { String::new() } else { format!(" ({live})") };
+            return Err(err(format!(
+                "Stuck: the page did not answer{where_now}. {STILL_IN_CHAT}"
+            )));
         }
         thread::sleep(Duration::from_millis(70));
     }
@@ -1400,6 +1814,82 @@ fn note_agent_drive(app: &AppHandle, bot_id: &str, hit: &MiniWindowHit, cursor_a
         sync_window_title(app, bot_id);
     }
     broadcast_shell(app, bot_id, "driven");
+    if let Ok(label) = chrome_label(bot_id) {
+        if app.get_webview(&label).is_some() {
+            crate::site_session::schedule_export(app, &label);
+        }
+    }
+}
+
+const STILL_IN_CHAT: &str = "This chat turn is still running. It is not a background job.";
+
+fn explain_stuck(message: &str) -> crate::error::RonicError {
+    if message.starts_with("Stuck:") {
+        err(message)
+    } else {
+        let message: String = message.chars().take(240).collect();
+        err(format!("Stuck: {message}. {STILL_IN_CHAT}"))
+    }
+}
+
+/// Plain status for the chat pill while a browser tool is in flight.
+pub fn live_browser_status(tool: &str, detail: &str) -> String {
+    let what = match tool {
+        "inspect_page" => "Opening the page",
+        "read_page" => "Reading the page",
+        "type_text" => "Writing the prompt into the page",
+        "click_control" => "Clicking a control",
+        "wait_for" => "Waiting for the page",
+        "scroll_page" => "Scrolling the page",
+        "find_control" => "Looking for a control",
+        "computer_shell" => "Driving the mini computer",
+        _ => "Working in the browser",
+    };
+    let detail: String = detail.trim().chars().take(80).collect();
+    if detail.is_empty() {
+        format!("{what}. {STILL_IN_CHAT}")
+    } else {
+        format!("{what} ({detail}). {STILL_IN_CHAT}")
+    }
+}
+
+/// The first line that tells the user why the browser step is stuck.
+pub fn stuck_line(output: &str) -> Option<String> {
+    output.lines().map(str::trim).find(|line| line.starts_with("Stuck:")).map(|line| line.chars().take(280).collect())
+}
+
+/// User-facing reason for a page that cannot take a prompt yet.
+pub fn page_status_line(url: &str, blocker: &str, title: &str) -> Option<String> {
+    let url = url.trim();
+    let title = title.trim();
+    let titled = if title.is_empty() { String::new() } else { format!(" ({title})") };
+    let located = if url.is_empty() { String::new() } else { format!(" at {url}") };
+    match blocker {
+        "sign-in" => Some(format!(
+            "Stuck: Google sign-in is on screen{titled}{located}. The prompt was not written because the composer is not available until sign-in finishes. Finish signing in in this bot's browser. {STILL_IN_CHAT}"
+        )),
+        "no-composer" => Some(format!(
+            "Stuck: the page is open{titled}{located}, but the prompt box is not on this screen. On Google Flow the composer is inside a project, not on the project gallery. Open a project, then the prompt can be written. {STILL_IN_CHAT}"
+        )),
+        "prompt-rejected" => Some(format!(
+            "Stuck: the prompt was sent to the composer and the page did not keep it{titled}{located}. {STILL_IN_CHAT}"
+        )),
+        _ => None,
+    }
+}
+
+pub fn explain_from_value(value: &serde_json::Value) -> String {
+    let code = value.get("error").and_then(|item| item.as_str()).unwrap_or("the action failed");
+    let url = value.get("url").and_then(|item| item.as_str()).unwrap_or("");
+    let title = value.get("title").and_then(|item| item.as_str()).unwrap_or("");
+    page_status_line(url, code, title).unwrap_or_else(|| {
+        if code.starts_with("Stuck:") {
+            code.to_string()
+        } else {
+            let code: String = code.chars().take(240).collect();
+            format!("Stuck: {code}. {STILL_IN_CHAT}")
+        }
+    })
 }
 
 pub fn agent_drive_open(app: &AppHandle, state: &crate::AppState, bot_id: &str, bot_handle: &str, url: &str) -> Result<MiniWindowHit> {
@@ -1547,11 +2037,10 @@ pub fn agent_drive_smart_click(app: &AppHandle, bot_id: &str, query: &str) -> Re
     let label = agent_chrome_surface(app, bot_id)?;
     let win = get_drive_surface(app, &label)?;
     let started = std::time::Instant::now();
-    let raw = eval_window_json(&win, &mini_smart_click_js(&crate::util::prefix_utf8(query, 120)), Duration::from_secs(3))?;
-    let value: serde_json::Value = serde_json::from_str(&raw).map_err(|_| err("the page did not answer with usable JSON"))?;
+    let raw = eval_window_json(&win, &mini_smart_click_js(&crate::util::prefix_utf8(query, 120)), Duration::from_secs(3)).map_err(|error| explain_stuck(&error.0))?;
+    let value: serde_json::Value = serde_json::from_str(&raw).map_err(|_| explain_stuck("the page did not answer with usable JSON"))?;
     if value.get("ok").and_then(|v| v.as_bool()) == Some(false) {
-        let message = value.get("error").and_then(|v| v.as_str()).unwrap_or("the action failed");
-        return Err(err(message));
+        return Err(err(explain_from_value(&value)));
     }
     let chosen = value
         .get("chosen")
@@ -1562,8 +2051,11 @@ pub fn agent_drive_smart_click(app: &AppHandle, bot_id: &str, query: &str) -> Re
             format!("clicked [{id}] {tag} {text}")
         })
         .unwrap_or_else(|| format!("clicked best match for \"{query}\""));
-    let mut hit = poll_read_hit(&win, &label, started, None, Duration::from_millis(1200))?;
-    hit.note = Some(chosen);
+    let press_note = value.get("note").and_then(|item| item.as_str()).unwrap_or("").trim().to_string();
+    let goto = value.get("goto").and_then(|item| item.as_str()).filter(|url| !url.is_empty());
+    follow_link(&win, goto);
+    let mut hit = poll_read_hit(&win, &label, started, goto, Duration::from_millis(if goto.is_some() { 2400 } else { 1200 }))?;
+    hit.note = Some(if press_note.is_empty() { chosen } else { format!("{press_note} ({chosen})") });
     note_agent_drive(app, bot_id, &hit, None);
     Ok(hit)
 }
@@ -1576,9 +2068,12 @@ pub fn agent_drive_wait(app: &AppHandle, bot_id: &str, query: Option<&str>, medi
     agent_gate(bot_id)?;
     let label = agent_chrome_surface(app, bot_id)?;
     let started = std::time::Instant::now();
-    let deadline = started + Duration::from_millis(cap_ms.clamp(500, 12000));
     let want_playing = media.map(|m| m.eq_ignore_ascii_case("playing")).unwrap_or(false);
     let wanted = query.map(str::trim).filter(|q| !q.is_empty());
+    // A skippable ad shows its button a few seconds in. Give that button time,
+    // then press it, instead of treating the ad as the video.
+    let cap_ms = if want_playing { cap_ms.max(8_000) } else { cap_ms };
+    let deadline = started + Duration::from_millis(cap_ms.clamp(500, 12_000));
     if !want_playing && wanted.is_none() {
         return Err(err("wait_for needs a query like \"add to cart\", or media: \"playing\"."));
     }
@@ -1586,7 +2081,15 @@ pub fn agent_drive_wait(app: &AppHandle, bot_id: &str, query: Option<&str>, medi
         if let Some(win) = app.get_webview(&label) {
             let win = DriveSurface::Chrome(win);
             if let Some(hit) = collect_once(&win, &label, started, None) {
-                if want_playing && hit.media.as_ref().is_some_and(|m| m.playing) {
+                let ad = hit.media.as_ref().map(|item| item.ad.clone()).unwrap_or_default();
+                let playing = hit.media.as_ref().is_some_and(|item| item.playing);
+                if want_playing && playing && ad.is_empty() {
+                    note_agent_drive(app, bot_id, &hit, None);
+                    return Ok(hit);
+                }
+                if want_playing && ad == "unskippable" {
+                    let mut hit = hit;
+                    hit.note = Some("an ad is playing and it has no Skip button. Leave this page instead of watching it.".into());
                     note_agent_drive(app, bot_id, &hit, None);
                     return Ok(hit);
                 }
@@ -1612,7 +2115,13 @@ pub fn agent_drive_wait(app: &AppHandle, bot_id: &str, query: Option<&str>, medi
                 (true, false) => "the video to start playing",
                 _ => "that control to appear",
             };
-            return Err(err(format!("timed out waiting for {what}{where_now}")));
+            let flow = seen.as_ref().is_some_and(|hit| hit.url.contains("labs.google") && hit.url.contains("/flow"));
+            let extra = if flow && want_playing {
+                " Video generation keeps running on the page and can take several minutes, so wait again if a clip is rendering."
+            } else {
+                ""
+            };
+            return Err(err(format!("Stuck: timed out waiting for {what}{where_now}.{extra} {STILL_IN_CHAT}")));
         }
         thread::sleep(Duration::from_millis(120));
     }
@@ -1820,18 +2329,35 @@ pub fn inspect_native_os_uia_tree(window_title_filter: String) -> Result<Vec<UIA
 
 /// Shared walk-and-cache used by the Tauri command and by Code Mode.
 pub fn inspect_and_cache(window_title_filter: &str) -> Result<Vec<UIAControlNode>> {
-    let nodes = inspect_uia_nodes(window_title_filter)?;
-    {
-        let mut map = som_marks();
-        map.clear();
-        for node in &nodes {
-            map.insert(node.mark_id, node.clone());
+    load_desktop_nodes(window_title_filter)
+}
+
+pub fn last_desktop_window() -> String {
+    last_uia_filter().clone()
+}
+
+fn load_desktop_nodes(window_title_filter: &str) -> Result<Vec<UIAControlNode>> {
+    match inspect_uia_nodes(window_title_filter) {
+        Ok(nodes) => {
+            store_marks(&nodes);
+            // An empty request means the foreground window. Clicks re-find that title.
+            *last_uia_filter() = resolve_window_filter(window_title_filter);
+            Ok(nodes)
+        }
+        Err(error) => {
+            // A failed inspect must not leave the previous window's marks clickable.
+            som_marks().clear();
+            Err(error)
         }
     }
-    // Store the *resolved* filter: an empty request means "the foreground
-    // window", and mark execution later needs that exact title to re-find it.
-    *last_uia_filter() = resolve_window_filter(window_title_filter);
-    Ok(nodes)
+}
+
+fn store_marks(nodes: &[UIAControlNode]) {
+    let mut map = som_marks();
+    map.clear();
+    for node in nodes {
+        map.insert(node.mark_id, node.clone());
+    }
 }
 
 #[cfg(windows)]
@@ -1853,14 +2379,14 @@ fn inspect_uia_nodes(window_title_filter: &str) -> Result<Vec<UIAControlNode>> {
     #[cfg(windows)]
     {
         let filter = resolve_window_filter(window_title_filter);
-        if !filter.is_empty() {
-            if let Ok(nodes) = uia_walk(&filter) {
-                if !nodes.is_empty() {
-                    return Ok(nodes);
-                }
-            }
+        if filter.is_empty() {
+            return Err(err("no window is in front — name the window to inspect"));
         }
-        return Ok(fallback_nodes());
+        return match uia_walk(&filter) {
+            Ok(nodes) if !nodes.is_empty() => Ok(nodes),
+            Ok(_) => Err(err(format!("no buttons or text fields in '{filter}'"))),
+            Err(message) => Err(err(message)),
+        };
     }
     #[cfg(not(windows))]
     {
@@ -1875,29 +2401,13 @@ fn uia_walk(window_title_filter: &str) -> std::result::Result<Vec<UIAControlNode
     use uiautomation::patterns::{UIInvokePattern, UIValuePattern};
     use uiautomation::UIAutomation;
 
-    let needle = window_title_filter.to_lowercase();
     let automation = UIAutomation::new().map_err(|e| e.to_string())?;
     let root = automation.get_root_element().map_err(|e| e.to_string())?;
     let walker = automation.get_control_view_walker().map_err(|e| e.to_string())?;
-
-    // Depth-limited BFS from the matching top-level window.
-    let mut frontier: Vec<uiautomation::UIElement> = Vec::new();
-    let mut cursor = walker.get_first_child(&root).map_err(|e| e.to_string())?;
-    loop {
-        let name = cursor.get_name().unwrap_or_default().to_lowercase();
-        let class = cursor.get_classname().unwrap_or_default().to_lowercase();
-        if name.contains(&needle) || class.contains(&needle) {
-            frontier.push(cursor);
-            break;
-        }
-        match walker.get_next_sibling(&cursor) {
-            Ok(next) => cursor = next,
-            Err(_) => break,
-        }
-    }
-    if frontier.is_empty() {
-        return Ok(Vec::new());
-    }
+    let window = matching_top_window(&walker, &root, window_title_filter)
+        .ok_or_else(|| format!("no window matching '{window_title_filter}'"))?;
+    // Depth-limited BFS from that top-level window. The window itself is not a control.
+    let mut frontier = vec![window];
 
     let mut nodes: Vec<UIAControlNode> = Vec::new();
     let mut depth = 0usize;
@@ -2028,6 +2538,9 @@ fn execute_mark(mark_id: u32, action: &str, text_payload: Option<&str>) -> Resul
     if EMERGENCY_HALT.load(Ordering::Relaxed) {
         return Err(err("emergency halt is engaged — resume the computer drivers first"));
     }
+    if action == "set_value" && text_payload.unwrap_or("").is_empty() {
+        return Err(err("type needs the text to write"));
+    }
     let node = {
         let map = som_marks();
         map.get(&mark_id).cloned().ok_or_else(|| err(format!("mark #{mark_id} is not in the active Set-of-Marks registry — inspect a window first")))?
@@ -2037,9 +2550,16 @@ fn execute_mark(mark_id: u32, action: &str, text_payload: Option<&str>) -> Resul
 
     #[cfg(windows)]
     {
+        if node.origin != "uia" {
+            return Err(err(format!("mark #{} is not a live desktop control — inspect the window first", node.mark_id)));
+        }
         // Priority 1: real background patterns on a freshly re-resolved element.
         if let Some(message) = try_uia_patterns(&node, action, text_payload, &window_title, &started) {
             return Ok(message);
+        }
+        // Typing that missed the value pattern must not become a click.
+        if action == "set_value" {
+            return Err(err(format!("mark #{} ({}) did not accept the text", node.mark_id, node.name)));
         }
         // Priority 2: posted click into the window's client area — never SendInput,
         // so the physical cursor stays wherever the human left it.
@@ -2075,21 +2595,7 @@ fn try_uia_patterns(
     let root = automation.get_root_element().ok()?;
     let walker = automation.get_control_view_walker().ok()?;
 
-    let mut cursor = walker.get_first_child(&root).ok()?;
-    let mut target_root: Option<uiautomation::UIElement> = None;
-    loop {
-        let name = cursor.get_name().unwrap_or_default().to_lowercase();
-        if name.contains(&filter.to_lowercase()) {
-            target_root = Some(cursor);
-            break;
-        }
-        match walker.get_next_sibling(&cursor) {
-            Ok(next) => cursor = next,
-            Err(_) => break,
-        }
-    }
-    let root_element = target_root?;
-    let walker = automation.get_control_view_walker().ok()?;
+    let root_element = matching_top_window(&walker, &root, &filter)?;
     let mut stack = vec![root_element];
     let mut visited = 0usize;
     while let Some(element) = stack.pop() {
@@ -2099,9 +2605,7 @@ fn try_uia_patterns(
         }
         let name = element.get_name().unwrap_or_default();
         let automation_id = element.get_automation_id().unwrap_or_default();
-        let same = !name.trim().is_empty()
-            && name == node.name
-            && (node.automation_id.is_empty() || automation_id == node.automation_id);
+        let same = names_match(&node.name, &name) && (node.automation_id.is_empty() || automation_id == node.automation_id);
         if same {
             let ms = started.elapsed().as_millis();
             return match action {
@@ -2148,12 +2652,18 @@ fn try_posted_click(node: &UIAControlNode, window_title: &str, started: &std::ti
     let hwnd = find_window_by_title(&filter)?;
     let mut point = windows::Win32::Foundation::POINT { x: node.center_xy[0], y: node.center_xy[1] };
     unsafe {
-        let _ = ScreenToClient(hwnd, &mut point);
+        if !ScreenToClient(hwnd, &mut point).as_bool() {
+            return None;
+        }
         let lparam = LPARAM((((point.y as i16 as i32) << 16) | (point.x as i16 as i32)) as isize);
         // MK_LBUTTON is 0x0001; posting straight to the window leaves the
         // physical cursor exactly where the human left it.
-        let _ = PostMessageW(Some(hwnd), WM_LBUTTONDOWN, WPARAM(1usize), lparam);
-        let _ = PostMessageW(Some(hwnd), WM_LBUTTONUP, WPARAM(0usize), lparam);
+        if PostMessageW(Some(hwnd), WM_LBUTTONDOWN, WPARAM(1usize), lparam).is_err() {
+            return None;
+        }
+        if PostMessageW(Some(hwnd), WM_LBUTTONUP, WPARAM(0usize), lparam).is_err() {
+            return None;
+        }
     }
     let ms = started.elapsed().as_millis();
     Some(format!(
@@ -2195,15 +2705,7 @@ const SOM_HEIGHT: u32 = 540;
 #[tauri::command]
 pub fn generate_som_annotated_snapshot(window_title: String) -> Result<SoMAnnotatedSnapshot> {
     let started = std::time::Instant::now();
-    let nodes = inspect_uia_nodes(&window_title)?;
-    *last_uia_filter() = resolve_window_filter(&window_title);
-    {
-        let mut map = som_marks();
-        map.clear();
-        for node in &nodes {
-            map.insert(node.mark_id, node.clone());
-        }
-    }
+    let nodes = load_desktop_nodes(&window_title)?;
 
     let mut capture_source = "simulated_canvas".to_string();
     let mut canvas = image::RgbaImage::from_pixel(SOM_WIDTH, SOM_HEIGHT, image::Rgba([248, 250, 252, 255]));
@@ -2387,11 +2889,79 @@ pub fn halt_engaged() -> bool {
 // ---------------------------------------------------------------------------
 
 #[cfg(windows)]
+fn hwnd_title(hwnd: windows::Win32::Foundation::HWND) -> String {
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowTextLengthW, GetWindowTextW};
+    unsafe {
+        let len = GetWindowTextLengthW(hwnd);
+        if len <= 0 {
+            return String::new();
+        }
+        let mut buf = vec![0u16; len as usize + 1];
+        let _ = GetWindowTextW(hwnd, &mut buf);
+        String::from_utf16_lossy(&buf)
+    }
+}
+
+#[cfg(windows)]
+fn foreground_window_title() -> String {
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.0.is_null() {
+            String::new()
+        } else {
+            hwnd_title(hwnd)
+        }
+    }
+}
+
+/// shortcut: the walker has no z-order, so the foreground title wins when it matches. Upgrade when the tree exposes z-order.
+#[cfg(windows)]
+fn matching_top_window(
+    walker: &uiautomation::UITreeWalker,
+    root: &uiautomation::UIElement,
+    needle: &str,
+) -> Option<uiautomation::UIElement> {
+    let needle = fold_name(needle);
+    if needle.is_empty() {
+        return None;
+    }
+    let foreground = fold_name(&foreground_window_title());
+    let mut cursor = walker.get_first_child(root).ok()?;
+    let mut first_contains: Option<uiautomation::UIElement> = None;
+    loop {
+        let name = fold_name(&cursor.get_name().unwrap_or_default());
+        let class = cursor.get_classname().unwrap_or_default().to_lowercase();
+        let contains = name.contains(&needle) || class.contains(&needle);
+        if contains && !foreground.is_empty() && name == foreground {
+            return Some(cursor);
+        }
+        if contains && first_contains.is_none() {
+            first_contains = Some(cursor.clone());
+        }
+        match walker.get_next_sibling(&cursor) {
+            Ok(next) => cursor = next,
+            Err(_) => break,
+        }
+    }
+    first_contains
+}
+
+#[cfg(windows)]
 fn find_window_by_title(filter: &str) -> Option<windows::Win32::Foundation::HWND> {
     use windows::Win32::Foundation::{HWND, LPARAM};
-    use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowTextLengthW, GetWindowTextW, IsWindowVisible};
+    use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetForegroundWindow, IsWindowVisible};
 
-    let needle = filter.to_lowercase();
+    let needle = fold_name(filter);
+    if needle.is_empty() {
+        return None;
+    }
+    unsafe {
+        let foreground = GetForegroundWindow();
+        if !foreground.0.is_null() && fold_name(&hwnd_title(foreground)).contains(&needle) {
+            return Some(foreground);
+        }
+    }
     let mut found: Option<isize> = None;
     let mut collected: Vec<isize> = Vec::new();
     unsafe extern "system" fn collect(hwnd: HWND, lparam: LPARAM) -> windows::core::BOOL {
@@ -2409,38 +2979,13 @@ fn find_window_by_title(filter: &str) -> Option<windows::Win32::Foundation::HWND
             if !IsWindowVisible(hwnd).as_bool() {
                 continue;
             }
-            let len = GetWindowTextLengthW(hwnd);
-            if len <= 0 {
-                continue;
-            }
-            let mut buf = vec![0u16; len as usize + 1];
-            GetWindowTextW(hwnd, &mut buf);
-            let title = String::from_utf16_lossy(&buf).to_lowercase();
-            if title.contains(&needle) {
-                found = Some(raw);
-                break;
-            }
+        }
+        if fold_name(&hwnd_title(hwnd)).contains(&needle) {
+            found = Some(raw);
+            break;
         }
     }
     found.map(|raw| HWND(raw as *mut _))
-}
-
-#[cfg(windows)]
-fn foreground_window_title() -> String {
-    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW};
-    unsafe {
-        let hwnd = GetForegroundWindow();
-        if hwnd.0.is_null() {
-            return String::new();
-        }
-        let len = GetWindowTextLengthW(hwnd);
-        if len <= 0 {
-            return String::new();
-        }
-        let mut buf = vec![0u16; len as usize + 1];
-        GetWindowTextW(hwnd, &mut buf);
-        String::from_utf16_lossy(&buf)
-    }
 }
 
 /// Captures the target window's client buffer via PrintWindow at native
@@ -2536,6 +3081,47 @@ mod tests {
         assert!(!mark_is_background_capable(&nodes[2]));
     }
 
+    fn sample(id: u32, name: &str, origin: &str) -> UIAControlNode {
+        UIAControlNode {
+            mark_id: id,
+            control_type: "Button".into(),
+            name: name.into(),
+            automation_id: String::new(),
+            class_name: String::new(),
+            bounds: [0, 0, 10, 10],
+            center_xy: [5, 5],
+            supports_background_invoke: true,
+            supports_background_value: false,
+            origin: origin.into(),
+        }
+    }
+
+    #[test]
+    fn pick_mark_prefers_the_live_exact_name_and_refuses_ties() {
+        let nodes = vec![
+            sample(1, "Run Build Task", "simulated"),
+            sample(2, "Save", "uia"),
+            sample(3, "Save as", "uia"),
+            sample(4, "Open file", "uia"),
+        ];
+        assert_eq!(pick_mark(&nodes, "Save").unwrap(), 2);
+        assert_eq!(pick_mark(&nodes, "file").unwrap(), 4);
+        assert_eq!(pick_mark(&nodes, "open").unwrap(), 4);
+        assert!(pick_mark(&nodes, "Run Build Task").unwrap_err().contains("no desktop control"));
+        let tied = vec![sample(1, "Close tab", "uia"), sample(2, "Close window", "uia")];
+        let err = pick_mark(&tied, "Close").unwrap_err();
+        assert!(err.contains("more than one"), "{err}");
+        assert!(names_match("Save", "save"));
+        assert!(names_match("Save   file", "save file"));
+        assert!(!names_match("Save", "Save as"));
+        let clipped = "a".repeat(80);
+        assert!(names_match(&clipped, &format!("{clipped} and more")));
+        assert_eq!(resolve_desktop_mark(&serde_json::json!({"mark_id": "4"})).unwrap(), 4);
+        assert_eq!(resolve_desktop_mark(&serde_json::json!({"id": 7})).unwrap(), 7);
+        assert!(resolve_desktop_mark(&serde_json::json!({"mark_id": 0})).is_err());
+        assert!(resolve_desktop_mark(&serde_json::json!({})).unwrap_err().contains("mark id"));
+    }
+
     #[test]
     fn labels_reject_path_components() {
         assert_eq!(mini_label("dots").unwrap(), "ronic_mini_comp_dots");
@@ -2582,10 +3168,27 @@ mod tests {
         // The smart layer: visibility filter, scoring, scroll-into-view.
         let smart = mini_smart_click_js("add to cart");
         assert!(smart.contains("__ronicScore"));
-        assert!(smart.contains("scrollIntoView"));
-        assert!(click.contains("scrollIntoView"));
-        assert!(typed.contains("scrollIntoView"));
+        assert!(smart.contains("__ronicPress"));
+        assert!(click.contains("__ronicPress"));
+        assert!(typed.contains("nearest"));
+        assert!(!click.contains("block: \"center\""));
+        assert!(collect.contains("__ronicAdDecision"));
+        assert!(collect.contains("__ronicArmAdWatch"));
+        assert!(collect.contains("__ronicScroll"));
+        assert!(!BOT_MINI_WINDOW_HUD_SCRIPT.contains("left:50%"));
         assert!(mini_find_js("cart").contains("__ronicScore"));
+        // Google Flow's composer is a React textarea or a Slate editor. Setting
+        // .value / textContent does not reach either, so the writer must use
+        // the native value setter and execCommand('insertText'), then check
+        // that the text actually stayed.
+        assert!(typed.contains("HTMLTextAreaElement"));
+        assert!(typed.contains("execCommand"));
+        assert!(typed.contains("insertText"));
+        assert!(typed.contains("PINHOLE_TEXT_AREA_ELEMENT_ID"));
+        assert!(typed.contains("data-slate-editor"));
+        assert!(typed.contains("shadowRoot"));
+        assert!(typed.contains("prompt-rejected"));
+        assert!(!typed.contains("textContent = value"));
         // ExecuteScript in this WebView2 does not await promises — a returned
         // Promise serialized as {} and every read died with "missing field
         // url". Drive scripts must stay plain sync objects, never promises.
@@ -2641,6 +3244,30 @@ mod tests {
         let old = node(3, "button", "Checkout", 500);
         let fresh = vec![node(1, "input", "Search", 80), node(2, "a", "Docs", 140)];
         assert_eq!(rematch_control(&fresh, &old), None);
+    }
+
+    #[test]
+    fn flow_status_says_why_it_is_stuck_and_that_the_turn_is_live() {
+        let sign_in = page_status_line("https://accounts.google.com/signin", "sign-in", "Sign in").unwrap();
+        assert!(sign_in.starts_with("Stuck:"));
+        assert!(sign_in.contains("Finish signing in"));
+        assert!(sign_in.contains("not a background job"));
+        let gallery = page_status_line("https://labs.google/fx/tools/flow", "no-composer", "Flow").unwrap();
+        assert!(gallery.contains("project"));
+        assert!(page_status_line("https://labs.google/fx/tools/flow", "composer-ready", "Flow").is_none());
+        let rejected = explain_from_value(&serde_json::json!({"error": "prompt-rejected", "url": "https://labs.google/fx/tools/flow", "title": "Flow"}));
+        assert!(rejected.contains("did not keep it"));
+        let stale = explain_from_value(&serde_json::json!({"error": "no control at that index — read the page again for fresh ids"}));
+        assert!(stale.contains("no control at that index"));
+        assert!(stale.starts_with("Stuck:"));
+        assert!(stale.contains("not a background job"));
+        let live = live_browser_status("type_text", "a cat walking through rain");
+        assert!(live.contains("Writing the prompt"));
+        assert!(live.contains("not a background job"));
+        assert_eq!(
+            stuck_line("Wrote nothing\nStuck: the prompt was sent to the composer and the page did not keep it."),
+            Some("Stuck: the prompt was sent to the composer and the page did not keep it.".into())
+        );
     }
 
     #[test]

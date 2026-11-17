@@ -17,6 +17,7 @@ mod redact;
 mod repair;
 mod remediation_core;
 mod scan;
+mod site_session;
 mod site_window;
 mod siwc;
 mod snapshot;
@@ -28,6 +29,7 @@ mod vault;
 mod wallet;
 mod wallet_engine;
 mod wallet_live;
+mod dock_mcp;
 mod workspace_apps;
 mod workspace_bridge;
 mod workspace_git;
@@ -36,11 +38,14 @@ mod terminal_pty;
 mod mini_computer;
 pub mod bot_fleet;
 mod code_mode;
+mod context_copy;
 mod coworker;
+mod job_clock;
 pub mod licensing;
 mod harness2_engine;
 mod kernel_ops;
 mod mcp_acp_automesh;
+mod mcp_oauth;
 pub mod messaging_gateway;
 pub mod bi_directional_push;
 pub mod gateway_connections;
@@ -263,7 +268,11 @@ pub fn run() {
             bi_directional_push::send_interactive_push_alert,
             bi_directional_push::handle_remote_push_button_callback,
             gateway_connections::gateway_connect,
+            gateway_connections::gateway_save_credentials,
+            gateway_connections::gateway_load_credentials,
+            gateway_connections::gateway_restore_saved,
             gateway_connections::gateway_pairing_qr,
+            gateway_connections::gateway_remember_owner,
             gateway_connections::gateway_disconnect,
             gateway_connections::gateway_connection_status,
             gateway_connections::gateway_poll_messages,
@@ -273,11 +282,13 @@ pub fn run() {
             mcp_acp_automesh::mesh_connect_all,
             mcp_acp_automesh::mesh_set_flags,
             mcp_acp_automesh::mesh_relay,
+            dock_mcp::connect_dock_app,
             mcp_acp_automesh::open_mcp_connected_webapp,
             mcp_acp_automesh::open_harness_mcp_setup,
             mcp_acp_automesh::get_webapp_mcp_context_bundle,
             mcp_acp_automesh::ronic_ask_peer_app,
             tunnel::mesh_tunnel_status,
+            tunnel::mesh_arm_connector,
             tunnel::mesh_tunnel_start,
             tunnel::mesh_tunnel_stop,
             tunnel::mesh_tunnel_download,
@@ -290,6 +301,7 @@ pub fn run() {
             licensing::cloud_keychain_store,
             licensing::cloud_keychain_restore,
             licensing::cloud_keychain_clear,
+            licensing::take_auth_callback,
             licensing::open_system_url,
             kernel_ops::kernel_diagnostics,
             kernel_ops::db_maintenance,
@@ -337,6 +349,10 @@ pub fn run() {
             squad_computer_orchestrator::dismiss_squad_windows,
             squad_computer_orchestrator::publish_squad_blackboard_packet,
             squad_computer_orchestrator::list_squad_blackboard_packets,
+            context_copy::context_copy_auto,
+            context_copy::list_context_copies,
+            context_copy::create_context_copy,
+            context_copy::paste_context_copy_to_targets,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
@@ -359,12 +375,36 @@ pub fn run() {
                 let _ = app.deep_link().register_all();
                 app.deep_link().on_open_url(move |event| {
                     for url in event.urls() {
+                        if url.host_str() == Some("gateway") && url.path() == "/pair" {
+                            let mut channel = String::new();
+                            let mut code = String::new();
+                            for (key, value) in url.query_pairs() {
+                                if key == "channel" {
+                                    channel = value.into_owned();
+                                } else if key == "code" {
+                                    code = value.into_owned();
+                                }
+                            }
+                            if let Some(mgr) = emitter.try_state::<Arc<gateway_connections::GatewayManager>>() {
+                                let _ = mgr.complete_pairing(&channel, &code);
+                            }
+                        }
                         if url.host_str() == Some("auth") && url.path() == "/callback" {
-                            let query = url.query().unwrap_or_default();
+                            let query = url.query().unwrap_or_default().to_string();
+                            let mut delivered = query.clone();
+                            if let Some(fragment) = url.fragment() {
+                                if !fragment.is_empty() {
+                                    if !delivered.is_empty() {
+                                        delivered.push('&');
+                                    }
+                                    delivered.push_str(fragment);
+                                }
+                            }
                             if let Some(state) = emitter.try_state::<AppState>() {
                                 ipc_push(&state.ipc, &format!("auth/deep_link {query}"));
                             }
-                            let _ = emitter.emit("ronic://auth-code", query);
+                            licensing::note_auth_callback(&delivered);
+                            let _ = emitter.emit("ronic://auth-code", delivered);
                         }
                     }
                 });
@@ -373,6 +413,7 @@ pub fn run() {
             crate::mcp_acp_automesh::start(handle.clone());
             crate::tunnel::ensure_installed(handle.clone());
             crate::harness2_engine::ensure_installed(handle.clone());
+            crate::job_clock::spawn(handle.clone());
             // Auto-connect desktop MCP clients (Claude Code, Cursor, VS Code,
             // Claude Desktop, ...) at launch. This is the default "connect
             // apps on this computer" behavior; the Mesh studio button re-runs
@@ -570,6 +611,14 @@ fn spawn_watchdog(db_path: PathBuf, beat: Arc<AtomicU64>) {
                     let _ = db::kv_set(&conn, "quote_btc", &price);
                 }
             }
+            // Once a minute, not every 500ms: PASSIVE checkpoints readers
+            // without the stall of a TRUNCATE on the heartbeat thread.
+            if tick % 120 == 0 {
+                let enabled = db::settings_of(&conn).map(|s| s.watchdog_enabled).unwrap_or(true);
+                if enabled {
+                    let _ = conn.pragma_update(None, "wal_checkpoint", "PASSIVE");
+                }
+            }
             tick = tick.wrapping_add(1);
             std::thread::sleep(Duration::from_millis(500));
         }
@@ -590,6 +639,7 @@ fn spawn_sentinel_monitor(db_path: PathBuf, home: PathBuf) {
         loop {
             if tick.is_multiple_of(20) {
                 let _ = crate::remediation_core::sentinel_scan_all(&conn, &home);
+                let _ = crate::remediation_core::auto_hotpatch(&conn, &home);
             } else {
                 let _ = crate::remediation_core::scan_fleet_except(&conn, &home, &["github_sentinel"]);
             }

@@ -144,6 +144,7 @@ fn main() {
         "mesh_connect_all",
         "mesh_set_flags",
         "mesh_relay",
+        "connect_dock_app",
         "open_mcp_connected_webapp",
         "open_harness_mcp_setup",
         "get_webapp_mcp_context_bundle",
@@ -171,6 +172,7 @@ fn main() {
         "cloud_keychain_store",
         "cloud_keychain_restore",
         "cloud_keychain_clear",
+        "take_auth_callback",
         "open_system_url",
         "register_local_machine",
         "unregister_local_machine",
@@ -209,7 +211,11 @@ fn main() {
         "publish_squad_blackboard_packet",
         "list_squad_blackboard_packets",
         "gateway_connect",
+        "gateway_save_credentials",
+        "gateway_load_credentials",
+        "gateway_restore_saved",
         "gateway_pairing_qr",
+        "gateway_remember_owner",
         "gateway_disconnect",
         "gateway_connection_status",
         "gateway_poll_messages",
@@ -219,6 +225,10 @@ fn main() {
         "write_backup_to_path",
         "save_exported_file",
         "delete_workflow",
+        "context_copy_auto",
+        "list_context_copies",
+        "create_context_copy",
+        "paste_context_copy_to_targets",
     ];
 
     tauri_build::try_build(

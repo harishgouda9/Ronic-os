@@ -1,9 +1,20 @@
 import { useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { ArrowLeft, Play, RefreshCw, CheckCircle2, Search, Zap, Shield, Sparkles, Sliders, BookOpen, Terminal } from "lucide-react";
+import { ArrowLeft, CheckCircle2, Search, Zap } from "lucide-react";
 import type { Step } from "../types";
 import { isTauri } from "../api";
 import { useRonic } from "../store";
+import { ChoiceSelect } from "../ui/ChoiceSelect";
+
+async function harness<T>(cmd: string, args: Record<string, unknown> = {}, applySnapshot = false): Promise<T> {
+  if (isTauri()) {
+    const { invoke } = await import("@tauri-apps/api/core");
+    return invoke<T>(cmd, args);
+  }
+  const { browserCall } = await import("../kernel/browser");
+  const result = await browserCall(cmd, args);
+  if (applySnapshot) useRonic.setState({ snap: result.snapshot, toast: result.toast });
+  return result.payload as T;
+}
 
 const COMPONENTS: [string, string][] = [
   ["system_prompt", "System prompt (SOUL.md)"],
@@ -80,20 +91,18 @@ type LibraryEntry = {
 const FLAG_EVENT = "ronic-harness2-flags";
 
 async function saveFlags(patch: Record<string, unknown>): Promise<HarnessStatus> {
-  const status = await invoke<HarnessStatus>("harness2_set_flags", { patch });
+  const status = await harness<HarnessStatus>("harness2_set_flags", { patch });
   window.dispatchEvent(new CustomEvent(FLAG_EVENT, { detail: status }));
   return status;
 }
 
-export function SuperchargeControl({ compact }: { compact?: boolean } = {}) {
-  const desktop = isTauri();
+export function SuperchargeControl({ compact, menu }: { compact?: boolean; menu?: "up" | "down" } = {}) {
   const [status, setStatus] = useState<HarnessStatus | null>(null);
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
-    if (!desktop) return;
     let alive = true;
-    void invoke<HarnessStatus>("harness2_status")
+    void harness<HarnessStatus>("harness2_status")
       .then((s) => {
         if (alive) setStatus(s);
       })
@@ -107,13 +116,13 @@ export function SuperchargeControl({ compact }: { compact?: boolean } = {}) {
       alive = false;
       window.removeEventListener(FLAG_EVENT, onFlags);
     };
-  }, [desktop]);
+  }, []);
 
   const flags = status?.flags;
-  const mode = flags?.mode ?? "off";
+  const mode = flags?.mode === "auto" || flags?.mode === "force" ? flags.mode : "off";
 
   async function setMode(next: string) {
-    if (!desktop || busy) return;
+    if (busy) return;
     setBusy(true);
     try {
       const saved = await saveFlags({ mode: next });
@@ -123,32 +132,27 @@ export function SuperchargeControl({ compact }: { compact?: boolean } = {}) {
     }
   }
 
-  if (!desktop) return null;
-
   return (
-    <div className={`flex items-center ${compact ? "gap-1 shrink-0" : "gap-1.5"}`} title="Harness² Supercharge self-supervision">
-      <span className={`${compact ? "text-[10px]" : "text-[11px]"} font-semibold text-slate-500`}>Supercharge:</span>
-      {(["off", "auto", "force"] as const).map((m) => (
-        <button
-          key={m}
-          type="button"
-          disabled={busy}
-          onClick={() => void setMode(m)}
-          className={`${compact ? "px-2 py-0.5 text-[10px]" : "px-2.5 py-1 text-[11px]"} font-semibold rounded-full border transition cursor-pointer ${
-            mode === m
-              ? "bg-zinc-800 text-white border-zinc-700 shadow-xs"
-              : "bg-slate-100 text-slate-600 border-slate-200 hover:bg-slate-200/80"
-          }`}
-        >
-          {m.toUpperCase()}
-        </button>
-      ))}
-    </div>
+    <ChoiceSelect
+      compact={compact}
+      menu={menu}
+      label="Supercharge"
+      ariaLabel="Supercharge mode"
+      title="Scores this message before the model answers. A complex task gets a local checklist in the same turn. A short question stays on the normal path."
+      value={mode}
+      tone={mode}
+      disabled={busy || !status}
+      options={[
+        { value: "off", label: "Off", hint: "Every message stays on the normal chat path." },
+        { value: "auto", label: "Auto", hint: "Complex tasks get a checklist in the same turn. Short questions do not." },
+        { value: "force", label: "Force", hint: "The next message gets a checklist before the model answers." },
+      ]}
+      onChange={(next) => void setMode(next)}
+    />
   );
 }
 
 export function Harness2PipelineCard({ step }: { step: Step }) {
-  const desktop = isTauri();
   const payload = step.actionPayload as Partial<RunCard>;
   const [card, setCard] = useState<Partial<RunCard>>(payload);
   const [note, setNote] = useState("");
@@ -159,11 +163,11 @@ export function Harness2PipelineCard({ step }: { step: Step }) {
   }, [step.id, step.actionPayload]);
 
   async function act(command: "harness2_keep" | "harness2_promote" | "harness2_revert") {
-    if (!desktop || !card.runId) return;
+    if (!card.runId) return;
     setBusy(true);
     setNote("");
     try {
-      setCard(await invoke<RunCard>(command, { runId: card.runId }));
+      setCard(await harness<RunCard>(command, { runId: card.runId }, true));
     } catch (error) {
       setNote(error instanceof Error ? error.message : String(error));
     } finally {
@@ -183,8 +187,8 @@ export function Harness2PipelineCard({ step }: { step: Step }) {
       </div>
       <p className="text-xs text-slate-600 leading-relaxed">
         {card.trigger === "auto_mid_run_error"
-          ? "Mid-run error recorded. No second model was started."
-          : `Local score ${card.score ?? 0}/100. ${card.recursion || "parallel"} · k=${card.budgetK ?? 1}.`}
+          ? "A command failed. Supercharge recorded one note. No second model was started."
+          : `This plan was attached to the same turn, so the model reads the checklist before it replies. Local score ${card.score ?? 0}/100. ${card.recursion || "parallel"} · k=${card.budgetK ?? 1}.`}
         {" "}Editor: {card.editor || "Local plan only"}. Executor: {card.executor || "not started"}.
       </p>
       <div className="grid gap-2.5 md:grid-cols-3">
@@ -205,7 +209,7 @@ export function Harness2PipelineCard({ step }: { step: Step }) {
       <div className="mt-3 flex flex-wrap gap-2 pt-2 border-t border-slate-100">
         <button
           type="button"
-          disabled={!desktop || busy || !card.runId || card.adopted}
+          disabled={busy || !card.runId || card.adopted}
           onClick={() => void act("harness2_keep")}
           className="px-3.5 py-1.5 text-xs font-semibold bg-zinc-800 hover:bg-zinc-700 text-white rounded-full transition-all cursor-pointer shadow-xs disabled:opacity-40 border border-zinc-700/50"
         >
@@ -213,7 +217,7 @@ export function Harness2PipelineCard({ step }: { step: Step }) {
         </button>
         <button
           type="button"
-          disabled={!desktop || busy || !card.runId || card.promoted}
+          disabled={busy || !card.runId || card.promoted}
           onClick={() => void act("harness2_promote")}
           className="px-3.5 py-1.5 text-xs font-semibold bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-full transition-all cursor-pointer border border-slate-200 disabled:opacity-40"
         >
@@ -221,7 +225,7 @@ export function Harness2PipelineCard({ step }: { step: Step }) {
         </button>
         <button
           type="button"
-          disabled={!desktop || busy || !card.runId || card.soulUntouched !== false}
+          disabled={busy || !card.runId || card.soulUntouched !== false}
           onClick={() => void act("harness2_revert")}
           className="px-3.5 py-1.5 text-xs font-semibold bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-full transition-all cursor-pointer border border-slate-200 disabled:opacity-40"
         >
@@ -237,7 +241,7 @@ export default function Harness2Studio() {
   const go = useRonic((s) => s.go);
   const desktop = isTauri();
   const [status, setStatus] = useState<HarnessStatus | null>(null);
-  const [banner, setBanner] = useState(desktop ? "Loading Harness²." : "Install, the demo, and chat plans run in the desktop app.");
+  const [banner, setBanner] = useState("Loading Harness².");
   const [busy, setBusy] = useState(false);
   const [log, setLog] = useState("");
   const [demo, setDemo] = useState<RunCard | null>(null);
@@ -247,16 +251,14 @@ export default function Harness2Studio() {
   const [score, setScore] = useState<Score | null>(null);
 
   async function refresh() {
-    if (!desktop) return;
-    const next = await invoke<HarnessStatus>("harness2_status");
+    const next = await harness<HarnessStatus>("harness2_status");
     setStatus(next);
     setBanner(next.note);
-    const entries = await invoke<LibraryEntry[]>("harness2_library", { query });
+    const entries = await harness<LibraryEntry[]>("harness2_library", { query });
     setLibrary(entries);
   }
 
   useEffect(() => {
-    if (!desktop) return;
     refresh().catch((error: unknown) => setBanner(error instanceof Error ? error.message : String(error)));
     const onFlags = (event: Event) => {
       const detail = (event as CustomEvent<HarnessStatus>).detail;
@@ -268,7 +270,7 @@ export default function Harness2Studio() {
 
   const flags = status?.flags;
   const badge = !desktop
-    ? "Desktop app"
+    ? "Live in this preview"
     : status?.demoPresent
       ? `harness2-demo installed${status.version ? ` ${status.version}` : ""}`
       : status?.repoPresent
@@ -276,7 +278,6 @@ export default function Harness2Studio() {
         : "Not installed";
 
   async function patch(next: Record<string, unknown>) {
-    if (!desktop) return;
     setBusy(true);
     try {
       const saved = await saveFlags(next);
@@ -306,7 +307,7 @@ export default function Harness2Studio() {
     setBusy(true);
     setLog("");
     try {
-      const report = await invoke<InstallReport>("harness2_install");
+      const report = await harness<InstallReport>("harness2_install");
       setLog(report.log);
       setBanner(report.ok ? (report.already ? "Already installed." : "Install finished.") : "Install did not finish.");
       await refresh();
@@ -321,7 +322,7 @@ export default function Harness2Studio() {
     if (!desktop) return;
     setBusy(true);
     try {
-      const text = await invoke<string>("harness2_check");
+      const text = await harness<string>("harness2_check");
       setLog(text);
       setBanner("Readiness check finished. FAIL lines list optional external pieces (judge URL, document tools) — the engine itself is verified by the demo.");
       await refresh();
@@ -337,7 +338,7 @@ export default function Harness2Studio() {
     setBusy(true);
     setDemo(null);
     try {
-      const card = await invoke<RunCard>("harness2_demo", { budgetK: 2 });
+      const card = await harness<RunCard>("harness2_demo", { budgetK: 2 });
       setDemo(card);
       setLog(card.log);
       setBanner(card.probesExecuted ? "harness2-demo exited 0." : "harness2-demo did not report success.");
@@ -348,17 +349,22 @@ export default function Harness2Studio() {
     }
   }
 
-  async function scoreSample() {
-    if (!desktop) return;
-    setBusy(true);
-    try {
-      setScore(await invoke<Score>("harness2_score", { prompt: sample, attachmentCount: 0 }));
-    } catch (error) {
-      setBanner(error instanceof Error ? error.message : String(error));
-    } finally {
-      setBusy(false);
-    }
-  }
+  useEffect(() => {
+    let alive = true;
+    const handle = window.setTimeout(() => {
+      void harness<Score>("harness2_score", { prompt: sample, attachmentCount: 0 })
+        .then((next) => {
+          if (alive) setScore(next);
+        })
+        .catch((error: unknown) => {
+          if (alive) setBanner(error instanceof Error ? error.message : String(error));
+        });
+    }, 280);
+    return () => {
+      alive = false;
+      window.clearTimeout(handle);
+    };
+  }, [sample, status?.flags.mode, status?.flags.threshold]);
 
   const visible = library.filter((entry) => {
     const needle = query.trim().toLowerCase();
@@ -398,8 +404,14 @@ export default function Harness2Studio() {
                   )}
                 </div>
                 <p className="text-xs text-slate-500 mt-1 max-w-2xl leading-relaxed">
-                  Supercharge scores task complexity on this machine and writes self-verifying execution plans into a local sandbox. Base souls are updated only after promotion.
+                  Supercharge scores the message on this machine before the model answers. A short question stays on the normal chat path. A complex task gets a local checklist in the same turn, so the reply follows a plan. The plan stays in a sandbox. OpenCode, Codex, and Claude are not started. The bot's base soul changes only when you promote a plan.
                 </p>
+                <ul className="text-xs text-slate-600 mt-2 max-w-2xl leading-relaxed list-disc pl-4 space-y-0.5">
+                  <li>Same-turn plan: the model reads the checklist before it replies.</li>
+                  <li>Simple chat stays on the normal path. Greetings and plain questions score 0 and do not arm.</li>
+                  <li>Keep saves the lesson. Promote appends the plan to the base soul. Restore puts the previous soul back.</li>
+                  <li>A failed terminal command records one note and does not start a second model. Probes are not executed.</li>
+                </ul>
               </div>
             </div>
 
@@ -408,6 +420,7 @@ export default function Harness2Studio() {
               <button
                 type="button"
                 disabled={!desktop || busy}
+                title={desktop ? "Clone and verify the upstream engine" : "Install runs in the desktop app"}
                 onClick={() => void install()}
                 className="px-4 py-2 text-xs font-semibold bg-zinc-800 hover:bg-zinc-700 text-white rounded-full transition-all cursor-pointer shadow-xs active:scale-95 disabled:opacity-40 border border-zinc-700/50"
               >
@@ -480,7 +493,7 @@ export default function Harness2Studio() {
             <div className="border-b border-slate-100 pb-3">
               <h3 className="text-sm font-bold text-slate-900">Trigger Conditions &amp; Live Evaluator</h3>
               <p className="text-xs text-slate-500 mt-0.5">
-                Configure auto-supercharge arming criteria, complexity scoring thresholds, and executor substrates.
+                The score updates as you type. Auto arms at the threshold. Force arms every message. Off leaves chat alone. The substrate name is a label. This screen does not start that process.
               </p>
             </div>
 
@@ -490,7 +503,7 @@ export default function Harness2Studio() {
                 <label className="font-semibold text-slate-700">Recursion</label>
                 <select
                   aria-label="Recursion mode"
-                  disabled={!desktop || busy}
+                  disabled={busy || !status}
                   value={flags?.recursion ?? "parallel"}
                   onChange={(event) => void patch({ recursion: event.target.value })}
                   className="w-full px-3 py-2 text-xs border border-slate-200 rounded-xl bg-slate-50 outline-none focus:ring-2 focus:ring-slate-200"
@@ -504,7 +517,7 @@ export default function Harness2Studio() {
                 <label className="font-semibold text-slate-700">Budget (k)</label>
                 <select
                   aria-label="Budget k"
-                  disabled={!desktop || busy}
+                  disabled={busy || !status}
                   value={String(flags?.budgetK ?? 1)}
                   onChange={(event) => void patch({ budgetK: Number(event.target.value) })}
                   className="w-full px-3 py-2 text-xs border border-slate-200 rounded-xl bg-slate-50 outline-none focus:ring-2 focus:ring-slate-200"
@@ -524,7 +537,7 @@ export default function Harness2Studio() {
                   type="range"
                   min={0}
                   max={100}
-                  disabled={!desktop || busy}
+                  disabled={busy || !status}
                   value={flags?.threshold ?? 65}
                   onChange={(event) => void patch({ threshold: Number(event.target.value) })}
                   className="w-full mt-2"
@@ -535,7 +548,7 @@ export default function Harness2Studio() {
                 <label className="font-semibold text-slate-700">Substrate</label>
                 <select
                   aria-label="Executor substrate"
-                  disabled={!desktop || busy}
+                  disabled={busy || !status}
                   value={flags?.substrate ?? "opencode"}
                   onChange={(event) => void patch({ substrate: event.target.value })}
                   className="w-full px-3 py-2 text-xs border border-slate-200 rounded-xl bg-slate-50 outline-none focus:ring-2 focus:ring-slate-200"
@@ -550,34 +563,27 @@ export default function Harness2Studio() {
             {/* Prompt Tester */}
             <div className="space-y-2 pt-2 border-t border-slate-100">
               <label className="block text-xs font-semibold text-slate-700">
-                Live Complexity Scoring Probe:
+                Live score, updates as you type
               </label>
-              <div className="flex gap-2">
-                <textarea
-                  className="min-h-20 flex-1 rounded-2xl border border-slate-200 bg-slate-50 p-3 font-mono text-xs outline-none focus:bg-white focus:ring-2 focus:ring-slate-200 transition"
-                  value={sample}
-                  onChange={(event) => setSample(event.target.value)}
-                  placeholder="Enter a prompt to simulate complexity scoring..."
-                />
-                <button
-                  type="button"
-                  disabled={!desktop || busy}
-                  onClick={() => void scoreSample()}
-                  className="px-5 py-2 font-semibold text-xs bg-zinc-800 hover:bg-zinc-700 text-white rounded-2xl transition-all cursor-pointer shadow-xs active:scale-95 disabled:opacity-40 self-end border border-zinc-700/50"
-                >
-                  Score Prompt
-                </button>
-              </div>
-              {score && (
+              <textarea
+                className="min-h-20 w-full rounded-2xl border border-slate-200 bg-slate-50 p-3 font-mono text-xs outline-none focus:bg-white focus:ring-2 focus:ring-slate-200 transition"
+                value={sample}
+                onChange={(event) => setSample(event.target.value)}
+                placeholder="Type a task. The score updates on its own."
+              />
+              {score ? (
                 <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl text-xs flex items-center gap-2">
                   <span className={`px-2.5 py-0.5 rounded-full font-mono font-bold text-xs ${score.armed ? "bg-emerald-50 text-emerald-800 border border-emerald-300" : "bg-slate-200 text-slate-700"}`}>
                     Score {score.value}/100
                   </span>
                   <span className="text-slate-700">
-                    Auto-supercharge would {score.armed ? "arm a plan" : "leave this in normal chat"}. {score.reasons.join(" ")}
+                    {score.armed
+                      ? "The next message gets a checklist before the model replies. The plan stays in a sandbox, and the base soul stays as it is until you promote it."
+                      : "The next message stays on the normal chat path. Short questions and greetings do not arm."}{" "}
+                    {score.reasons.join(" ")}
                   </span>
                 </div>
-              )}
+              ) : null}
             </div>
           </div>
 
@@ -587,7 +593,7 @@ export default function Harness2Studio() {
               <div>
                 <h3 className="text-sm font-bold text-slate-900">Scoped Evolutionary Components</h3>
                 <p className="text-xs text-slate-500 mt-0.5">
-                  Select which architectural layers are eligible for autonomous adaptation.
+                  Layers named on the plan. Nothing here is rewritten until you promote a plan.
                 </p>
               </div>
               <span className="text-xs font-mono text-slate-500 bg-slate-50 px-2.5 py-0.5 rounded-full border border-slate-200">
@@ -609,7 +615,7 @@ export default function Harness2Studio() {
                   >
                     <input
                       type="checkbox"
-                      disabled={!desktop || busy}
+                      disabled={busy || !status}
                       checked={active}
                       onChange={() => toggleComponent(id)}
                       className="rounded"
@@ -627,7 +633,7 @@ export default function Harness2Studio() {
               <div>
                 <h3 className="text-sm font-bold text-slate-900">Experience Library ({status?.libraryCount ?? 0})</h3>
                 <p className="text-xs text-slate-500 mt-0.5">
-                  Learned reflection notes, domain adaptations, and verifiable behavioral evidence.
+                  Lessons you chose to keep. A plan is not saved here until you press Keep.
                 </p>
               </div>
               <div className="relative min-w-[220px]">

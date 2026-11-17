@@ -32,10 +32,10 @@ import { UpdateNotice } from "./UpdateNotice";
 import { RAIL, type ScreenId } from "../types";
 import { useRonic } from "../store";
 import { Pill } from "./bits";
-import { isTauri } from "../api";
+import { call, isTauri } from "../api";
 import { SuperchargeControl } from "../components/Harness2Studio";
+import { ChoiceSelect } from "./ChoiceSelect";
 
-import { JobClock } from "./JobClock";
 import { useDesktopChrome, WindowControls } from "./WindowChrome";
 
 // xterm and the PTY glue are the heaviest leaf in the shell; load the panel
@@ -43,6 +43,40 @@ import { useDesktopChrome, WindowControls } from "./WindowChrome";
 const TerminalPanel = lazy(() => import("../components/TerminalPanel"));
 
 const RAIL_KEY = "ronic.railWidth";
+
+function LedgerChoice({ mode, sandbox }: { mode: string; sandbox: boolean }) {
+  const value = mode === "live_signer" ? "live_signer" : "sandbox";
+  const [busy, setBusy] = useState(false);
+
+  async function choose(next: string) {
+    if (next === value || busy) return;
+    setBusy(true);
+    try {
+      const res = await call("set_ledger_mode", { mode: next });
+      useRonic.setState({ snap: res.snapshot, toast: res.toast });
+    } catch (error) {
+      useRonic.setState({ toast: error instanceof Error ? error.message : String(error) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <ChoiceSelect
+      ariaLabel="Ledger mode"
+      title="Wallet ledger"
+      value={value}
+      valueLabel={value === "sandbox" && !sandbox ? "Live off" : undefined}
+      tone={value === "live_signer" ? "live" : "sandbox"}
+      disabled={busy}
+      options={[
+        { value: "sandbox", label: "Sandbox", hint: "Virtual funds. Nothing moves on a real rail." },
+        { value: "live_signer", label: "Live signed", hint: "Policy signer is armed. External rails stay locked in this build." },
+      ]}
+      onChange={(next) => void choose(next)}
+    />
+  );
+}
 
 function clampRail(width: number) {
   return Math.min(320, Math.max(56, Math.round(width)));
@@ -255,7 +289,6 @@ export function Shell({ children }: { children: ReactNode }) {
 
   return (
     <div className="app">
-      <JobClock />
       <header className={chrome ? "header desktop-chrome" : "header"}>
         <div className="brand" {...drag}>
           <img className="logo-lockup" src="/brand/logo.png" alt="Ronic OS" draggable={false} />
@@ -303,8 +336,8 @@ export function Shell({ children }: { children: ReactNode }) {
           <button className="wallet-pill" onClick={() => navigate("wallet")}>
             <span>{usdc?.nativeAmount ?? "—"}</span>
             <span className="faint">{inr?.nativeAmount ?? ""}</span>
-            {snap.ledgerMode === "live_signer" ? <span className="sandbox-tag">LIVE·SIGNED</span> : snap.sandbox ? <span className="sandbox-tag">SANDBOX</span> : <span className="sandbox-tag">LIVE OFF</span>}
           </button>
+          <LedgerChoice mode={snap.ledgerMode} sandbox={snap.sandbox} />
           {snap.kernel === "browser" ? (
             <span className="quote-chip" title="The watchdog runs in the desktop shell">no watchdog</span>
           ) : (

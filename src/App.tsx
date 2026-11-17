@@ -1,4 +1,5 @@
 import { useEffect } from "react";
+import { GatewayInbox } from "./components/GatewayInbox";
 import { Screen } from "./screens/Screen";
 import { useRonic } from "./store";
 import { Shell } from "./ui/Shell";
@@ -92,6 +93,7 @@ export function App() {
 
   return (
     <Shell>
+      <GatewayInbox />
       <Screen />
     </Shell>
   );

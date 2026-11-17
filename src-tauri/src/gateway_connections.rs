@@ -4,7 +4,11 @@
 //! - Telegram: Bot API long-polling (getMe → getUpdates loop)
 //! - Discord: Gateway WebSocket (IDENTIFY → event stream)
 //! - Slack: Socket Mode WebSocket (apps.connections.open → event stream)
-//! - WhatsApp: QR pairing via whatsmeow-style WebSocket protocol
+//! - WhatsApp: a real linked-device QR. The phone scans it from WhatsApp →
+//!   Linked devices → Link a device. A Cloud API token still uses Graph.
+//! - Signal, WeChat, and iMessage: a same-Wi-Fi confirm page encoded in a QR.
+//!   The phone opens the page and confirms. This does not log into those apps.
+//! Telegram, Discord, and Slack use their bot tokens.
 //!
 //! Credentials are validated against the live platform API before a connection
 //! is marked "connected". The frontend polls `gateway_connection_status` for
@@ -15,6 +19,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+#[path = "whatsapp_link.rs"]
+mod whatsapp_link;
 
 // ─────────────────────────────────────────────────────────────
 // Public types exposed to the frontend
@@ -34,6 +41,9 @@ pub struct GatewayConnectionInfo {
     pub qr_png_base64: Option<String>,
     /// Deep-link URI encoded in the QR.
     pub qr_uri: Option<String>,
+    /// Allowlisted owner captured for this channel. Empty until one is set.
+    #[serde(default)]
+    pub owner_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -90,6 +100,26 @@ pub struct GatewayManager {
     pub app_handle: Mutex<Option<tauri::AppHandle>>,
     /// Allowlisted owner id captured when a channel connects.
     owners: Mutex<HashMap<String, String>>,
+    /// One-time QR confirm codes. The phone page must present the matching code.
+    pending_pairs: Mutex<HashMap<String, PendingPair>>,
+    /// LAN listener that serves the confirm page. Started on the first QR.
+    pair_listener: Mutex<Option<PairListener>>,
+    /// Bumps when a WhatsApp link session is replaced, so a stale QR is ignored.
+    whatsapp_generation: AtomicU64,
+    /// Live WhatsApp linked-device session. Dropping it stops the client.
+    whatsapp_session: Mutex<Option<whatsapp_link::Session>>,
+    /// One restore per process, so a saved token does not start two listeners.
+    restore_started: AtomicBool,
+}
+
+struct PendingPair {
+    code: String,
+    expires_ms: u64,
+}
+
+struct PairListener {
+    host: String,
+    port: u16,
 }
 
 impl GatewayManager {
@@ -102,12 +132,31 @@ impl GatewayManager {
             inbox: Mutex::new(Vec::new()),
             app_handle: Mutex::new(None),
             owners: Mutex::new(HashMap::new()),
+            pending_pairs: Mutex::new(HashMap::new()),
+            pair_listener: Mutex::new(None),
+            whatsapp_generation: AtomicU64::new(0),
+            whatsapp_session: Mutex::new(None),
+            restore_started: AtomicBool::new(false),
         }
     }
 
     pub fn remember_owner(&self, channel_id: &str, owner_id: &str) {
         let mut owners = self.owners.lock().unwrap_or_else(|error| error.into_inner());
         owners.insert(channel_id.to_string(), owner_id.trim().to_string());
+    }
+
+    /// Saves the first owner. A later, different id does not replace it.
+    pub fn remember_owner_if_unset(&self, channel_id: &str, owner_id: &str) -> Result<String, String> {
+        let owner = owner_id.trim();
+        if owner.is_empty() {
+            return Err("Owner id is empty.".into());
+        }
+        let existing = self.stored_owner(channel_id);
+        if !existing.trim().is_empty() && existing.trim() != owner {
+            return Ok(existing);
+        }
+        self.remember_owner(channel_id, owner);
+        Ok(owner.to_string())
     }
 
     pub fn stored_owner(&self, channel_id: &str) -> String {
@@ -145,20 +194,13 @@ impl GatewayManager {
         self.app_handle.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    fn lock_pairs(&self) -> std::sync::MutexGuard<'_, HashMap<String, PendingPair>> {
+        self.pending_pairs.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn set_state(&self, channel_id: &str, state: GatewayState, error: Option<String>) {
         let mut conns = self.lock_connections();
-        let entry = conns.entry(channel_id.to_string()).or_insert_with(|| GatewayConnectionInfo {
-            channel_id: channel_id.to_string(),
-            state: GatewayState::Disconnected,
-            platform_user: None,
-            platform_user_id: None,
-            error: None,
-            connected_at_ms: None,
-            messages_received: 0,
-            messages_sent: 0,
-            qr_png_base64: None,
-            qr_uri: None,
-        });
+        let entry = conns.entry(channel_id.to_string()).or_insert_with(|| blank_connection(channel_id));
         entry.state = state;
         entry.error = error;
     }
@@ -181,11 +223,22 @@ impl GatewayManager {
 
     fn mark_connected(&self, channel_id: &str) {
         let mut conns = self.lock_connections();
-        if let Some(entry) = conns.get_mut(channel_id) {
-            entry.state = GatewayState::Connected;
-            entry.connected_at_ms = Some(now_ms());
-            entry.error = None;
-        }
+        let entry = conns.entry(channel_id.to_string()).or_insert_with(|| blank_connection(channel_id));
+        entry.state = GatewayState::Connected;
+        entry.connected_at_ms = Some(now_ms());
+        entry.error = None;
+    }
+
+    fn export_public(&self, channel_id: &str) -> GatewayConnectionInfo {
+        let info = self.lock_connections().get(channel_id).cloned();
+        let mut info = info.unwrap_or_else(|| blank_connection(channel_id));
+        info.owner_id = self.stored_owner(channel_id);
+        info
+    }
+
+    fn arm_pairing(&self, channel_id: &str, code: &str, expires_ms: u64) {
+        let mut pairs = self.lock_pairs();
+        pairs.insert(channel_id.to_string(), PendingPair { code: code.to_string(), expires_ms });
     }
 
     fn store_token(&self, channel_id: &str, token: &str) {
@@ -259,6 +312,7 @@ impl GatewayManager {
             let mut info = info.clone();
             let counter = self.msg_counter(channel_id);
             info.messages_received = counter.load(Ordering::Relaxed);
+            info.owner_id = self.stored_owner(channel_id);
             // Skip QR payload in emitted events — it's large and only needed for the QR panel
             info.qr_png_base64 = None;
             if let Some(handle) = self.lock_app_handle().as_ref() {
@@ -266,6 +320,22 @@ impl GatewayManager {
                 let _ = handle.emit("gateway-connection-changed", info);
             }
         }
+    }
+}
+
+fn blank_connection(channel_id: &str) -> GatewayConnectionInfo {
+    GatewayConnectionInfo {
+        channel_id: channel_id.to_string(),
+        state: GatewayState::Disconnected,
+        platform_user: None,
+        platform_user_id: None,
+        error: None,
+        connected_at_ms: None,
+        messages_received: 0,
+        messages_sent: 0,
+        qr_png_base64: None,
+        qr_uri: None,
+        owner_id: String::new(),
     }
 }
 
@@ -321,6 +391,131 @@ fn sanitize_error_body(body: &str, max_len: usize) -> String {
 }
 
 // ─────────────────────────────────────────────────────────────
+// Saved credentials — vault, not the React session
+// ─────────────────────────────────────────────────────────────
+
+const GATEWAY_CRED_KEY: &str = "gateway.credentials.v1";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayCredentialRecord {
+    #[serde(default)]
+    token: String,
+    #[serde(default)]
+    owner_id: String,
+    #[serde(default)]
+    extras: Vec<GatewayCredentialExtra>,
+    #[serde(default)]
+    reconnect: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GatewayCredentialExtra {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    value: String,
+}
+
+fn valid_channel_id(channel_id: &str) -> bool {
+    let channel_id = channel_id.trim();
+    !channel_id.is_empty()
+        && channel_id.len() <= 32
+        && channel_id.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn clean_extra(extra: GatewayCredentialExtra) -> Option<GatewayCredentialExtra> {
+    let label = extra.label.trim();
+    let value = extra.value.trim();
+    if label.is_empty() || value.is_empty() || label.len() > 80 || value.len() > 4_000 {
+        return None;
+    }
+    let id = if extra.id.trim().is_empty() { format!("extra_{label}") } else { extra.id.trim().to_string() };
+    Some(GatewayCredentialExtra { id, label: label.to_string(), value: value.to_string() })
+}
+
+fn parse_gateway_credentials(raw: &str) -> std::collections::BTreeMap<String, GatewayCredentialRecord> {
+    serde_json::from_str(raw).unwrap_or_default()
+}
+
+fn upsert_gateway_credential(
+    mut file: std::collections::BTreeMap<String, GatewayCredentialRecord>,
+    channel_id: &str,
+    token: &str,
+    owner_id: &str,
+    extras: Vec<GatewayCredentialExtra>,
+    reconnect: Option<bool>,
+) -> Result<std::collections::BTreeMap<String, GatewayCredentialRecord>, String> {
+    if !valid_channel_id(channel_id) {
+        return Err("Unknown channel.".into());
+    }
+    let channel_id = channel_id.trim();
+    let token = token.trim();
+    let owner_id = owner_id.trim();
+    if token.len() > 4_000 || owner_id.len() > 200 {
+        return Err("That credential is too long to save.".into());
+    }
+    let extras: Vec<GatewayCredentialExtra> = extras.into_iter().filter_map(clean_extra).take(8).collect();
+    let previous = file.get(channel_id).map(|row| row.reconnect).unwrap_or(false);
+    let reconnect = reconnect.unwrap_or(previous);
+    if token.is_empty() && owner_id.is_empty() && extras.is_empty() && !(channel_id == "whatsapp" && reconnect) {
+        file.remove(channel_id);
+        return Ok(file);
+    }
+    file.insert(
+        channel_id.to_string(),
+        GatewayCredentialRecord {
+            token: token.to_string(),
+            owner_id: owner_id.to_string(),
+            extras,
+            reconnect,
+        },
+    );
+    Ok(file)
+}
+
+fn vault_is_locked(app: &crate::AppState) -> bool {
+    let has_pass = {
+        let conn = crate::commands::guard(app);
+        crate::db::kv_get(&conn, "vault_verifier").ok().flatten().is_some()
+    };
+    if !has_pass {
+        return false;
+    }
+    app.vault_key.lock().unwrap_or_else(|error| error.into_inner()).is_none()
+}
+
+fn load_gateway_file(app: &crate::AppState) -> Result<std::collections::BTreeMap<String, GatewayCredentialRecord>, String> {
+    if vault_is_locked(app) {
+        return Err("Unlock the vault before loading gateway credentials.".into());
+    }
+    let secrets = app.secrets.lock().unwrap_or_else(|error| error.into_inner());
+    let raw = secrets.get(GATEWAY_CRED_KEY).cloned().unwrap_or_else(|| "{}".into());
+    Ok(parse_gateway_credentials(&raw))
+}
+
+fn store_gateway_file(app: &crate::AppState, file: &std::collections::BTreeMap<String, GatewayCredentialRecord>) -> Result<(), String> {
+    if vault_is_locked(app) {
+        return Err("Unlock the vault before saving gateway credentials.".into());
+    }
+    let json = serde_json::to_string(file).map_err(|error| error.to_string())?;
+    if json.len() > 48_000 {
+        return Err("Gateway credentials are too large to save.".into());
+    }
+    let conn = crate::commands::guard(app);
+    let key_guard = app.vault_key.lock().unwrap_or_else(|error| error.into_inner());
+    let mut secrets = app.secrets.lock().unwrap_or_else(|error| error.into_inner());
+    if json == "{}" {
+        secrets.remove(GATEWAY_CRED_KEY);
+    } else {
+        secrets.insert(GATEWAY_CRED_KEY.to_string(), json);
+    }
+    crate::vault::persist(&app.home, &conn, key_guard.as_ref(), &secrets).map_err(|error| error.to_string())
+}
+
+// ─────────────────────────────────────────────────────────────
 // Tauri commands — frontend calls these
 // ─────────────────────────────────────────────────────────────
 
@@ -359,72 +554,159 @@ pub async fn gateway_connect(
                 messages_sent: 0,
                 qr_png_base64: None,
                 qr_uri: None,
+                owner_id: String::new(),
             };
             mgr.set_state(other, GatewayState::Error, info.error.clone());
             mgr.emit_status(other);
             Err(info.error.unwrap())
         }
     };
-    if result.is_ok() {
-        owner_mgr.remember_owner(&channel_key, &owner_key);
+    match result {
+        Ok(mut info) => {
+            // An empty owner must not wipe a sender adopted after the last connect.
+            if !owner_key.is_empty() {
+                owner_mgr.remember_owner(&channel_key, &owner_key);
+            }
+            info.owner_id = owner_mgr.stored_owner(&channel_key);
+            Ok(info)
+        }
+        Err(error) => Err(error),
     }
-    result
 }
 
 /// Build a scannable pairing QR for a channel without requiring a bot token.
-/// A channel that is already connected keeps that state. The PNG is returned
-/// on this call — status events omit it because the payload is large.
+/// The code is an http page on this computer's LAN address. The phone opens
+/// it and confirms. `force` replaces a code on a channel that is already paired.
+/// A channel connected with an API token is left alone.
 #[tauri::command]
 pub async fn gateway_pairing_qr(
     channel_id: String,
+    force: Option<bool>,
     state: tauri::State<'_, Arc<GatewayManager>>,
 ) -> Result<GatewayConnectionInfo, String> {
     let mgr = state.inner().clone();
-    let code = generate_pairing_id();
-    let uri = format!("ronic://gateway/pair?channel={channel_id}&code={code}");
-    let png = generate_qr_png(&uri)?;
-    {
-        let mut conns = mgr.lock_connections();
-        let entry = conns.entry(channel_id.clone()).or_insert_with(|| GatewayConnectionInfo {
-            channel_id: channel_id.clone(),
-            state: GatewayState::Disconnected,
-            platform_user: None,
-            platform_user_id: None,
-            error: None,
-            connected_at_ms: None,
-            messages_received: 0,
-            messages_sent: 0,
-            qr_png_base64: None,
-            qr_uri: None,
-        });
-        if !matches!(entry.state, GatewayState::Connected | GatewayState::Connecting | GatewayState::Validating) {
-            entry.state = GatewayState::AwaitingQrScan;
-            entry.error = None;
-        }
-        entry.qr_png_base64 = Some(png);
-        entry.qr_uri = Some(uri);
+    if channel_id == "whatsapp" {
+        return whatsapp_link::begin(&mgr, force.unwrap_or(false)).await;
     }
-    let result = mgr.lock_connections()
-        .get(&channel_id)
-        .cloned()
-        .ok_or_else(|| "pairing state missing".to_string());
-    result
+    begin_scan_pairing(&mgr, &channel_id, force.unwrap_or(false))
+}
+
+/// Remember the first person who messaged a connected bot. Does not replace an owner.
+#[tauri::command]
+pub async fn gateway_remember_owner(
+    channel_id: String,
+    owner_id: String,
+    state: tauri::State<'_, Arc<GatewayManager>>,
+) -> Result<String, String> {
+    state.remember_owner_if_unset(&channel_id, &owner_id)
 }
 
 /// Disconnect a channel, stopping its background listener and removing the stored token.
+/// The saved credential stays. The next launch does not connect it again.
 #[tauri::command]
 pub async fn gateway_disconnect(
     channel_id: String,
     state: tauri::State<'_, Arc<GatewayManager>>,
+    app: tauri::State<'_, crate::AppState>,
 ) -> Result<String, String> {
     let mgr = state.inner();
+    if channel_id == "whatsapp" {
+        whatsapp_link::stop(mgr);
+    }
     mgr.signal_cancel(&channel_id);
     mgr.remove_token(&channel_id);
     mgr.set_state(&channel_id, GatewayState::Disconnected, None);
     mgr.set_platform_user(&channel_id, None, None);
     mgr.set_qr(&channel_id, None, None);
     mgr.emit_status(&channel_id);
+    // The disconnect only counts once the saved reconnect flag is cleared on disk.
+    // Otherwise a locked vault or a write failure would reconnect on the next launch.
+    let mut file = load_gateway_file(app.inner())?;
+    if let Some(record) = file.get_mut(channel_id.trim()) {
+        record.reconnect = false;
+        store_gateway_file(app.inner(), &file)?;
+    }
     Ok(format!("Disconnected {channel_id}"))
+}
+
+/// Saves one channel's token, owner, and extra fields in the vault.
+#[tauri::command]
+pub async fn gateway_save_credentials(
+    channel_id: String,
+    token: String,
+    owner_id: String,
+    extras: Option<Vec<GatewayCredentialExtra>>,
+    reconnect: Option<bool>,
+    app: tauri::State<'_, crate::AppState>,
+) -> Result<String, String> {
+    let file = load_gateway_file(app.inner())?;
+    let file = upsert_gateway_credential(file, &channel_id, &token, &owner_id, extras.unwrap_or_default(), reconnect)?;
+    store_gateway_file(app.inner(), &file)?;
+    Ok("Credentials saved on this computer.".into())
+}
+
+/// Returns saved gateway credentials so the form can be filled after a restart.
+#[tauri::command]
+pub async fn gateway_load_credentials(
+    app: tauri::State<'_, crate::AppState>,
+) -> Result<std::collections::BTreeMap<String, GatewayCredentialRecord>, String> {
+    load_gateway_file(app.inner())
+}
+
+/// Connects channels that were connected last time, using the saved vault tokens.
+#[tauri::command]
+pub async fn gateway_restore_saved(
+    app: tauri::State<'_, crate::AppState>,
+    state: tauri::State<'_, Arc<GatewayManager>>,
+) -> Result<Vec<String>, String> {
+    let file = load_gateway_file(app.inner())?;
+    let mgr = state.inner().clone();
+    if mgr.restore_started.swap(true, Ordering::AcqRel) {
+        return Ok(Vec::new());
+    }
+    let mut started = Vec::new();
+    for (channel_id, record) in file {
+        if !record.reconnect || mgr.is_connected(&channel_id) {
+            continue;
+        }
+        if !record.owner_id.trim().is_empty() {
+            let _ = mgr.remember_owner_if_unset(&channel_id, &record.owner_id);
+        }
+        let token = record.token.trim().to_string();
+        match channel_id.as_str() {
+            "telegram" | "discord" | "slack" if !token.is_empty() => {
+                let listener = mgr.clone();
+                let id = channel_id.clone();
+                let secret = token;
+                mgr.clear_cancel(&id);
+                tokio::spawn(async move {
+                    let result = if id == "telegram" {
+                        connect_telegram(listener, id, secret, String::new()).await
+                    } else if id == "discord" {
+                        connect_discord(listener, id, secret, String::new()).await
+                    } else {
+                        connect_slack(listener, id, secret, String::new()).await
+                    };
+                    let _ = result;
+                });
+                started.push(channel_id);
+            }
+            "whatsapp" if !whatsapp_token_is_pairing(&token) => {
+                let listener = mgr.clone();
+                let secret = token.clone();
+                tokio::spawn(async move {
+                    let _ = connect_whatsapp_cloud(listener, "whatsapp".into(), secret).await;
+                });
+                started.push(channel_id);
+            }
+            "whatsapp" if whatsapp_link::session_file_exists() => {
+                let _ = whatsapp_link::begin(&mgr, false).await;
+                started.push(channel_id);
+            }
+            _ => {}
+        }
+    }
+    Ok(started)
 }
 
 /// Get the current connection status for one or all channels.
@@ -434,11 +716,20 @@ pub async fn gateway_connection_status(
     state: tauri::State<'_, Arc<GatewayManager>>,
 ) -> Result<Vec<GatewayConnectionInfo>, String> {
     let mgr = state.inner();
-    let conns = mgr.connections.lock().unwrap();
-    match channel_id {
-        Some(id) => Ok(conns.get(&id).cloned().into_iter().collect()),
-        None => Ok(conns.values().cloned().collect()),
-    }
+    let infos: Vec<GatewayConnectionInfo> = {
+        let conns = mgr.lock_connections();
+        match channel_id {
+            Some(id) => conns.get(&id).cloned().into_iter().collect(),
+            None => conns.values().cloned().collect(),
+        }
+    };
+    Ok(infos
+        .into_iter()
+        .map(|mut info| {
+            info.owner_id = mgr.stored_owner(&info.channel_id);
+            info
+        })
+        .collect())
 }
 
 /// Drain pending incoming messages (frontend polls this).
@@ -582,8 +873,31 @@ async fn connect_telegram(
         messages_sent: 0,
         qr_png_base64: None,
         qr_uri: None,
+        owner_id: String::new(),
     });
     Ok(info)
+}
+
+fn telegram_identity(from: Option<&serde_json::Value>) -> (String, String) {
+    let sender_id = from
+        .and_then(|item| item.get("id"))
+        .and_then(|value| value.as_i64())
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    let sender_name = from
+        .and_then(|item| item.get("first_name"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("Unknown");
+    let sender_username = from
+        .and_then(|item| item.get("username"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let display = if sender_username.is_empty() {
+        sender_name.to_string()
+    } else {
+        format!("{sender_name} (@{sender_username})")
+    };
+    (sender_id, display)
 }
 
 /// Long-polling loop for Telegram getUpdates. Runs until cancelled.
@@ -652,25 +966,7 @@ async fn telegram_poll_loop(
                     continue;
                 }
 
-                let from = message.get("from");
-                let sender_id = from
-                    .and_then(|f| f.get("id"))
-                    .and_then(|v| v.as_i64())
-                    .map(|v| v.to_string())
-                    .unwrap_or_default();
-                let sender_name = from
-                    .and_then(|f| f.get("first_name"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Unknown");
-                let sender_username = from
-                    .and_then(|f| f.get("username"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let display = if sender_username.is_empty() {
-                    sender_name.to_string()
-                } else {
-                    format!("{sender_name} (@{sender_username})")
-                };
+                let (sender_id, display) = telegram_identity(message.get("from"));
 
                 let chat_id = message
                     .get("chat")
@@ -700,21 +996,12 @@ async fn telegram_poll_loop(
             // Handle callback queries (inline keyboard button taps)
             if let Some(callback) = update.get("callback_query") {
                 let data = callback.get("data").and_then(|v| v.as_str()).unwrap_or("");
-                let from = callback.get("from");
-                let sender_id = from
-                    .and_then(|f| f.get("id"))
-                    .and_then(|v| v.as_i64())
-                    .map(|v| v.to_string())
-                    .unwrap_or_default();
-                let sender_name = from
-                    .and_then(|f| f.get("first_name"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Unknown");
+                let (sender_id, display) = telegram_identity(callback.get("from"));
 
                 let incoming = IncomingGatewayMessage {
                     channel_id: channel_id.clone(),
                     sender_id,
-                    sender_display: sender_name.to_string(),
+                    sender_display: display,
                     text: format!("[button_tap:{data}]"),
                     chat_id: callback
                         .get("message")
@@ -985,6 +1272,7 @@ async fn connect_discord(
         messages_sent: 0,
         qr_png_base64: None,
         qr_uri: None,
+        owner_id: String::new(),
     });
     Ok(info)
 }
@@ -1368,6 +1656,7 @@ async fn connect_slack(
         messages_sent: 0,
         qr_png_base64: None,
         qr_uri: None,
+        owner_id: String::new(),
     });
     Ok(info)
 }
@@ -1530,35 +1819,11 @@ async fn connect_whatsapp(
     // the channel waits on a scannable pairing QR. The PNG is on the returned
     // info — status events strip it.
     if !whatsapp_token_is_pairing(&token) {
+        whatsapp_link::stop(&mgr);
         return connect_whatsapp_cloud(mgr, channel_id, token.trim().to_string()).await;
     }
 
-    let pairing_id = generate_pairing_id();
-    let pairing_uri = format!("ronic://gateway/pair?channel=whatsapp&code={pairing_id}");
-    let qr_png = generate_qr_png(&pairing_uri)?;
-
-    mgr.set_state(&channel_id, GatewayState::AwaitingQrScan, None);
-    mgr.set_qr(&channel_id, Some(qr_png.clone()), Some(pairing_uri.clone()));
-
-    let info = mgr.lock_connections().get(&channel_id).cloned().unwrap_or(GatewayConnectionInfo {
-        channel_id: channel_id.clone(),
-        state: GatewayState::AwaitingQrScan,
-        platform_user: None,
-        platform_user_id: None,
-        error: None,
-        connected_at_ms: None,
-        messages_received: 0,
-        messages_sent: 0,
-        qr_png_base64: None,
-        qr_uri: None,
-    });
-    // Put the bytes on the value we return even if the map entry was replaced.
-    Ok(GatewayConnectionInfo {
-        qr_png_base64: Some(qr_png),
-        qr_uri: Some(pairing_uri),
-        error: None,
-        ..info
-    })
+    whatsapp_link::begin(&mgr, true).await
 }
 
 async fn connect_whatsapp_cloud(
@@ -1621,8 +1886,279 @@ async fn connect_whatsapp_cloud(
         messages_sent: 0,
         qr_png_base64: None,
         qr_uri: None,
+        owner_id: String::new(),
     });
     Ok(info)
+}
+
+// ─────────────────────────────────────────────────────────────
+// QR pairing — same-Wi-Fi confirm page
+// ─────────────────────────────────────────────────────────────
+
+const PAIR_TTL_MS: u64 = 10 * 60 * 1000;
+
+fn channel_pairs_by_scan(channel_id: &str) -> bool {
+    // WhatsApp is a linked-device session, not this confirm page.
+    matches!(channel_id, "signal" | "wechat" | "bluebubbles")
+}
+
+fn channel_label(channel_id: &str) -> &str {
+    match channel_id {
+        "whatsapp" => "WhatsApp",
+        "signal" => "Signal",
+        "wechat" => "WeChat",
+        "bluebubbles" => "iMessage",
+        "telegram" => "Telegram",
+        other => other,
+    }
+}
+
+fn pairing_http_uri(host: &str, port: u16, channel_id: &str, code: &str) -> String {
+    format!("http://{host}:{port}/pair?channel={channel_id}&code={code}")
+}
+
+fn lan_ipv4() -> String {
+    let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") else {
+        return "127.0.0.1".into();
+    };
+    if socket.connect("8.8.8.8:80").is_err() {
+        return "127.0.0.1".into();
+    }
+    match socket.local_addr() {
+        Ok(addr) => match addr.ip() {
+            std::net::IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => ip.to_string(),
+            _ => "127.0.0.1".into(),
+        },
+        Err(_) => "127.0.0.1".into(),
+    }
+}
+
+fn codes_match(expected: &str, given: &str) -> bool {
+    let left = expected.as_bytes();
+    let right = given.as_bytes();
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in left.iter().zip(right.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
+fn ensure_pair_listener(mgr: &Arc<GatewayManager>) -> Result<(String, u16), String> {
+    let mut slot = mgr.pair_listener.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(listener) = slot.as_ref() {
+        return Ok((listener.host.clone(), listener.port));
+    }
+    let listener = std::net::TcpListener::bind("0.0.0.0:0")
+        .map_err(|error| format!("Pairing listener failed: {error}"))?;
+    let port = listener.local_addr().map_err(|error| format!("Pairing listener failed: {error}"))?.port();
+    let host = lan_ipv4();
+    let mgr_thread = Arc::clone(mgr);
+    std::thread::spawn(move || pair_http_loop(mgr_thread, listener));
+    *slot = Some(PairListener { host: host.clone(), port });
+    Ok((host, port))
+}
+
+fn begin_scan_pairing(mgr: &Arc<GatewayManager>, channel_id: &str, force: bool) -> Result<GatewayConnectionInfo, String> {
+    if channel_id == "whatsapp" {
+        return Err("WhatsApp links from the phone: WhatsApp, then Linked devices, then Link a device.".into());
+    }
+    if !channel_pairs_by_scan(channel_id) {
+        return Err(format!("{channel_id} connects with a bot token, not a QR code."));
+    }
+    let token_connected = mgr.is_connected(channel_id) && mgr.get_token(channel_id).is_some();
+    if token_connected || (mgr.is_connected(channel_id) && !force) {
+        let mut info = mgr.export_public(channel_id);
+        info.qr_png_base64 = None;
+        info.qr_uri = None;
+        return Ok(info);
+    }
+    let (host, port) = ensure_pair_listener(mgr)?;
+    let code = generate_pairing_id();
+    mgr.arm_pairing(channel_id, &code, now_ms().saturating_add(PAIR_TTL_MS));
+    let uri = pairing_http_uri(&host, port, channel_id, &code);
+    let png = generate_qr_png(&uri)?;
+    {
+        let mut conns = mgr.lock_connections();
+        let entry = conns.entry(channel_id.to_string()).or_insert_with(|| blank_connection(channel_id));
+        if !matches!(entry.state, GatewayState::Connected | GatewayState::Connecting | GatewayState::Validating) {
+            entry.state = GatewayState::AwaitingQrScan;
+            entry.error = None;
+        }
+        entry.qr_png_base64 = Some(png.clone());
+        entry.qr_uri = Some(uri.clone());
+    }
+    mgr.emit_status(channel_id);
+    let mut info = mgr.export_public(channel_id);
+    info.qr_png_base64 = Some(png);
+    info.qr_uri = Some(uri);
+    Ok(info)
+}
+
+impl GatewayManager {
+    /// Marks a scan channel connected when the phone opens the matching confirm page.
+    pub fn complete_pairing(&self, channel_id: &str, code: &str) -> Result<(), String> {
+        if channel_id == "whatsapp" {
+            return Err("WhatsApp links from the phone: WhatsApp, then Linked devices, then Link a device. This page is not a WhatsApp code.".into());
+        }
+        if !channel_pairs_by_scan(channel_id) {
+            return Err("This channel connects with a bot token. A QR scan cannot connect it.".into());
+        }
+        if self.get_token(channel_id).is_some() && self.is_connected(channel_id) {
+            return Err("This channel is already connected with an API token.".into());
+        }
+        let code = code.trim();
+        let pending = {
+            let pairs = self.lock_pairs();
+            pairs.get(channel_id).map(|item| (item.code.clone(), item.expires_ms))
+        };
+        let Some((expected, expires_ms)) = pending else {
+            if self.is_connected(channel_id) {
+                return Err("This channel is already connected.".into());
+            }
+            return Err("No pairing code is waiting. On the computer, open the channel and refresh the QR.".into());
+        };
+        if now_ms() >= expires_ms {
+            self.lock_pairs().remove(channel_id);
+            return Err("That pairing code expired. Refresh the QR on the computer.".into());
+        }
+        if !codes_match(&expected, code) {
+            return Err("That pairing code does not match the one on screen.".into());
+        }
+        self.lock_pairs().remove(channel_id);
+        self.set_platform_user(channel_id, Some("Paired phone".into()), None);
+        self.mark_connected(channel_id);
+        self.set_qr(channel_id, None, None);
+        if self.stored_owner(channel_id).trim().is_empty() {
+            self.remember_owner(channel_id, "paired-phone");
+        }
+        self.emit_status(channel_id);
+        Ok(())
+    }
+}
+
+fn pair_http_loop(mgr: Arc<GatewayManager>, listener: std::net::TcpListener) {
+    for stream in listener.incoming() {
+        let Ok(mut stream) = stream else { continue };
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(4)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(4)));
+        let mut buf = [0u8; 2048];
+        let Ok(n) = std::io::Read::read(&mut stream, &mut buf) else { continue };
+        if n == 0 {
+            continue;
+        }
+        let request = String::from_utf8_lossy(&buf[..n]);
+        let response = handle_pair_http(&mgr, &request);
+        let _ = std::io::Write::write_all(&mut stream, &response);
+    }
+}
+
+fn handle_pair_http(mgr: &GatewayManager, request: &str) -> Vec<u8> {
+    let Some(target) = request_target(request) else {
+        return http_html(400, "Bad Request", "This page only accepts the pairing link from the QR code.");
+    };
+    let path = target.split('?').next().unwrap_or(target);
+    let channel = query_param(target, "channel").unwrap_or_default();
+    let code = query_param(target, "code").unwrap_or_default();
+    if !channel_pairs_by_scan(&channel) || !valid_pair_code(&code) {
+        return http_html(404, "Not Found", "This pairing link is not valid. Refresh the QR on the computer.");
+    }
+    let label = channel_label(&channel);
+    if path == "/pair/confirm" {
+        return match mgr.complete_pairing(&channel, &code) {
+            Ok(()) => http_html(200, "OK", &format!(
+                "<h1>Phone paired</h1><p>This phone is paired. Ronic OS on your computer now shows {label} as connected. You can close this page.</p>"
+            )),
+            Err(error) => http_html(400, "Bad Request", &format!("<h1>Not paired</h1><p>{}</p>", html_escape(&error))),
+        };
+    }
+    if path == "/pair" {
+        let ready = {
+            let pairs = mgr.lock_pairs();
+            matches!(pairs.get(&channel), Some(pending) if now_ms() < pending.expires_ms && codes_match(&pending.code, &code))
+        };
+        if !ready {
+            if mgr.is_connected(&channel) {
+                return http_html(200, "OK", &format!("<h1>Already paired</h1><p>{label} is already connected on this computer.</p>"));
+            }
+            return http_html(400, "Bad Request", "<h1>Code expired</h1><p>Refresh the QR on the computer and scan the new code.</p>");
+        }
+        let body = format!(
+            "<h1>Pair this phone</h1><p>This connects the {label} channel in Ronic OS on the computer that showed the QR. It does not log in to WhatsApp, Signal, WeChat, or iMessage.</p><p><a href=\"/pair/confirm?channel={channel}&amp;code={code}\">Confirm pairing</a></p>"
+        );
+        return http_html(200, "OK", &body);
+    }
+    http_html(404, "Not Found", "This pairing link is not valid. Refresh the QR on the computer.")
+}
+
+fn request_target(request: &str) -> Option<&str> {
+    let line = request.lines().next()?.trim();
+    let mut parts = line.split_whitespace();
+    if parts.next()? != "GET" {
+        return None;
+    }
+    parts.next()
+}
+
+fn query_param(target: &str, key: &str) -> Option<String> {
+    let query = target.split_once('?')?.1;
+    for pair in query.split('&') {
+        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if name == key {
+            return Some(percent_decode(value));
+        }
+    }
+    None
+}
+
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_val(bytes[index + 1]), hex_val(bytes[index + 2])) {
+                out.push((hi << 4) | lo);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn valid_pair_code(code: &str) -> bool {
+    code.len() == 32 && code.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn html_escape(value: &str) -> String {
+    value.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+fn http_html(status: u16, reason: &str, body_inner: &str) -> Vec<u8> {
+    let page = format!(
+        "<!doctype html><html><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Ronic OS pairing</title></head><body style=\"font-family:sans-serif;padding:24px;max-width:28rem;line-height:1.45\">{body_inner}</body></html>"
+    );
+    let header = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n",
+        page.len()
+    );
+    let mut out = header.into_bytes();
+    out.extend_from_slice(page.as_bytes());
+    out
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1762,6 +2298,91 @@ mod tests {
             let inbox = mgr.inbox.lock().unwrap();
             assert_eq!(inbox.len(), 2);
         }
+    }
+
+    #[test]
+    fn qr_confirm_connects_the_channel_once() {
+        let mgr = GatewayManager::new();
+        let code = "ab".repeat(16);
+        mgr.arm_pairing("signal", &code, now_ms() + 60_000);
+        let page = String::from_utf8(handle_pair_http(&mgr, &format!("GET /pair?channel=signal&code={code} HTTP/1.1\r\n"))).unwrap();
+        assert!(page.contains("Confirm pairing"));
+        assert!(page.contains("does not log in"));
+        let confirmed = String::from_utf8(handle_pair_http(&mgr, &format!("GET /pair/confirm?channel=signal&code={code} HTTP/1.1\r\n"))).unwrap();
+        assert!(confirmed.contains("Phone paired"));
+        assert!(mgr.is_connected("signal"));
+        assert_eq!(mgr.stored_owner("signal"), "paired-phone");
+        let again = mgr.complete_pairing("signal", &code).unwrap_err();
+        assert!(again.contains("already connected"));
+    }
+
+    #[test]
+    fn whatsapp_qr_is_a_linked_device_code_not_a_web_link() {
+        let four = "2@AbCdEf,AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=,BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=,CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=";
+        let five = format!("{four},1");
+        assert!(whatsapp_link::is_companion_code(four));
+        assert!(whatsapp_link::is_companion_code(&five));
+        assert!(whatsapp_link::is_companion_code(&format!("https://wa.me/settings/linked_devices#{five}")));
+        assert!(whatsapp_link::is_companion_code(&format!("{five},https://faq.whatsapp.com/r/ld")));
+        assert!(!whatsapp_link::is_companion_code("http://192.168.1.20:47321/pair?channel=whatsapp&code=abcd"));
+        assert!(!whatsapp_link::is_companion_code("a,b,c,d"));
+        let mgr = GatewayManager::new();
+        let err = mgr.complete_pairing("whatsapp", &"ab".repeat(16)).unwrap_err();
+        assert!(err.contains("Linked devices"));
+        let refused = begin_scan_pairing(&Arc::new(mgr), "whatsapp", true).unwrap_err();
+        assert!(refused.contains("Linked devices"));
+    }
+
+    #[test]
+    fn qr_confirm_rejects_the_wrong_code_and_telegram() {
+        let mgr = GatewayManager::new();
+        let code = "cd".repeat(16);
+        mgr.arm_pairing("signal", &code, now_ms() + 60_000);
+        let wrong = String::from_utf8(handle_pair_http(&mgr, "GET /pair/confirm?channel=signal&code=00112233445566778899aabbccddeeff HTTP/1.1\r\n")).unwrap();
+        assert!(wrong.contains("does not match"));
+        assert!(!mgr.is_connected("signal"));
+        let telegram = mgr.complete_pairing("telegram", &code).unwrap_err();
+        assert!(telegram.contains("bot token"));
+        assert!(!pairing_http_uri("192.168.1.20", 47321, "whatsapp", &code).contains("ronic://"));
+    }
+
+    #[test]
+    fn expired_qr_and_token_connection_do_not_pair() {
+        let mgr = GatewayManager::new();
+        mgr.arm_pairing("wechat", &"ef".repeat(16), 0);
+        let expired = mgr.complete_pairing("wechat", &"ef".repeat(16)).unwrap_err();
+        assert!(expired.contains("expired"));
+        mgr.mark_connected("bluebubbles");
+        mgr.store_token("bluebubbles", "cloud-token");
+        mgr.arm_pairing("bluebubbles", &"aa".repeat(16), now_ms() + 60_000);
+        let kept = mgr.complete_pairing("bluebubbles", &"aa".repeat(16)).unwrap_err();
+        assert!(kept.contains("API token"));
+        assert_eq!(mgr.remember_owner_if_unset("telegram", "8512444167").unwrap(), "8512444167");
+        assert_eq!(mgr.remember_owner_if_unset("telegram", "999").unwrap(), "8512444167");
+    }
+
+    #[test]
+    fn saved_credentials_round_trip_and_a_blank_form_clears_the_channel() {
+        let file = upsert_gateway_credential(
+            std::collections::BTreeMap::new(),
+            "telegram",
+            "123456789:AAH-token-token-token-token",
+            "8512444167",
+            vec![GatewayCredentialExtra { id: "e1".into(), label: "Allowlisted sender".into(), value: "999".into() }],
+            Some(true),
+        )
+        .unwrap();
+        let raw = serde_json::to_string(&file).unwrap();
+        let parsed = parse_gateway_credentials(&raw);
+        assert_eq!(parsed["telegram"].token, "123456789:AAH-token-token-token-token");
+        assert_eq!(parsed["telegram"].owner_id, "8512444167");
+        assert!(parsed["telegram"].reconnect);
+        assert_eq!(parsed["telegram"].extras[0].value, "999");
+        let cleared = upsert_gateway_credential(parsed, "telegram", "", "", vec![], None).unwrap();
+        assert!(cleared.get("telegram").is_none());
+        let kept = upsert_gateway_credential(std::collections::BTreeMap::new(), "whatsapp", "", "", vec![], Some(true)).unwrap();
+        assert!(kept["whatsapp"].reconnect);
+        assert!(kept["whatsapp"].token.is_empty());
     }
 
     #[test]

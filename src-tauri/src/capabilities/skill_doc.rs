@@ -225,13 +225,28 @@ fn finish_plugin(
     let tools: Vec<_> = tools.into_iter().filter(|tool| !tool.name.trim().is_empty()).collect();
     let hooks: Vec<_> = hooks.into_iter().map(|hook| hook.trim().to_string()).filter(|hook| is_hook(hook)).collect();
     let skills: Vec<_> = skills.into_iter().map(|skill| sanitize_slug(&skill)).filter(|skill| !skill.is_empty()).collect();
-    let desktop: Vec<_> = desktop
-        .into_iter()
-        .filter(|bit| matches!(bit.kind.as_str(), "status" | "command" | "pane") && !bit.label.trim().is_empty())
-        .collect();
+    let desktop = keep_desktop(desktop);
     let has_desktop = has_desktop || !desktop.is_empty();
     let has_agent = has_agent || !tools.is_empty() || !hooks.is_empty() || !skills.is_empty();
     ParsedPlugin { slug, name, version, has_agent, has_desktop, tools, hooks, skills, desktop }
+}
+
+pub fn keep_desktop(bits: Vec<DesktopBit>) -> Vec<DesktopBit> {
+    bits.into_iter().filter_map(|mut bit| {
+        let kind = match bit.kind.trim().to_ascii_lowercase().as_str() {
+            "status" => "status",
+            "command" => "command",
+            "pane" | "webview" | "screen" | "side" => "pane",
+            _ => return None,
+        };
+        let label = bit.label.trim().to_string();
+        if label.is_empty() {
+            return None;
+        }
+        bit.kind = kind.into();
+        bit.label = label;
+        Some(bit)
+    }).collect()
 }
 
 pub fn sanitize_slug(raw: &str) -> String {
@@ -339,7 +354,21 @@ fn array_of<T>(value: &serde_json::Value, key: &str, map: impl Fn(&serde_json::V
 
 #[cfg(test)]
 mod tests {
-    use super::parse_skill;
+    use super::{parse_plugin, parse_skill};
+
+    #[test]
+    fn webview_desktop_bit_becomes_a_side_pane() {
+        let parsed = parse_plugin(
+            "id: docs-canvas\nname: Docs Canvas\nhas_desktop_part: true\ndesktop:\n  - kind: webview\n    label: Docs Canvas\n    target: docs-canvas\n  - kind: side\n    label: Notes\n    target: notes\n  - kind: mystery\n    label: Skip\n    target: x\n  - kind: pane\n    label: \"  \"\n    target: empty\n  - kind: status\n    label: Ready\n    target: \"\"\n",
+            "docs-canvas",
+        );
+        assert_eq!(parsed.desktop.len(), 3);
+        assert_eq!(parsed.desktop[0].kind, "pane");
+        assert_eq!(parsed.desktop[0].label, "Docs Canvas");
+        assert_eq!(parsed.desktop[1].kind, "pane");
+        assert_eq!(parsed.desktop[2].kind, "status");
+        assert!(parsed.has_desktop);
+    }
 
     #[test]
     fn folded_frontmatter_description_is_one_line() {

@@ -4,8 +4,9 @@
 //! WebView2 profile under ~/.ronicos/webapps/browser so a login survives
 //! and a second site does not share cookies. On Windows a webview that sets
 //! its own user agent is blank unless that profile directory is unique.
-//! Google and Apple sign-in closes that panel and opens Chrome or Edge on
-//! the same EBWebView folder. OpenAI sign-in stays in the panel.
+//! Google and Apple sign-in closes that panel and opens Edge, then Chrome, on
+//! the same EBWebView folder. That sign-in page is never shown in the panel.
+//! OpenAI sign-in stays in the panel.
 
 use crate::db;
 use crate::error::{err, Result};
@@ -175,11 +176,27 @@ pub fn open_workspace_webapp_by_bot<R: Runtime>(
     url: Option<&str>,
     name: Option<&str>,
 ) -> Result<String> {
+    open_workspace_webapp_at(app, id, url, name, None)
+}
+
+/// Open a Dock web app, then stay on `landing` when that page is the same site.
+/// Known apps ignore a free-form URL, so the connector page is passed here.
+pub fn open_workspace_webapp_at<R: Runtime>(
+    app: &AppHandle<R>,
+    id: &str,
+    url: Option<&str>,
+    name: Option<&str>,
+    landing: Option<&str>,
+) -> Result<String> {
     let (app_id, app_name, app_url) = resolve_web(id, url, name)?;
+    let view_url = match landing {
+        Some(landing) => checked_landing(&app_url, landing)?,
+        None => app_url.clone(),
+    };
     let _ = app.emit("ronic://open-workspace-webapp", serde_json::json!({
         "id": app_id,
         "name": app_name,
-        "url": app_url,
+        "url": view_url,
     }));
     let label = label_for(&app_id);
     let bounds = stored_bounds(&label).unwrap_or(WebAppBounds {
@@ -189,8 +206,28 @@ pub fn open_workspace_webapp_by_bot<R: Runtime>(
         height: 700.0,
     });
     let home = crate::util::product_home();
-    let shown = show(app, &home, &app_id, bounds, true, Some(&app_url), Some(&app_name))?;
+    let shown = show_in(app, &home, &app_id, bounds, true, Some(&app_url), Some(&app_name), landing)?;
+    if landing.is_some() {
+        if let Some(message) = shown.signing_in {
+            return Ok(format!("{message} The connector page is {view_url}."));
+        }
+        return Ok(format!("Opened {} beside you in the workspace stage ({view_url}).", shown.name));
+    }
     Ok(format!("Opened {} beside you in the workspace stage ({})", shown.name, app_url))
+}
+
+fn checked_landing(home: &str, landing: &str) -> Result<String> {
+    let home_url = url::Url::parse(home).map_err(|_| err("web app address must be an https URL"))?;
+    let next = url::Url::parse(landing).map_err(|_| err("web app address must be an https URL"))?;
+    if next.scheme() != "https" {
+        return Err(err("web app address must be an https URL"));
+    }
+    let home_host = home_url.host_str().unwrap_or("");
+    let next_host = next.host_str().unwrap_or("");
+    if home_host.is_empty() || !home_host.eq_ignore_ascii_case(next_host) {
+        return Err(err("That connector page is not on this app."));
+    }
+    Ok(next.to_string())
 }
 
 fn web_spec(id: &str) -> Option<WebSpec> {
@@ -326,8 +363,16 @@ fn resolve_web(id: &str, url: Option<&str>, name: Option<&str>) -> Result<(Strin
 }
 
 pub fn show<R: Runtime>(app: &AppHandle<R>, home: &Path, id: &str, bounds: WebAppBounds, focus: bool, url: Option<&str>, name: Option<&str>) -> Result<ShownWebApp> {
+    show_in(app, home, id, bounds, focus, url, name, None)
+}
+
+fn show_in<R: Runtime>(app: &AppHandle<R>, home: &Path, id: &str, bounds: WebAppBounds, focus: bool, url: Option<&str>, name: Option<&str>, landing: Option<&str>) -> Result<ShownWebApp> {
     let _guard = WEB_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
     let (app_id, app_name, app_url) = resolve_web(id, url, name)?;
+    let view_url = match landing {
+        Some(landing) => checked_landing(&app_url, landing)?,
+        None => app_url.clone(),
+    };
     let bounds = bounds.clamped();
     let label = label_for(&app_id);
     remember_bounds(&label, bounds);
@@ -344,17 +389,22 @@ pub fn show<R: Runtime>(app: &AppHandle<R>, home: &Path, id: &str, bounds: WebAp
     let dir = crate::site_window::profile_dir(home, &label);
     if let Some(existing) = app.get_webview(&label) {
         if let Some(current) = existing.url().ok() {
-            if crate::site_window::handoff_if_blocked(app, &label, &dir, &current, &app_url, &app_name) {
-                let message = crate::site_window::browser_sign_in_message(&label);
-                return Ok(ShownWebApp { name: app_name, signing_in: message });
-            }
             if crate::site_window::embedded_auth_blocked(&current) {
                 if let Ok(home_url) = app_url.parse() {
                     let _ = existing.navigate(home_url);
                 }
             }
+            if crate::site_window::handoff_if_blocked(app, &label, &dir, &current, &app_url, &app_name) {
+                let message = crate::site_window::browser_sign_in_message(&label);
+                return Ok(ShownWebApp { name: app_name, signing_in: message });
+            }
         }
         move_view(&existing, bounds)?;
+        if landing.is_some() {
+            if let Ok(next) = view_url.parse() {
+                let _ = existing.navigate(next);
+            }
+        }
         if existing.url().ok().is_some_and(|url| crate::workspace_bridge::chat_page_url(&url)) {
             let _ = existing.eval(crate::workspace_bridge::PAGE_SCRIPT);
         }
@@ -369,20 +419,20 @@ pub fn show<R: Runtime>(app: &AppHandle<R>, home: &Path, id: &str, bounds: WebAp
         return Err(err(format!("Close the browser sign-in window, then open {app_name} again.")));
     }
     let dir = crate::site_window::ensure_profile(home, &label)?;
-    let parsed: url::Url = app_url.parse().map_err(|error: url::ParseError| err(error.to_string()))?;
+    let parsed: url::Url = view_url.parse().map_err(|error: url::ParseError| err(error.to_string()))?;
     let builder = crate::site_window::site_child(
         WebviewBuilder::new(&label, WebviewUrl::External(parsed)),
         dir.clone(),
         app.clone(),
         label.clone(),
-        app_url.clone(),
+        view_url.clone(),
     )
     .background_color(Color(255, 255, 255, 255));
     let created = window
         .add_child(builder, LogicalPosition::new(bounds.x, bounds.y), LogicalSize::new(bounds.width, bounds.height))
         .map_err(|error| err(error.to_string()))?;
     crate::site_window::prepare_sign_in(&created, false);
-    crate::site_window::watch_panel(app.clone(), label, dir, app_url, app_name.clone());
+    crate::site_window::watch_panel(app.clone(), label, dir, view_url, app_name.clone());
     if focus {
         let _ = created.set_focus();
     }
@@ -1219,6 +1269,15 @@ fn last_line(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dock_connector_url_stays_on_the_app_host() {
+        assert!(checked_landing("https://chatgpt.com", "https://chatgpt.com/#settings/apps").unwrap().contains("chatgpt.com"));
+        assert!(checked_landing("https://claude.ai", "https://claude.ai/settings/connectors").is_ok());
+        assert!(checked_landing("https://grok.com", "https://grok.com/settings").is_ok());
+        assert!(checked_landing("https://chatgpt.com", "https://evil.example/settings").is_err());
+        assert!(checked_landing("https://chatgpt.com", "http://chatgpt.com/#settings/apps").is_err());
+    }
 
     #[test]
     fn web_apps_point_at_https_sites() {

@@ -38,8 +38,10 @@
     "allow-cloud-keychain-clear",
     "allow-cloud-keychain-restore",
     "allow-cloud-keychain-store",
+    "allow-take-auth-callback",
     "allow-compile-mcp-acp-to-typescript-dts",
     "allow-complete-onboarding",
+    "allow-connect-dock-app",
     "allow-connect-external-bot",
     "allow-create-bot-group",
     "allow-appoint-chief-officer",
@@ -88,6 +90,7 @@
     "allow-mesh-relay",
     "allow-mesh-set-flags",
     "allow-mesh-status",
+    "allow-mesh-arm-connector",
     "allow-mesh-tunnel-download",
     "allow-mesh-tunnel-start",
     "allow-mesh-tunnel-status",
@@ -254,7 +257,11 @@
     "allow-publish-squad-blackboard-packet",
     "allow-list-squad-blackboard-packets",
     "allow-gateway-connect",
+    "allow-gateway-save-credentials",
+    "allow-gateway-load-credentials",
+    "allow-gateway-restore-saved",
     "allow-gateway-pairing-qr",
+    "allow-gateway-remember-owner",
     "allow-gateway-disconnect",
     "allow-gateway-connection-status",
     "allow-gateway-poll-messages",
@@ -263,6 +270,10 @@
     "allow-detect-backup-destinations",
     "allow-write-backup-to-path",
     "allow-save-exported-file",
-    "allow-delete-workflow"
+    "allow-delete-workflow",
+    "allow-context-copy-auto",
+    "allow-list-context-copies",
+    "allow-create-context-copy",
+    "allow-paste-context-copy-to-targets"
   ]
 }

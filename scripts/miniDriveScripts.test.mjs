@@ -45,9 +45,30 @@ test("generated mini-computer drive scripts parse as plain sync JavaScript", () 
     assert.ok(!js.includes("new Promise"), `${name} script must not return a promise (WebView2 serializes it as {})`);
   }
   assert.match(scripts.smartClick, /__ronicScore/, "smart click scores matches");
-  assert.match(scripts.smartClick, /scrollIntoView/, "smart click scrolls the target into view");
+  assert.match(scripts.smartClick, /__ronicPress/, "smart click uses the shared press");
   assert.match(scripts.click, /__ronicControls\(\)/, "click uses the visibility-filtered control list");
+  assert.match(scripts.scroll, /__ronicScroll/, "scroll moves the panel under the pointer, not only the window");
   assert.match(scripts.find, /hits\.length < 15/, "find caps its hits");
+  assert.doesNotMatch(scripts.click, /block: "center"/, "a click must not park the target in the middle of the view");
+});
+
+test("ad skip presses Skip and ignores countdown, intro, and non-ad buttons", () => {
+  const collect = rawString("MINI_COLLECT_FN");
+  const decide = new Function(`${collect}; return {
+    skip: __ronicAdDecision(true, "Skip", false),
+    skipAd: __ronicAdDecision(true, "Skip Ad", false),
+    countdown: __ronicAdDecision(true, "Skip in 5", false),
+    intro: __ronicAdDecision(true, "Skip intro", false),
+    off: __ronicAdDecision(false, "Skip", false),
+    disabled: __ronicAdDecision(true, "Skip", true)
+  };`);
+  const got = decide();
+  assert.equal(got.skip, "skip");
+  assert.equal(got.skipAd, "skip");
+  assert.equal(got.countdown, "waiting");
+  assert.equal(got.intro, "waiting");
+  assert.equal(got.off, "");
+  assert.equal(got.disabled, "waiting");
 });
 
 test("collector exposes media state so playback is verifiable", () => {
@@ -56,6 +77,8 @@ test("collector exposes media state so playback is verifiable", () => {
   assert.doesNotThrow(() => new Function(`${collect}; return __ronicCollect();`));
   assert.match(collect, /querySelector\("video"\)/);
   assert.match(collect, /video\.paused/);
+  assert.match(collect, /__ronicAdState/, "an ad is not reported as the real video");
+  assert.match(collect, /__ronicArmAdWatch/, "skip keeps running between tool calls");
   assert.match(collect, /__ronicControls/, "controls pass through the visibility filter");
   assert.match(collect, /type === "hidden"/, "hidden inputs are dropped");
   assert.match(collect, /type === "file"/, "file inputs are dropped");

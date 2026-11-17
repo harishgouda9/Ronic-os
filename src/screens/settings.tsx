@@ -541,6 +541,7 @@ export function SettingsScreen() {
                   <span>Fail over to the profile fallback provider</span>
                   <Switch on={draft.autoFailover} />
                 </button>
+                <p className="muted">Uses that bot's Fallback lane when the current model is full or cannot answer, and only if that lane is connected. None leaves the current model in place.</p>
                 <p className="muted">Run doctor checkpoints SQLite, repairs broken JSON under extensions, and can patch one known scraper error. A copy of that file is kept in the workspace .shadow-git folder. The doctor runs when you press the button.</p>
                 <div className="row-actions">
                   <button className="btn ghost" disabled={recovering} onClick={() => void recover()}>{recovering ? "Refreshing…" : "Refresh"}</button>

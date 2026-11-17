@@ -89,8 +89,8 @@ export function PlanHub() {
   const pro = license?.planTier === "pro" || founder;
 
   return (
-    <div className="flex-1 h-full bg-[#eceef2] p-3 sm:p-5 lg:p-6 overflow-y-auto select-none flex flex-col">
-      <div className="w-full max-w-[1560px] flex-1 min-h-[660px] bg-white rounded-3xl shadow-[0_12px_40px_-8px_rgba(0,0,0,0.06),0_2px_8px_-1px_rgba(0,0,0,0.03)] border border-slate-200/70 flex flex-col mx-auto overflow-hidden transition-all duration-300">
+    <div className="flex-1 h-full min-h-0 bg-[#eceef2] p-3 sm:p-5 lg:p-6 overflow-y-auto select-none flex flex-col">
+      <div className="w-full max-w-[1560px] flex-1 min-h-0 bg-white rounded-3xl shadow-[0_12px_40px_-8px_rgba(0,0,0,0.06),0_2px_8px_-1px_rgba(0,0,0,0.03)] border border-slate-200/70 flex flex-col mx-auto overflow-hidden transition-all duration-300">
 
         {/* ─── HEADER ─── */}
         <div className="p-5 sm:p-7 pb-3.5 space-y-4 border-b border-slate-100">
@@ -169,6 +169,9 @@ function PlansTab({ snap, signedIn, founder, pro }: { snap: Snapshot; signedIn: 
   const walletUsd = (license?.walletMicroUsd ?? 0) / 1_000_000;
   const [note, setNote] = useState("");
   const [authBusy, setAuthBusy] = useState(false);
+  const [picked, setPicked] = useState<"starter" | "pro" | "founder">(founder ? "founder" : license?.planTier === "pro" ? "pro" : "starter");
+  const [cycle, setCycle] = useState<"month" | "year">("month");
+  const proProduct = cycle === "year" ? "pro_yearly" : "pro_monthly";
 
   function save(next: Settings) {
     void run("save_settings", { settings: next });
@@ -198,8 +201,17 @@ function PlansTab({ snap, signedIn, founder, pro }: { snap: Snapshot; signedIn: 
     }
   }
 
-  async function checkout(product: "founder_pass" | "pro_monthly" | "pro_yearly", rail: "stripe" | "razorpay") {
+  async function choosePlan(product: "founder_pass" | "pro_monthly" | "pro_yearly", rail: "stripe" | "razorpay") {
+    if (authBusy) return;
     if (!signedIn) {
+      await signInAndRegister();
+      if (!cloudSession()) return;
+    }
+    await checkout(product, rail);
+  }
+
+  async function checkout(product: "founder_pass" | "pro_monthly" | "pro_yearly", rail: "stripe" | "razorpay") {
+    if (!cloudSession()) {
       setNote("Sign in first — the plan lands on your account after payment.");
       return;
     }
@@ -352,7 +364,10 @@ function PlansTab({ snap, signedIn, founder, pro }: { snap: Snapshot; signedIn: 
 
         <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
           {/* Starter */}
-          <article className={`bg-white rounded-2xl p-5 shadow-xs space-y-3 border transition-all ${!pro ? "border-slate-900 ring-1 ring-slate-900" : "border-slate-200/80"}`}>
+          <article
+            className={`bg-white rounded-2xl p-5 shadow-xs space-y-3 border transition-all cursor-pointer ${picked === "starter" ? "border-slate-900 ring-1 ring-slate-900" : "border-slate-200/80"}`}
+            onClick={() => setPicked("starter")}
+          >
             <div className="flex items-center justify-between">
               <h3 className="text-sm font-bold text-slate-900">Ronic Starter</h3>
               <Chip tone={pro ? "slate" : "emerald"}>{pro ? "included" : "current"}</Chip>
@@ -369,17 +384,47 @@ function PlansTab({ snap, signedIn, founder, pro }: { snap: Snapshot; signedIn: 
               <li className="flex items-start gap-1.5"><Check size={12} className="text-emerald-500 mt-0.5 shrink-0" /> Original bots on your subscriptions + 3 manual Supercharge runs/day</li>
               <li className="flex items-start gap-1.5"><Check size={12} className="text-emerald-500 mt-0.5 shrink-0" /> Sandbox wallet ledger (no live charges)</li>
             </ul>
+            <button
+              type="button"
+              onClick={(event) => {
+                event.stopPropagation();
+                setPicked("starter");
+                setNote(pro ? "Starter stays on the machine. A paid plan stays on the account until the billing provider ends it." : "Starter is the plan on this machine.");
+              }}
+              className="text-xs font-semibold px-3.5 py-1.5 rounded-full border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 transition-all cursor-pointer active:scale-95"
+            >
+              {pro ? "View Starter" : "Current plan"}
+            </button>
           </article>
 
           {/* Pro */}
-          <article className={`bg-white rounded-2xl p-5 shadow-xs space-y-3 border transition-all ${pro && !founder ? "border-slate-900 ring-1 ring-slate-900" : "border-slate-200/80"}`}>
+          <article
+            className={`bg-white rounded-2xl p-5 shadow-xs space-y-3 border transition-all cursor-pointer ${picked === "pro" ? "border-slate-900 ring-1 ring-slate-900" : "border-slate-200/80"}`}
+            onClick={() => setPicked("pro")}
+          >
             <div className="flex items-center justify-between">
               <h3 className="text-sm font-bold text-slate-900">Ronic Pro</h3>
-              {founder ? <Chip tone="emerald">★ included for life</Chip> : snap.license?.proEntitled ? <Chip tone="emerald">active</Chip> : null}
+              {founder ? <Chip tone="emerald">★ included for life</Chip> : license?.planTier === "pro" ? <Chip tone="emerald">active</Chip> : null}
             </div>
             <div>
-              <p className="text-2xl font-bold text-slate-900 tracking-tight">$14/mo</p>
-              <p className="text-[11px] text-slate-400">or $120/yr · ₹999/mo UPI</p>
+              <p className="text-2xl font-bold text-slate-900 tracking-tight">{cycle === "year" ? "$120/yr" : "$14/mo"}</p>
+              <p className="text-[11px] text-slate-400">{cycle === "year" ? "₹9,990/yr UPI" : "₹999/mo UPI"}</p>
+            </div>
+            <div className="flex items-center gap-1.5" onClick={(event) => event.stopPropagation()}>
+              <button
+                type="button"
+                onClick={() => { setPicked("pro"); setCycle("month"); }}
+                className={`text-xs font-semibold px-3 py-1.5 rounded-full border transition-all cursor-pointer ${cycle === "month" ? "bg-zinc-800 text-white border-zinc-700/50" : "bg-white text-slate-700 border-slate-200 hover:bg-slate-50"}`}
+              >
+                Monthly
+              </button>
+              <button
+                type="button"
+                onClick={() => { setPicked("pro"); setCycle("year"); }}
+                className={`text-xs font-semibold px-3 py-1.5 rounded-full border transition-all cursor-pointer ${cycle === "year" ? "bg-zinc-800 text-white border-zinc-700/50" : "bg-white text-slate-700 border-slate-200 hover:bg-slate-50"}`}
+              >
+                Yearly
+              </button>
             </div>
             <ul className="space-y-1.5 text-[11.5px] text-slate-600">
               <li className="flex items-start gap-1.5"><Zap size={12} className="text-amber-500 mt-0.5 shrink-0" /> &lt;50ms auto-failover when a 5-hour cap hits mid-task</li>
@@ -390,34 +435,36 @@ function PlansTab({ snap, signedIn, founder, pro }: { snap: Snapshot; signedIn: 
               <li className="flex items-start gap-1.5"><Laptop size={12} className="text-slate-500 mt-0.5 shrink-0" /> 3 concurrent machines</li>
             </ul>
             {!founder ? (
-              <div className="flex items-center gap-2 pt-1">
+              <div className="flex items-center gap-2 pt-1" onClick={(event) => event.stopPropagation()}>
                 <button
                   type="button"
-                  disabled={!signedIn}
-                  title={signedIn ? undefined : "Sign in first."}
-                  onClick={() => void checkout("pro_monthly", "stripe")}
+                  disabled={authBusy}
+                  onClick={() => void choosePlan(proProduct, "stripe")}
                   className="text-xs font-semibold px-3.5 py-1.5 rounded-full bg-zinc-800 hover:bg-zinc-700 text-white border border-zinc-700/50 shadow-xs transition-all cursor-pointer active:scale-95 disabled:opacity-40"
                 >
-                  $14/mo card
+                  {cycle === "year" ? "$120/yr card" : "$14/mo card"}
                 </button>
                 <button
                   type="button"
-                  disabled={!signedIn}
-                  onClick={() => void checkout("pro_monthly", "razorpay")}
+                  disabled={authBusy}
+                  onClick={() => void choosePlan(proProduct, "razorpay")}
                   className="text-xs font-semibold px-3.5 py-1.5 rounded-full border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 transition-all cursor-pointer active:scale-95 disabled:opacity-40"
                 >
-                  ₹999 UPI
+                  {cycle === "year" ? "₹9,990 UPI" : "₹999 UPI"}
                 </button>
               </div>
             ) : null}
           </article>
 
           {/* Founder */}
-          <article className={`rounded-2xl p-5 shadow-xs space-y-3 border transition-all ${
-            founder
-              ? "bg-slate-900 text-white border-slate-900"
-              : "bg-white border-slate-200/80"
-          }`}>
+          <article
+            className={`rounded-2xl p-5 shadow-xs space-y-3 border transition-all cursor-pointer ${
+              founder
+                ? "bg-slate-900 text-white border-slate-900"
+                : "bg-white"
+            } ${picked === "founder" ? "ring-1 ring-slate-900 border-slate-900" : "border-slate-200/80"}`}
+            onClick={() => setPicked("founder")}
+          >
             <div className="flex items-center justify-between">
               <h3 className={`text-sm font-bold ${founder ? "text-white" : "text-slate-900"}`}>Founder Pass ★</h3>
               {founder && license?.founderBadge ? <Chip tone="amber">#{license.founderBadge}</Chip> : null}
@@ -434,20 +481,19 @@ function PlansTab({ snap, signedIn, founder, pro }: { snap: Snapshot; signedIn: 
               <li className="flex items-start gap-1.5"><Star size={12} className="text-amber-400 mt-0.5 shrink-0" /> All future core updates</li>
             </ul>
             {!founder ? (
-              <div className="flex items-center gap-2 pt-1">
+              <div className="flex items-center gap-2 pt-1" onClick={(event) => event.stopPropagation()}>
                 <button
                   type="button"
-                  disabled={!signedIn}
-                  title={signedIn ? undefined : "Sign in first."}
-                  onClick={() => void checkout("founder_pass", "stripe")}
+                  disabled={authBusy}
+                  onClick={() => void choosePlan("founder_pass", "stripe")}
                   className="text-xs font-semibold px-3.5 py-1.5 rounded-full bg-zinc-800 hover:bg-zinc-700 text-white border border-zinc-700/50 shadow-xs transition-all cursor-pointer active:scale-95 disabled:opacity-40"
                 >
                   Claim — $149
                 </button>
                 <button
                   type="button"
-                  disabled={!signedIn}
-                  onClick={() => void checkout("founder_pass", "razorpay")}
+                  disabled={authBusy}
+                  onClick={() => void choosePlan("founder_pass", "razorpay")}
                   className="text-xs font-semibold px-3.5 py-1.5 rounded-full border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 transition-all cursor-pointer active:scale-95 disabled:opacity-40"
                 >
                   ₹11,999 UPI

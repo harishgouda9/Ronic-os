@@ -57,7 +57,7 @@ import {
 } from "lucide-react";
 
 import { listen } from "@tauri-apps/api/event";
-import { isTauri } from "../api";
+import { call, isTauri } from "../api";
 import { useRonic } from "../store";
 import type { WfNode, Workflow, BotProfile } from "../types";
 
@@ -780,6 +780,7 @@ const nodeTypes = {
 // ==========================================
 export default function WorkflowsStudio() {
   const run = useRonic((s) => s.run);
+  const setToast = useRonic((s) => s.setToast);
   const snap = useRonic((s) => s.snap);
   const go = useRonic((s) => s.go);
   const busy = useRonic((s) => s.busy);
@@ -855,6 +856,13 @@ export default function WorkflowsStudio() {
   const activeWf: Workflow | null = liveForThis
     ? { ...snapshotWf!, nodes: liveForThis.nodes, currentStatus: liveForThis.status }
     : snapshotWf;
+
+  useEffect(() => {
+    if (!live || !snapshotWf || live.wfId !== snapshotWf.id) return;
+    if (snapshotWf.currentStatus === live.status && snapshotWf.currentStatus !== "running") {
+      setLive(null);
+    }
+  }, [snapshotWf?.updatedAt, snapshotWf?.currentStatus, live, snapshotWf]);
 
   useEffect(() => {
     if (activeWf) {
@@ -1139,31 +1147,10 @@ export default function WorkflowsStudio() {
     persist(snapshotWf, nextNodes);
   };
 
-  const handleRunSingleStep = async (nodeId: string) => {
+  const handleRunSingleStep = (nodeId: string) => {
     if (!snapshotWf) return;
-    const currentNodes = liveForThis?.nodes ?? snapshotWf.nodes;
-    const node = currentNodes.find((n) => n.id === nodeId);
-    if (!node) return;
-
-    const nextNodes = currentNodes.map((n) => (n.id === nodeId ? { ...n, status: "running" as const } : n));
-    setLive({ wfId: snapshotWf.id, status: "running", nodes: nextNodes });
-
-    setTimeout(() => {
-      const doneNodes = currentNodes.map((n) =>
-        n.id === nodeId ? { ...n, status: "done" as const, latencyMs: Math.floor(Math.random() * 300 + 150) } : n
-      );
-      const checkpoint = { ...(snapshotWf.checkpoint || {}) };
-      checkpoint[nodeId] = `Test output for step "${node.name}" (${node.kind}): evaluated successfully with ${node.model || "default agent engine"}.`;
-
-      void run("update_workflow", {
-        patch: {
-          id: snapshotWf.id,
-          nodes: doneNodes,
-          checkpoint,
-        },
-      });
-      setLive(null);
-    }, 700);
+    setLive(null);
+    void run("run_workflow", { id: snapshotWf.id, nodeId }).finally(() => setLive(null));
   };
 
   const handleAutoLayoutDAG = () => {
@@ -1386,7 +1373,7 @@ export default function WorkflowsStudio() {
           <button
             onClick={() => {
               setLive(null);
-              if (snapshotWf) void run("run_workflow", { id: snapshotWf.id });
+              if (snapshotWf) void run("run_workflow", { id: snapshotWf.id }).finally(() => setLive(null));
             }}
             disabled={!snapshotWf || busy || activeWf?.currentStatus === "running"}
             className="px-3.5 py-1.5 text-xs font-semibold bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg flex items-center gap-1.5 transition cursor-pointer disabled:opacity-50 shadow-xs active:scale-98"
@@ -1397,8 +1384,17 @@ export default function WorkflowsStudio() {
           </button>
 
           <button
-            onClick={() => snapshotWf && void run("pause_workflow", { id: snapshotWf.id })}
-            disabled={!snapshotWf || busy || activeWf?.currentStatus !== "running"}
+            onClick={() => {
+              if (!snapshotWf) return;
+              void call("pause_workflow", { id: snapshotWf.id })
+                .then((res) => {
+                  if (res.toast) setToast(res.toast);
+                })
+                .catch((error: unknown) => {
+                  setToast(error instanceof Error ? error.message : String(error));
+                });
+            }}
+            disabled={!snapshotWf || activeWf?.currentStatus !== "running"}
             className={`px-3 py-1.5 text-xs font-semibold rounded-lg border flex items-center gap-1.5 transition cursor-pointer disabled:opacity-50 ${
               isDark
                 ? "bg-slate-800 hover:bg-slate-700 text-slate-200 border-slate-700"
@@ -1413,11 +1409,11 @@ export default function WorkflowsStudio() {
           <button
             onClick={() => {
               setLive(null);
-              if (snapshotWf) void run("resume_workflow", { id: snapshotWf.id });
+              if (snapshotWf) void run("resume_workflow", { id: snapshotWf.id }).finally(() => setLive(null));
             }}
-            disabled={!snapshotWf || busy || !activeWf?.currentStatus.includes("paused")}
+            disabled={!snapshotWf || busy || !(activeWf?.currentStatus.includes("paused") || activeWf?.currentStatus === "error")}
             className="px-3 py-1.5 text-xs font-semibold bg-amber-600 hover:bg-amber-500 text-white rounded-lg flex items-center gap-1.5 transition cursor-pointer disabled:opacity-50 shadow-xs"
-            title="Resume paused approval gate"
+            title="Resume a paused gate or a failed step"
           >
             <Play size={12} className="fill-current" />
             <span>Resume</span>

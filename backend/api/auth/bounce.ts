@@ -1,12 +1,10 @@
 // GET /auth/bounce (rewritten from /api/auth/bounce) — the last hop of the
-// desktop PKCE flow. Supabase redirects the system browser here with
-// ?code=... (or ?error=...); this page hands the code to the desktop app via
-// the ronic:// deep link. No tokens ever appear in this URL.
+// desktop auth flow. Supabase redirects the system browser here with
+// ?code=... (PKCE) or #access_token=... (implicit recovery). This page sends
+// that string to the desktop app via ronic://. The HTML is static: the query
+// is read in the browser so it cannot break out of the page.
 
-export default async function handler(request: Request): Promise<Response> {
-  const url = new URL(request.url);
-  const query = url.searchParams.toString();
-  const html = `<!doctype html>
+const HTML = `<!doctype html>
 <html>
 <head>
   <meta charset="utf-8">
@@ -26,12 +24,16 @@ export default async function handler(request: Request): Promise<Response> {
     <p id="status">Sending the sign-in code back to Ronic OS…</p>
     <p id="manual" hidden>
       The desktop app did not open automatically.
-      <a href="ronic://auth/callback${query ? `?${query}` : ""}">Click here to finish signing in.</a>
+      <a id="open" href="ronic://auth/callback">Click here to finish signing in.</a>
     </p>
   </div>
   <script>
-    var q = ${JSON.stringify(query)};
+    var search = location.search.replace(/^\\?/, "");
+    var hash = location.hash.replace(/^#/, "");
+    var q = search && hash ? search + "&" + hash : (search || hash);
     var target = "ronic://auth/callback" + (q ? "?" + q : "");
+    var link = document.getElementById("open");
+    if (link) link.setAttribute("href", target);
     var shown = false;
     try { location.href = target; } catch (e) { shown = true; }
     setTimeout(function () {
@@ -42,11 +44,12 @@ export default async function handler(request: Request): Promise<Response> {
   </script>
 </body>
 </html>`;
-  return new Response(html, {
+
+export default async function handler(_request: Request): Promise<Response> {
+  return new Response(HTML, {
     status: 200,
     headers: {
       "content-type": "text/html; charset=utf-8",
-      // Never cache a page that carries a one-time auth code.
       "cache-control": "no-store",
     },
   });

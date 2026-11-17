@@ -97,10 +97,64 @@ export function verifyDelegationAuthority(issuerId: string, isChief: boolean, as
   return null;
 }
 
+/** A thread this long prefers the long-context lane when that lane is set. */
+export const LONG_CONTEXT_CHARS = 32_000;
+
+const FACTORY_PRIMARY = new Set(["prov_ollama", "prov_claude", "prov_gemini", "prov_chatgpt", "prov_grok", "prov_openrouter"]);
+
+/** Empty, "none", and "unassigned" are the same unset lane. */
+export function laneId(value: string | null | undefined): string {
+  const trimmed = (value ?? "").trim();
+  if (!trimmed || trimmed.toLowerCase() === "none" || trimmed === "unassigned") return "";
+  return trimmed;
+}
+
+export function firstLane(...values: Array<string | null | undefined>): string {
+  for (const value of values) {
+    const id = laneId(value);
+    if (id) return id;
+  }
+  return "";
+}
+
 export function routeAccount(score: number, bot: PlanBot): { endpoint: string; tier: string } {
-  if (score < 35) return { endpoint: nonempty(bot.fallbackAccountId, bot.primaryAccountId), tier: "lightweight" };
-  if (score < 70) return { endpoint: nonempty(bot.primaryAccountId, bot.fallbackAccountId), tier: "balanced" };
-  return { endpoint: nonempty(bot.longContextAccountId, bot.primaryAccountId), tier: "heavy" };
+  const primary = bot.primaryAccountId;
+  const longContext = bot.longContextAccountId;
+  const fallback = bot.fallbackAccountId;
+  if (score < 35) return { endpoint: firstLane(fallback, primary, longContext), tier: "lightweight" };
+  if (score < 70) return { endpoint: firstLane(primary, fallback, longContext), tier: "balanced" };
+  return { endpoint: firstLane(longContext, primary, fallback), tier: "heavy" };
+}
+
+/** Live turn: long context only after the thread grows. A single set lane is used for every turn. */
+export function pickTurnAccount(bot: Pick<PlanBot, "primaryAccountId" | "longContextAccountId" | "fallbackAccountId">, contextChars: number): string {
+  if (contextChars >= LONG_CONTEXT_CHARS) return firstLane(bot.longContextAccountId, bot.primaryAccountId, bot.fallbackAccountId);
+  return firstLane(bot.primaryAccountId, bot.fallbackAccountId, bot.longContextAccountId);
+}
+
+/**
+ * Bots used to be created with Gemini and OpenRouter filled in, and a harness
+ * copied into Primary, before any key existed. Drop that stamp. A lane the
+ * user pointed at a provider that now has a key stays.
+ */
+export function normalizeModelLanes(
+  bot: { engineKind?: string; primaryAccountId: string; longContextAccountId: string; fallbackAccountId: string },
+  keyedIds: readonly string[],
+): { primaryAccountId: string; longContextAccountId: string; fallbackAccountId: string } {
+  const keyed = new Set(keyedIds);
+  const longContext = bot.longContextAccountId;
+  const fallback = bot.fallbackAccountId;
+  const factoryPair = longContext === "prov_gemini" && fallback === "prov_openrouter" && !keyed.has(longContext) && !keyed.has(fallback);
+  if (!factoryPair) {
+    return { primaryAccountId: bot.primaryAccountId, longContextAccountId: longContext, fallbackAccountId: fallback };
+  }
+  const bound = (bot.engineKind ?? "").trim().length > 0;
+  const keepPrimary = bound || !FACTORY_PRIMARY.has(bot.primaryAccountId) || keyed.has(bot.primaryAccountId);
+  return {
+    primaryAccountId: keepPrimary ? bot.primaryAccountId : "",
+    longContextAccountId: "",
+    fallbackAccountId: "",
+  };
 }
 
 export function scopesFor(bot: PlanBot): string[] {
@@ -180,7 +234,8 @@ export type MobileRoute = {
 
 export function routeMobile(text: string, chiefId: string, groups: PlanGroup[], bots: PlanBot[]): { ok: true; route: MobileRoute } | PlanFailure {
   let trimmed = text.trim();
-  if (trimmed.startsWith("/chief")) trimmed = trimmed.slice("/chief".length).trim();
+  const chiefRest = trimmed.startsWith("/chief") ? trimmed.slice("/chief".length) : null;
+  if (chiefRest !== null && (chiefRest.length === 0 || /\s/.test(chiefRest[0]))) trimmed = chiefRest.trim();
   if (!trimmed) return { ok: false, error: "Write an objective first." };
   const first = trimmed.split(/\s+/)[0] ?? "";
   const rest = trimmed.slice(first.length).trim();
@@ -323,10 +378,6 @@ export function sha256Hex(message: string): string {
     h4 = (h4 + e) >>> 0; h5 = (h5 + f) >>> 0; h6 = (h6 + g) >>> 0; h7 = (h7 + h) >>> 0;
   }
   return [h0, h1, h2, h3, h4, h5, h6, h7].map((part) => part.toString(16).padStart(8, "0")).join("");
-}
-
-function nonempty(preferred: string, fallback: string): string {
-  return preferred.trim() || fallback.trim();
 }
 
 function needsHuman(text: string): boolean {

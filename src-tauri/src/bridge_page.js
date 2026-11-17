@@ -2,8 +2,8 @@
    Chat requests that contain the user's text are extended with the live workspace pack.
    The host drains window.__RONIC_OUTBOX and answers through window.__RONIC_DELIVER. */
 (function () {
-  if (window.__RONIC_BRIDGE === 4) return;
-  window.__RONIC_BRIDGE = 4;
+  if (window.__RONIC_BRIDGE === 10) return;
+  window.__RONIC_BRIDGE = 10;
   var hooksArmed = false;
   window.__RONIC_OUTBOX = [];
   window.__RONIC_ARMED = "";
@@ -29,7 +29,7 @@
   }
 
   function bridgeCall(op, text, waitMs) {
-    if (op !== "context") {
+    if (op !== "context" && op !== "mcp-url") {
       return Promise.resolve("Embedded pages cannot run Ronic tools. Use the Ronic chat or the signed MCP bridge.");
     }
     return new Promise(function (resolve) {
@@ -42,7 +42,7 @@
         done = true;
         resolve(payload);
       };
-      root.__RONIC_OUTBOX.push({ id: id, op: "context", text: text || "" });
+      root.__RONIC_OUTBOX.push({ id: id, op: op, text: text || "" });
       setTimeout(function () {
         if (done) return;
         done = true;
@@ -119,6 +119,31 @@
     }
   }
 
+  function pluginPage() {
+    try {
+      var path = String(location.pathname || "").toLowerCase();
+      return path.indexOf("/plugins") !== -1 || path.indexOf("/connector") !== -1;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function connectorSurface() {
+    return pluginPage() || !!connectorDialog();
+  }
+
+  function deadPage() {
+    try {
+      var protocol = String(location.protocol || "").toLowerCase();
+      var host = String(location.hostname || "").toLowerCase();
+      if (protocol.indexOf("chrome-error") === 0) return true;
+      if (!host || host === "chromewebdata") return true;
+    } catch (e) {
+      return true;
+    }
+    return false;
+  }
+
   function authHost(hostname) {
     var host = String(hostname || "").toLowerCase();
     if (!host) return false;
@@ -176,8 +201,30 @@
     return false;
   }
 
+  // Team-message and mail hosts. The login is reported to every Ronic tool.
+  // The workspace pack is not written into a message other people can read.
+  function channelPage() {
+    var host = String(location.hostname || "").toLowerCase();
+    if (host === "slack.com" || host === "app.slack.com" || host.slice(-10) === ".slack.com") return true;
+    if (host === "discord.com" || host.slice(-12) === ".discord.com" || host === "discordapp.com" || host.slice(-15) === ".discordapp.com") return true;
+    if (host === "teams.microsoft.com" || host === "teams.live.com") return true;
+    if (host === "web.telegram.org" || host === "web.whatsapp.com") return true;
+    if (host === "mail.google.com" || host === "outlook.office.com" || host === "outlook.live.com") return true;
+    return false;
+  }
+
+  function chatHost() {
+    var host = String(location.hostname || "").toLowerCase();
+    var names = ["chatgpt.com", "claude.ai", "gemini.google.com", "grok.com", "x.com", "twitter.com", "perplexity.ai", "deepseek.com", "mistral.ai", "meta.ai", "copilot.microsoft.com", "openrouter.ai", "qwen.ai", "openai.com"];
+    for (var i = 0; i < names.length; i++) {
+      if (host === names[i] || host.slice(-1 - names[i].length) === "." + names[i]) return true;
+    }
+    return false;
+  }
+
   function mayEnrich() {
     try {
+      if (channelPage() || !chatHost()) return false;
       return signedIn();
     } catch (e) {
       return false;
@@ -192,11 +239,11 @@
       el = document.createElement("div");
       el.id = "ronic-bridge-badge";
       el.setAttribute("data-ronic", "bridge");
-      el.onclick = handleBadgeClick;
       var parent = document.documentElement || document.body;
       if (!parent) return;
       parent.appendChild(el);
     }
+    el.onclick = handleBadgeClick;
 
     if (customText) {
       el.innerHTML = customText;
@@ -206,8 +253,13 @@
     if (authed) {
       el.className = "ronic-mcp-connected";
       el.style.cssText = "position:fixed;right:14px;bottom:14px;z-index:2147483646;display:inline-flex;align-items:center;gap:8px;padding:6px 14px;border-radius:9999px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;font-size:12px;font-weight:600;line-height:1.4;background:rgba(15,23,42,0.92);color:#ecfdf5;border:1px solid rgba(16,185,129,0.5);box-shadow:0 4px 16px rgba(0,0,0,0.36);cursor:pointer;user-select:none;transition:all 0.2s ease;";
-      el.title = "Ronic OS MCP Bridge is Active. Click to inject workspace skills & memory into this composer.";
-      el.innerHTML = '<span style="display:inline-block;width:8px;height:8px;border-radius:99px;background:#10b981;box-shadow:0 0 8px #10b981;"></span><span>MCP Connected · Ronic OS</span>';
+      if (channelPage() || !chatHost()) {
+        el.title = "Signed in. This login is on every Ronic tool. Messages to other people are not modified.";
+        el.innerHTML = '<span style="display:inline-block;width:8px;height:8px;border-radius:99px;background:#10b981;box-shadow:0 0 8px #10b981;"></span><span>Signed in · Ronic OS</span>';
+      } else {
+        el.title = "Signed in. Your message is sent as typed. Workspace tools use the MCP connector.";
+        el.innerHTML = '<span style="display:inline-block;width:8px;height:8px;border-radius:99px;background:#10b981;box-shadow:0 0 8px #10b981;"></span><span>Signed in · Ronic OS</span>';
+      }
     } else {
       el.className = "ronic-mcp-not-connected";
       el.style.cssText = "position:fixed;right:14px;bottom:14px;z-index:2147483646;display:inline-flex;align-items:center;gap:8px;padding:6px 14px;border-radius:9999px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;font-size:12px;font-weight:600;line-height:1.4;background:rgba(24,18,12,0.94);color:#fef3c7;border:1px solid rgba(245,158,11,0.55);box-shadow:0 4px 16px rgba(0,0,0,0.36);cursor:pointer;user-select:none;transition:all 0.2s ease;";
@@ -230,27 +282,38 @@
     }
   }
 
+  function showFillBadge() {
+    updateBadge(true);
+    var el = document.getElementById("ronic-bridge-badge");
+    if (!el) return;
+    el.title = "Fill the Ronic OS name, description, and server URL.";
+    el.innerHTML = '<span style="display:inline-block;width:8px;height:8px;border-radius:99px;background:#10b981;box-shadow:0 0 8px #10b981;"></span><span>Fill MCP connector</span>';
+  }
+
   function handleBadgeClick(event) {
     if (event) event.stopPropagation();
+    if (connectorSurface()) {
+      fillConnector();
+      updateBadge(true, '<span style="display:inline-block;width:8px;height:8px;border-radius:99px;background:#10b981;"></span><span>Filling the MCP connector</span>');
+      setTimeout(function () { if (connectorSurface()) showFillBadge(); else updateBadge(signedIn()); }, 1600);
+      return;
+    }
     var authed = signedIn();
+    if (authed && (channelPage() || !chatHost())) {
+      updateBadge(true, '<span style="display:inline-block;width:8px;height:8px;border-radius:99px;background:#10b981;"></span><span>Signed in · every Ronic tool has this login</span>');
+      setTimeout(function () { updateBadge(true); }, 2600);
+      return;
+    }
     if (authed) {
-      bridgeCall("context", location.origin || "").then(function (bundle) {
-        var box = composerBox() || document.querySelector("textarea, [contenteditable='true']");
-        if (!box) {
-          updateBadge(true, '<span style="display:inline-block;width:8px;height:8px;border-radius:99px;background:#10b981;"></span><span>Focus the chat box to inject context</span>');
-          setTimeout(function () { updateBadge(true); }, 2200);
-          return;
-        }
-        var current = box.tagName === "TEXTAREA" || box.tagName === "INPUT" ? String(box.value || "") : String(box.innerText || "");
-        if (current.indexOf("[Ronic OS connection]") !== -1) {
-          updateBadge(true, '<span style="display:inline-block;width:8px;height:8px;border-radius:99px;background:#10b981;"></span><span>✓ Context already in composer</span>');
-          setTimeout(function () { updateBadge(true); }, 2200);
-          return;
-        }
-        writeBox(box, String(bundle || cachePack()) + (current ? "\n\n" + current : ""));
-        updateBadge(true, '<span style="display:inline-block;width:8px;height:8px;border-radius:99px;background:#10b981;"></span><span>✓ MCP Context Injected</span>');
-        setTimeout(function () { updateBadge(true); }, 2500);
-      });
+      if (connectorDialog()) {
+        fillConnector();
+        updateBadge(true, '<span style="display:inline-block;width:8px;height:8px;border-radius:99px;background:#10b981;"></span><span>Filling the MCP connector</span>');
+        setTimeout(function () { updateBadge(true); }, 2200);
+        return;
+      }
+      stripPackFromComposer();
+      updateBadge(true, '<span style="display:inline-block;width:8px;height:8px;border-radius:99px;background:#10b981;"></span><span>Message left as typed</span>');
+      setTimeout(function () { updateBadge(true); }, 1800);
     } else {
       showAuthPopup();
     }
@@ -282,7 +345,7 @@
     document.getElementById("ronic-auth-dismiss").onclick = function () { modal.remove(); };
     document.getElementById("ronic-auth-check").onclick = function () {
       if (signedIn()) {
-        modal.innerHTML = '<div style="padding:10px 0;text-align:center;"><strong style="color:#10b981;font-size:13px;">✓ MCP Connected Successfully!</strong><p style="margin:6px 0 0;color:#a1a1aa;font-size:11.5px;">Ronic OS workspace bridge is active.</p></div>';
+        modal.innerHTML = '<div style="padding:10px 0;text-align:center;"><strong style="color:#10b981;font-size:13px;">✓ Signed in</strong><p style="margin:6px 0 0;color:#a1a1aa;font-size:11.5px;">This chat can use the workspace pack. A custom MCP connector is separate.</p></div>';
         updateBadge(true);
         if (mayEnrich()) { try { armHooks(); } catch (e) {} }
         setTimeout(function () { modal.remove(); }, 1800);
@@ -313,7 +376,7 @@
 
   function composerText() {
     var active = document.activeElement;
-    if (authField(active)) return "";
+    if (authField(active) || connectorControl(active)) return "";
     if (active && (active.tagName === "TEXTAREA" || active.tagName === "INPUT")) {
       var live = String(active.value || "").trim();
       if (live) return live;
@@ -325,11 +388,13 @@
     var best = "";
     var areas = document.querySelectorAll("textarea");
     for (var i = 0; i < areas.length; i++) {
+      if (connectorControl(areas[i])) continue;
       var value = String(areas[i].value || "").trim();
       if (value.length > best.length && value.length < 20000) best = value;
     }
     var edits = document.querySelectorAll("[contenteditable='true']");
     for (var j = 0; j < edits.length; j++) {
+      if (connectorControl(edits[j])) continue;
       var block = String(edits[j].innerText || "").trim();
       if (block.length > best.length && block.length < 20000) best = block;
     }
@@ -349,7 +414,7 @@
 
   document.addEventListener("keydown", function (event) {
     remember();
-    if (event.key === "Enter" && !event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey && !event.isComposing) stampComposer();
+    if (event.key === "Enter" && !event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey && !event.isComposing) stripPackFromComposer();
   }, true);
   document.addEventListener("beforeinput", remember, true);
   document.addEventListener("pointerdown", function (event) {
@@ -358,7 +423,7 @@
     var el = node && node.closest ? node.closest("button, [role='button']") : null;
     if (!el) return;
     var label = String(el.getAttribute("aria-label") || el.getAttribute("data-testid") || "").toLowerCase();
-    if (label && label.length < 48 && /send|submit/.test(label)) stampComposer();
+    if (label && label.length < 48 && /send|submit/.test(label)) stripPackFromComposer();
   }, true);
   function reloadBlankOnce() {
     try {
@@ -378,12 +443,24 @@
     if (!top) return;
     var autoPromptShown = false;
     function pill() {
-      if (authHost(location.hostname || "")) {
+      if (deadPage() || authHost(location.hostname || "")) {
         var existing = document.getElementById("ronic-bridge-badge");
         if (existing) existing.remove();
+        var modal = document.getElementById("ronic-bridge-auth-modal");
+        if (modal) modal.remove();
+        return;
+      }
+      if (connectorSurface()) {
+        var authModal = document.getElementById("ronic-bridge-auth-modal");
+        if (authModal) authModal.remove();
+        showFillBadge();
+        try { fillConnector(); } catch (e) {}
         return;
       }
       var authed = signedIn();
+      if (authed) {
+        try { fillConnector(); } catch (e) {}
+      }
       if (authed && mayEnrich()) {
         try { armHooks(); } catch (e) {}
       }
@@ -398,7 +475,7 @@
       } else if (authed) {
         var modal = document.getElementById("ronic-bridge-auth-modal");
         if (modal) {
-          modal.innerHTML = '<div style="padding:10px 0;text-align:center;"><strong style="color:#10b981;font-size:13px;">✓ MCP Connected Successfully!</strong><p style="margin:6px 0 0;color:#a1a1aa;font-size:11.5px;">Ronic OS workspace bridge is active.</p></div>';
+          modal.innerHTML = '<div style="padding:10px 0;text-align:center;"><strong style="color:#10b981;font-size:13px;">✓ Signed in</strong><p style="margin:6px 0 0;color:#a1a1aa;font-size:11.5px;">This chat can use the workspace pack. A custom MCP connector is separate.</p></div>';
           setTimeout(function () { modal.remove(); }, 1600);
         }
       }
@@ -486,9 +563,116 @@
     return body;
   }
 
+  function connectorDialog() {
+    var dialogs = document.querySelectorAll("[role='dialog'], [aria-modal='true']");
+    for (var i = 0; i < dialogs.length; i++) {
+      if (/add custom (mcp|connector)|custom mcp server/i.test(String(dialogs[i].innerText || "").slice(0, 2500))) return dialogs[i];
+    }
+    var heads = document.querySelectorAll("h1, h2, h3, [role='heading']");
+    for (var j = 0; j < heads.length; j++) {
+      if (!/add custom (mcp|connector)/i.test(String(heads[j].innerText || "").trim())) continue;
+      var node = heads[j];
+      for (var depth = 0; node && depth < 8; depth++, node = node.parentElement) {
+        if (!node.querySelector || !node.querySelector("input, textarea")) continue;
+        if (String(node.innerText || "").length < 4000) return node;
+      }
+    }
+    return null;
+  }
+
+  function connectorControl(el) {
+    if (!el || !el.closest) return false;
+    var dialog = connectorDialog();
+    return !!(dialog && dialog.contains(el));
+  }
+
+  function usableField(el) {
+    if (!el) return false;
+    var type = String(el.getAttribute("type") || "text").toLowerCase();
+    return type !== "hidden" && type !== "checkbox" && type !== "radio" && type !== "password";
+  }
+
+  function byPlaceholder(dialog, needle) {
+    var inputs = dialog.querySelectorAll("input, textarea");
+    for (var i = 0; i < inputs.length; i++) {
+      if (!usableField(inputs[i])) continue;
+      if (String(inputs[i].getAttribute("placeholder") || "").toLowerCase().indexOf(needle) !== -1) return inputs[i];
+    }
+    return null;
+  }
+
+  function directText(node) {
+    var text = "";
+    var kids = node.childNodes || [];
+    for (var i = 0; i < kids.length; i++) {
+      if (kids[i].nodeType === 3) text += kids[i].textContent;
+    }
+    return text.replace(/\s+/g, " ").trim();
+  }
+
+  function byLabel(dialog, pattern, tag) {
+    var nodes = dialog.querySelectorAll("label, span, div, p");
+    for (var i = 0; i < nodes.length; i++) {
+      var label = directText(nodes[i]);
+      if (!label || label.length > 48 || !pattern.test(label)) continue;
+      var found = null;
+      var sib = nodes[i].nextElementSibling;
+      if (sib && sib.matches && sib.matches(tag) && usableField(sib)) found = sib;
+      else if (sib && sib.querySelector) found = sib.querySelector(tag);
+      if (!usableField(found) && nodes[i].parentElement && nodes[i].parentElement !== dialog) {
+        found = nodes[i].parentElement.querySelector(tag);
+      }
+      if (!usableField(found)) continue;
+      var placeholder = String(found.getAttribute("placeholder") || "").toLowerCase();
+      if (pattern.source === "^name$" && placeholder.indexOf("http") !== -1) continue;
+      return found;
+    }
+    return null;
+  }
+
+  function staleConnectorUrl(value) {
+    if (!value || value.indexOf("example.com") !== -1) return true;
+    return /\.trycloudflare\.com\/mcp/i.test(value);
+  }
+
+  function writeConnector(el, next) {
+    writeBox(el, next);
+    try { el.dispatchEvent(new Event("change", { bubbles: true })); } catch (e) {}
+  }
+
+  function fillConnector() {
+    var dialog = connectorDialog();
+    if (!dialog) return;
+    var nameEl = byPlaceholder(dialog, "custom tool") || byLabel(dialog, /^name$/i, "input");
+    var descEl = byLabel(dialog, /^description/i, "textarea");
+    if (!descEl) {
+      var areas = dialog.querySelectorAll("textarea");
+      if (areas.length === 1) descEl = areas[0];
+    }
+    var urlEl = byPlaceholder(dialog, "example.com/mcp") || byPlaceholder(dialog, "/mcp") || byLabel(dialog, /server url|mcp url|remote mcp/i, "input");
+    if (nameEl && !String(nameEl.value || "").trim()) writeConnector(nameEl, "Ronic OS");
+    if (descEl) {
+      var current = descEl.tagName === "TEXTAREA" || descEl.tagName === "INPUT" ? String(descEl.value || "") : String(descEl.innerText || "");
+      if (!current.trim() || current.indexOf("[Ronic OS connection]") !== -1) {
+        writeConnector(descEl, "Ronic OS on this computer. Skills, plugins, memory, and workspace files.");
+      }
+    }
+    if (!urlEl || !staleConnectorUrl(String(urlEl.value || "").trim())) return;
+    if (window.__RONIC_URL_WAIT) return;
+    window.__RONIC_URL_WAIT = true;
+    bridgeCall("mcp-url", "", 2500).then(function (url) {
+      window.__RONIC_URL_WAIT = false;
+      url = String(url || "").trim();
+      if (!/^https:\/\/[a-z0-9.-]+(?::\d+)?\/mcp$/i.test(url)) return;
+      var latest = String(urlEl.value || "").trim();
+      if (latest === url || !staleConnectorUrl(latest)) return;
+      writeConnector(urlEl, url);
+    });
+  }
+
   function composerBox() {
     var active = document.activeElement;
-    if (active && !authField(active) && (active.tagName === "TEXTAREA" || active.isContentEditable)) return active;
+    if (active && !authField(active) && !connectorControl(active) && (active.tagName === "TEXTAREA" || active.isContentEditable)) return active;
     var candidates = [
       "#prompt-textarea",
       ".ProseMirror",
@@ -502,7 +686,7 @@
     ];
     for (var i = 0; i < candidates.length; i++) {
       var found = document.querySelector(candidates[i]);
-      if (found && !authField(found)) {
+      if (found && !authField(found) && !connectorControl(found)) {
         var style = window.getComputedStyle ? window.getComputedStyle(found) : null;
         if (!style || (style.display !== "none" && style.visibility !== "hidden" && style.opacity !== "0")) {
           return found;
@@ -525,19 +709,15 @@
     box.dispatchEvent(new InputEvent("input", { bubbles: true, data: next, inputType: "insertText" }));
   }
 
-  function stampComposer() {
-    if (!mayEnrich()) return;
+  function stripPackFromComposer() {
     var box = composerBox();
-    if (authField(box)) return;
-    var text = box ? String(box.tagName === "TEXTAREA" || box.tagName === "INPUT" ? box.value : box.innerText || "").trim() : armedText();
-    if (!text || text.indexOf("[Ronic OS connection]") !== -1) return;
-    var pack = cachePack();
-    if (!pack) return;
-    var next = text + "\n\n" + pack;
-    if (box) {
-      try { writeBox(box, next); } catch (e) { return; }
-    }
-    badge("Ronic context attached");
+    if (!box || authField(box)) return;
+    var text = String(box.tagName === "TEXTAREA" || box.tagName === "INPUT" ? box.value : box.innerText || "");
+    var cut = text.indexOf("[Ronic OS connection]");
+    if (cut === -1) return;
+    var kept = text.slice(0, cut).replace(/\s+$/g, "");
+    if (!kept || kept === text) return;
+    try { writeBox(box, kept); } catch (e) {}
   }
 
   function extraFor(suffix) {
@@ -582,9 +762,8 @@
     var text = armedText();
     if (!text || text.indexOf("[Ronic tool result]") === 0) return body;
     if (!carries(body, text)) return body;
-    var suffix = await bridgeCall("context", text);
-    if (!suffix) suffix = cachePack();
-    var packed = extraFor(suffix);
+    // The connection pack is not part of the chat message. A pending tool result still rides along.
+    var packed = extraFor("");
     if (!packed.extra) return body;
     var next = splicePack(body, text, packed.extra);
     if (next !== body) {
@@ -665,10 +844,10 @@
     var wsSend = WebSocket.prototype.send;
     WebSocket.prototype.send = function (data) {
       if (!mayEnrich()) return wsSend.call(this, data);
-      if (typeof data === "string" && cachePack()) {
+      if (typeof data === "string") {
         var text = armedText();
         if (text && text.indexOf("[Ronic tool result]") !== 0) {
-          var packed = extraFor(cachePack());
+          var packed = extraFor("");
           var next = splicePack(data, text, packed.extra);
           if (next !== data) {
             if (packed.pending) window.__RONIC_PENDING = "";

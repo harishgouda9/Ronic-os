@@ -10,6 +10,12 @@ import reactPractices from "../../src-tauri/resources/builtin-skills/prebuilt/sk
 import remotionPort from "../../src-tauri/resources/builtin-skills/prebuilt/skills/remotion-to-hyperframes/SKILL.md?raw";
 import hyperframesCli from "../../src-tauri/resources/builtin-skills/prebuilt/skills/hyperframes-cli/SKILL.md?raw";
 import composio from "../../src-tauri/resources/builtin-skills/prebuilt/skills/composio/SKILL.md?raw";
+import ponytail from "../../src-tauri/resources/builtin-skills/prebuilt/skills/ponytail/SKILL.md?raw";
+import ponytailReview from "../../src-tauri/resources/builtin-skills/prebuilt/skills/ponytail-review/SKILL.md?raw";
+import ponytailAudit from "../../src-tauri/resources/builtin-skills/prebuilt/skills/ponytail-audit/SKILL.md?raw";
+import ponytailDebt from "../../src-tauri/resources/builtin-skills/prebuilt/skills/ponytail-debt/SKILL.md?raw";
+import ponytailGain from "../../src-tauri/resources/builtin-skills/prebuilt/skills/ponytail-gain/SKILL.md?raw";
+import ponytailHelp from "../../src-tauri/resources/builtin-skills/prebuilt/skills/ponytail-help/SKILL.md?raw";
 
 export const PREBUILT_PLUGIN_ID = "plug-prebuilt-skills";
 
@@ -24,6 +30,12 @@ const BODIES: Record<string, string> = {
   "remotion-to-hyperframes": remotionPort,
   "hyperframes-cli": hyperframesCli,
   composio,
+  ponytail,
+  "ponytail-review": ponytailReview,
+  "ponytail-audit": ponytailAudit,
+  "ponytail-debt": ponytailDebt,
+  "ponytail-gain": ponytailGain,
+  "ponytail-help": ponytailHelp,
 };
 
 function meta(raw: string, slug: string) {

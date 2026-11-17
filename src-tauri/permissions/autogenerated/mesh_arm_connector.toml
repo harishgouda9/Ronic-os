@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-mesh-arm-connector"
+description = "Enables the mesh_arm_connector command without any pre-configured scope."
+commands.allow = ["mesh_arm_connector"]
+
+[[permission]]
+identifier = "deny-mesh-arm-connector"
+description = "Denies the mesh_arm_connector command without any pre-configured scope."
+commands.deny = ["mesh_arm_connector"]

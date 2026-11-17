@@ -24,6 +24,11 @@ fn flag(v: i64) -> bool {
     v != 0
 }
 
+/// A chat run with no write newer than this is stuck. A live reply bumps
+/// `updated_at` when it starts and on each activity note, so this does not
+/// match a turn that is still moving.
+const STUCK_AFTER_MS: i64 = 120_000;
+
 pub const SENTINELS: [(&str, &str, &str); 5] = [
     (
         "sentry_sentinel",
@@ -43,7 +48,7 @@ pub const SENTINELS: [(&str, &str, &str); 5] = [
     (
         "github_sentinel",
         "GitHub-Sentinel",
-        "CI actions & security posture (working-tree drift)",
+        "Local git checkout (stale lock only)",
     ),
     (
         "middleware_sentinel",
@@ -59,6 +64,9 @@ pub fn sentinels_ensure(conn: &Connection) -> Result<()> {
             "INSERT OR IGNORE INTO sentinels (id, name, source, status, severity, acknowledged, last_scan, finding, staged_fix) VALUES (?1,?2,?3,'healthy','info',0,0,'','')",
             params![id, name, source],
         )?;
+        // The chip is stored on the row. INSERT OR IGNORE would leave an old
+        // job description in place after this label changes.
+        conn.execute("UPDATE sentinels SET name = ?2, source = ?3 WHERE id = ?1", params![id, name, source])?;
     }
     Ok(())
 }
@@ -71,12 +79,24 @@ fn log_event(conn: &Connection, sentinel_id: &str, message: &str) -> Result<()> 
     Ok(())
 }
 
+/// Write a scan. An acknowledgement sticks only while the same incident
+/// finding is still there. A resolved incident, or a different finding,
+/// clears it so the next problem can flash.
+fn persist_sentinel(conn: &Connection, id: &str, name: &str, status: &str, severity: &str, finding: &str, staged_fix: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE sentinels SET status = ?1, severity = ?2, last_scan = ?3, finding = ?4, staged_fix = ?5, acknowledged = CASE WHEN ?1 != 'incident_detected' OR finding != ?4 THEN 0 ELSE acknowledged END WHERE id = ?6",
+        params![status, severity, now_ms(), finding, staged_fix, id],
+    )?;
+    log_event(conn, id, &format!("[{name}] scan → {status} [{severity}]: {finding}"))?;
+    Ok(())
+}
+
 /// Live status of the four internal tiers, derived from real kernel state.
 pub fn tier_status(conn: &Connection, home: &Path, heartbeat_ms: u64) -> Result<Vec<TierStatus>> {
     let settings = db::settings_of(conn)?;
     let beat = heartbeat_ms as i64;
     let age = if beat == 0 { i64::MAX } else { (now_ms() - beat).max(0) };
-    let watchdog_ok = settings.watchdog_enabled && age < 4_000;
+    let heartbeat_fresh = age < 4_000;
     let dom_latency: i64 = db::kv_get(conn, "dom_latency_ms")?.and_then(|s| s.parse().ok()).unwrap_or(0);
     let dom_nodes = db::kv_get(conn, "dom_nodes")
         .ok()
@@ -92,9 +112,21 @@ pub fn tier_status(conn: &Connection, home: &Path, heartbeat_ms: u64) -> Result<
             tier: 1,
             name: "500ms Rust Anti-Hang Watchdog".into(),
             title: "Anti-Hang & WAL Unlocker".into(),
-            detail: "Kills zombie subprocesses and clears SQLite BUSY locks in <5ms.".into(),
-            status: if watchdog_ok { "ok".into() } else { "degraded".into() },
-            badge: if watchdog_ok { format!("heartbeat {age}ms") } else { "no heartbeat".into() },
+            detail: "Releases chat runs that have not moved for 120 seconds, and passive-checkpoints the WAL once a minute. A live reply is left alone.".into(),
+            status: if !settings.watchdog_enabled {
+                "off".into()
+            } else if heartbeat_fresh {
+                "ok".into()
+            } else {
+                "degraded".into()
+            },
+            badge: if !settings.watchdog_enabled {
+                "disabled in settings".into()
+            } else if heartbeat_fresh {
+                format!("heartbeat {age}ms")
+            } else {
+                "no heartbeat".into()
+            },
             repair_count: tier_repair_count(conn, 1)?,
             last_run_at: tier_last_run(conn, 1)?,
         },
@@ -112,7 +144,7 @@ pub fn tier_status(conn: &Connection, home: &Path, heartbeat_ms: u64) -> Result<
                 "no CDP session yet".into()
             },
             repair_count: dom_heals,
-            last_run_at: db::kv_get(conn, "dom_last_heal")?.and_then(|s| s.parse().ok()).unwrap_or(0),
+            last_run_at: db::kv_get(conn, "dom_last_heal_at")?.and_then(|s| s.parse().ok()).unwrap_or(0),
         },
         TierStatus {
             tier: 3,
@@ -128,7 +160,7 @@ pub fn tier_status(conn: &Connection, home: &Path, heartbeat_ms: u64) -> Result<
             tier: 4,
             name: "Harness² Recursive Script & Skill Auto-Patcher".into(),
             title: "Recursive Script Patcher".into(),
-            detail: "Auto-probes a fix when any tool or skill script exits non-zero.".into(),
+            detail: "Heals trailing commas in extension JSON and probes skill scripts with node --check. Background healing stays off when hotpatch is disabled.".into(),
             status: if settings.hotpatch_enabled { "ok".into() } else { "off".into() },
             badge: if settings.hotpatch_enabled { "auto-ON".into() } else { "disabled in settings".into() },
             repair_count: tier_repair_count(conn, 4)?,
@@ -167,6 +199,62 @@ fn tier_last_run(conn: &Connection, tier: i64) -> Result<i64> {
     Ok(v)
 }
 
+/// Idle chat runs that have not moved in 120s. Cancels the in-flight turn
+/// only when no newer run is still going, so a live reply is not cleared to
+/// tidy an old row.
+fn release_stuck_runs(conn: &Connection) -> Result<usize> {
+    let now = now_ms();
+    let cutoff = now - STUCK_AFTER_MS;
+    let fresh: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM chat_threads WHERE status = 'running' AND updated_at >= ?1",
+        params![cutoff],
+        |r| r.get(0),
+    )?;
+    let released = conn.execute(
+        "UPDATE chat_threads SET status = 'idle', updated_at = ?1 WHERE status = 'running' AND updated_at < ?2",
+        params![now, cutoff],
+    )?;
+    if released > 0 && fresh == 0 {
+        crate::agent::release_turn();
+    }
+    Ok(released)
+}
+
+fn configured_root(conn: &Connection, home: &Path) -> (String, std::path::PathBuf) {
+    let configured = db::settings_of(conn).map(|s| s.project_root).unwrap_or_default();
+    let configured = configured.trim().to_string();
+    let root = if configured.is_empty() { home.to_path_buf() } else { std::path::PathBuf::from(&configured) };
+    (configured, root)
+}
+
+fn inside_work_tree(root: &Path) -> bool {
+    matches!(
+        run_capture("git", &["rev-parse", "--is-inside-work-tree"], Some(root), Duration::from_secs(5)),
+        Ok((0, out)) if out.trim() == "true"
+    )
+}
+
+/// Age of a regular `.git/index.lock`. `None` when there is no lock, the
+/// lock is a symlink, or the mtime cannot be read. `git status` can still
+/// exit 0 while this file exists, so the sentinel has to look at the file.
+fn index_lock_age_ms(root: &Path) -> Option<i64> {
+    let lock = root.join(".git").join("index.lock");
+    let meta = std::fs::symlink_metadata(&lock).ok()?;
+    if !meta.file_type().is_file() {
+        return None;
+    }
+    meta.modified().ok().and_then(|t| t.elapsed().ok()).map(|d| d.as_millis() as i64)
+}
+
+/// shortcut: a lock younger than 120s is treated as live; raise the age if a long git command loses its lock.
+fn clear_stale_index_lock(root: &Path) -> bool {
+    let Some(age_ms) = index_lock_age_ms(root) else { return false };
+    if age_ms < STUCK_AFTER_MS {
+        return false;
+    }
+    std::fs::remove_file(root.join(".git").join("index.lock")).is_ok()
+}
+
 /// Run a self-heal drill. `tier` 1-4 runs a single tier; 0 runs the full drill.
 /// Every tier performs its real action (release stuck turns, WAL checkpoint,
 /// shadow checkpoint sweep, doctor patcher) and logs a measured duration.
@@ -179,18 +267,10 @@ pub fn run_drill(conn: &Connection, home: &Path, tier: i64) -> Result<String> {
 
     if run_all || tier == 1 {
         let started = std::time::Instant::now();
-        crate::agent::release_turn();
-        let released = conn.execute(
-            "UPDATE chat_threads SET status = 'idle', updated_at = ?1 WHERE status = 'running'",
-            params![now_ms()],
-        )?;
-        let _ = conn.execute(
-            "UPDATE bot_profiles SET run_status = 'stopped', active_pid = NULL WHERE run_status = 'running' AND active_pid IS NULL",
-            [],
-        );
+        let released = release_stuck_runs(conn)?;
         db::checkpoint(conn)?;
         let ms = started.elapsed().as_millis() as i64;
-        log_repair(conn, 1, "watchdog_drill", "watchdog", &format!("Heartbeat verified, {released} stuck run(s) released, zombie PTY handles flushed, SQLite WAL checkpointed."), ms, "repaired")?;
+        log_repair(conn, 1, "watchdog_drill", "watchdog", &format!("Heartbeat verified, {released} stuck run(s) released, SQLite WAL checkpointed. Runs still moving were left alone."), ms, "repaired")?;
         notes.push(format!("Tier 1: watchdog OK, WAL unlocked in {ms}ms, {released} stuck run(s) released."));
     }
 
@@ -220,11 +300,25 @@ pub fn run_drill(conn: &Connection, home: &Path, tier: i64) -> Result<String> {
 
     if run_all || tier == 4 {
         let started = std::time::Instant::now();
-        let fixed_json = heal_json_dir(&home.join("extensions"), Some(&home.join(".shadow-git")))?;
-        let probe = syntax_probe_scripts(&home.join("extensions").join("skills"));
-        let ms = started.elapsed().as_millis() as i64;
-        log_repair(conn, 4, "hotpatch_drill", "harness2", &format!("Auto-patcher probed extension scripts; healed {fixed_json} malformed JSON file(s); {probe}"), ms.max(1), "repaired")?;
-        notes.push(format!("Tier 4: Harness² auto-patcher healed {fixed_json} JSON file(s); {probe}."));
+        if !db::settings_of(conn)?.hotpatch_enabled {
+            let ms = started.elapsed().as_millis() as i64;
+            log_repair(conn, 4, "hotpatch_drill", "harness2", "Hotpatch is off in settings, so no file was rewritten.", ms.max(1), "skipped")?;
+            notes.push("Tier 4: hotpatch is off in settings, so no file was rewritten.".into());
+        } else {
+            let fixed_json = heal_extension_json(conn, home)?;
+            let (probe, probe_ok) = syntax_probe_scripts(&home.join("extensions").join("skills"));
+            let ms = started.elapsed().as_millis() as i64;
+            log_repair(
+                conn,
+                4,
+                "hotpatch_drill",
+                "harness2",
+                &format!("Auto-patcher probed extension scripts; healed {fixed_json} malformed JSON file(s); {probe}"),
+                ms.max(1),
+                if probe_ok { "repaired" } else { "failed" },
+            )?;
+            notes.push(format!("Tier 4: Harness² auto-patcher healed {fixed_json} JSON file(s); {probe}."));
+        }
     }
     prune_audit_tails(conn)?;
 
@@ -234,10 +328,12 @@ pub fn run_drill(conn: &Connection, home: &Path, tier: i64) -> Result<String> {
 /// Real syntax verification for Tier 4: runs `node --check` over every .js
 /// script under extensions/skills (capped) and reports honestly — including
 /// when node is not installed, instead of claiming probes that never ran.
-fn syntax_probe_scripts(skills_dir: &Path) -> String {
+/// `(summary, ok)`. A missing node or an empty skills folder is not a failure:
+/// the drill says so, and it does not count as an unresolved repair.
+fn syntax_probe_scripts(skills_dir: &Path) -> (String, bool) {
     let mut scripts = Vec::new();
     let Ok(rd) = std::fs::read_dir(skills_dir) else {
-        return "no skills directory to probe".to_string();
+        return ("no skills directory to probe".to_string(), true);
     };
     for entry in rd.flatten() {
         let path = entry.path();
@@ -252,10 +348,10 @@ fn syntax_probe_scripts(skills_dir: &Path) -> String {
         }
     }
     if scripts.is_empty() {
-        return "no skill scripts to probe".to_string();
+        return ("no skill scripts to probe".to_string(), true);
     }
     let Some(node) = crate::util::which("node") else {
-        return format!("node is not installed, so {} script(s) were not syntax-probed", scripts.len());
+        return (format!("node is not installed, so {} script(s) were not syntax-probed", scripts.len()), true);
     };
     let mut passed = 0usize;
     let mut failed = Vec::new();
@@ -267,9 +363,9 @@ fn syntax_probe_scripts(skills_dir: &Path) -> String {
         }
     }
     if failed.is_empty() {
-        format!("node --check passed on {passed} skill script(s)")
+        (format!("node --check passed on {passed} skill script(s)"), true)
     } else {
-        format!("node --check: {passed} passed, {} failed ({})", failed.len(), failed.join("; "))
+        (format!("node --check: {passed} passed, {} failed ({})", failed.len(), failed.join("; ")), false)
     }
 }
 
@@ -353,6 +449,30 @@ fn heal_json_dir(dir: &Path, shadow: Option<&Path>) -> Result<i64> {
     Ok(n)
 }
 
+/// Heal trailing-comma JSON under `extensions`, keeping a shadow copy when
+/// shadow-git is on. Shared by the doctor, the tier-4 drill, and the
+/// background pass so the three paths cannot drift.
+pub(crate) fn heal_extension_json(conn: &Connection, home: &Path) -> Result<i64> {
+    let keep_shadow = db::settings_of(conn).map(|s| s.shadow_git).unwrap_or(true);
+    let shadow = home.join(".shadow-git");
+    heal_json_dir(&home.join("extensions"), keep_shadow.then_some(shadow.as_path()))
+}
+
+/// Background tier-4 pass. Quiet when hotpatch is off or nothing was rewritten,
+/// so a healthy workspace does not grow a repair row every sweep.
+pub fn auto_hotpatch(conn: &Connection, home: &Path) -> Result<()> {
+    if !db::settings_of(conn)?.hotpatch_enabled {
+        return Ok(());
+    }
+    let fixed = heal_extension_json(conn, home)?;
+    if fixed == 0 {
+        return Ok(());
+    }
+    let (probe, _) = syntax_probe_scripts(&home.join("extensions").join("skills"));
+    log_repair(conn, 4, "hotpatch_auto", "extensions", &format!("Healed {fixed} malformed JSON file(s). {probe}"), 1, "repaired")?;
+    Ok(())
+}
+
 /// Scan the complete fleet in one explicit operation. The same operation is
 /// also used by the background monitor so the UI and autonomous path share
 /// identical checks and persistence semantics. Returns per-sentinel statuses
@@ -385,11 +505,7 @@ fn scan_fleet_filtered(conn: &Connection, home: &Path, skip: &[&str]) -> Result<
             continue;
         }
         let (id, name, (status, severity, finding, staged_fix)) = sentinel_check(conn, home, id)?;
-        conn.execute(
-            "UPDATE sentinels SET status = ?1, severity = ?2, last_scan = ?3, finding = ?4, staged_fix = ?5 WHERE id = ?6",
-            params![status, severity, now_ms(), finding, staged_fix, id],
-        )?;
-        log_event(conn, id, &format!("[{name}] scan → {status} [{severity}]: {finding}"))?;
+        persist_sentinel(conn, id, name, &status, &severity, &finding, &staged_fix)?;
         statuses.push(status);
     }
     prune_audit_tails(conn)?;
@@ -424,11 +540,7 @@ pub fn prune_audit_tails(conn: &Connection) -> Result<()> {
 /// finding is persisted with the staged fix it would apply.
 pub fn sentinel_scan(conn: &Connection, home: &Path, sentinel_id: &str) -> Result<String> {
     let (id, name, (status, severity, finding, staged_fix)) = sentinel_check(conn, home, sentinel_id)?;
-    conn.execute(
-        "UPDATE sentinels SET status = ?1, severity = ?2, last_scan = ?3, finding = ?4, staged_fix = ?5 WHERE id = ?6",
-        params![status, severity, now_ms(), finding, staged_fix, id],
-    )?;
-    log_event(conn, id, &format!("[{name}] scan → {status} [{severity}]: {finding}"))?;
+    persist_sentinel(conn, id, name, &status, &severity, &finding, &staged_fix)?;
     prune_audit_tails(conn)?;
     Ok(format!("{name} scan complete: {status}. {finding}"))
 }
@@ -444,7 +556,7 @@ fn sentinel_check(conn: &Connection, home: &Path, sentinel_id: &str) -> Result<(
     let (status, severity, finding, staged_fix) = match id {
         "sentry_sentinel" => {
             let backlog: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM remediation_logs WHERE created_at > ?1 AND status != 'repaired'",
+                "SELECT COUNT(*) FROM remediation_logs WHERE created_at > ?1 AND status IN ('failed', 'error')",
                 params![now_ms() - 24 * 3600 * 1000],
                 |r| r.get(0),
             )?;
@@ -457,7 +569,10 @@ fn sentinel_check(conn: &Connection, home: &Path, sentinel_id: &str) -> Result<(
                 (
                     "incident_detected".to_string(),
                     "warn".to_string(),
-                    format!("{errored} errored thread(s) and {backlog} unresolved repair entr(ies) in the last 24h."),
+                    format!(
+                        "{errored} errored thread(s) and {backlog} failed repair {} in the last 24h.",
+                        if backlog == 1 { "entry" } else { "entries" }
+                    ),
                     "Run the Harness² auto-patcher, then re-scan; errored threads reset to idle on heal.".to_string(),
                 )
             } else {
@@ -467,7 +582,7 @@ fn sentinel_check(conn: &Connection, home: &Path, sentinel_id: &str) -> Result<(
         "supabase_sentinel" => {
             let stuck: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM chat_threads WHERE status = 'running' AND updated_at < ?1",
-                params![now_ms() - 120_000],
+                params![now_ms() - STUCK_AFTER_MS],
                 |r| r.get(0),
             )?;
             if stuck > 0 {
@@ -496,17 +611,28 @@ fn sentinel_check(conn: &Connection, home: &Path, sentinel_id: &str) -> Result<(
             }
         }
         "github_sentinel" => {
-            let configured = db::settings_of(conn)?.project_root.trim().to_string();
-            let root = if configured.is_empty() { home.to_path_buf() } else { Path::new(&configured).to_path_buf() };
-            let in_repo = matches!(run_capture("git", &["rev-parse", "--is-inside-work-tree"], Some(&root), Duration::from_secs(5)), Ok((0, out)) if out.trim() == "true");
-            if configured.is_empty() && !in_repo {
-                // Nothing to watch yet — that is a resting state, not an
-                // incident; reporting one here would keep the fleet red forever.
+            let (configured, root) = configured_root(conn, home);
+            let in_repo = inside_work_tree(&root);
+            if !in_repo {
+                // A missing checkout is a resting state, not an incident.
+                // Reporting one here would keep the fleet red forever.
+                let finding = if configured.is_empty() {
+                    "No project checkout configured — point Settings → Project root at a Git checkout to watch CI drift."
+                } else {
+                    "Project root is not a Git checkout, so CI drift is not watched."
+                };
                 (
                     "watching".to_string(),
                     "info".to_string(),
-                    "No project checkout configured — point Settings → Project root at a Git checkout to watch CI drift.".into(),
+                    finding.into(),
                     String::new(),
+                )
+            } else if index_lock_age_ms(&root).is_some_and(|age| age >= STUCK_AFTER_MS) {
+                (
+                    "incident_detected".to_string(),
+                    "warn".to_string(),
+                    "A .git/index.lock is older than 120s. Git writes stay blocked until it is removed.".into(),
+                    "Remove the stale index.lock. A lock younger than 120s is left alone.".into(),
                 )
             } else {
                 // --no-optional-locks is a global git option and must precede
@@ -519,14 +645,14 @@ fn sentinel_check(conn: &Connection, home: &Path, sentinel_id: &str) -> Result<(
                             (
                                 "healthy".to_string(),
                                 "info".to_string(),
-                                format!("CI posture OK; working tree has {dirty} uncommitted change(s) — commit or checkpoint before the next action run."),
-                                "Stage a shadow-git checkpoint so a broken push can be rolled back in one click.".to_string(),
+                                format!("{dirty} tracked file(s) differ from the last commit. A run is not blocked, and this check does not commit them. It only removes a .git/index.lock older than 120s."),
+                                String::new(),
                             )
                         } else {
-                            ("healthy".to_string(), "info".to_string(), "Working tree clean; no failing-check advisories on the local branch.".into(), String::new())
+                            ("healthy".to_string(), "info".to_string(), "Working tree matches the last commit. No stale git lock.".into(), String::new())
                         }
                     }
-                    Ok((code, out)) => ("incident_detected".to_string(), "warn".to_string(), format!("git status exited {code}; CI posture could not be verified."), out.lines().next().unwrap_or_default().to_string()),
+                    Ok((code, out)) => ("incident_detected".to_string(), "warn".to_string(), format!("git status exited {code}. The checkout could not be read."), out.lines().next().unwrap_or_default().to_string()),
                     // A probe that could not finish is not evidence of drift —
                     // flagging an incident here would keep the fleet red on
                     // slow or OneDrive-synced checkouts. Report the honest
@@ -589,14 +715,18 @@ pub fn sentinel_remediate(conn: &Connection, home: &Path, sentinel_id: &str) -> 
         "sentry_sentinel" => {
             let note = crate::repair::doctor(conn, home)?;
             let errored = conn.execute("UPDATE chat_threads SET status = 'idle', updated_at = ?1 WHERE status = 'error'", params![now_ms()])?;
-            format!("Harness² auto-patcher executed: {note} Reset {errored} errored thread(s) to idle for retry.")
+            let (probe, probe_ok) = syntax_probe_scripts(&home.join("extensions").join("skills"));
+            if probe_ok {
+                // A failed probe that now passes should not keep the fleet red.
+                conn.execute(
+                    "UPDATE remediation_logs SET status = 'repaired' WHERE status = 'failed' AND fault_type IN ('hotpatch_drill', 'hotpatch_auto') AND created_at > ?1",
+                    params![now_ms() - 24 * 3600 * 1000],
+                )?;
+            }
+            format!("Harness² auto-patcher executed: {note} {probe} Reset {errored} errored thread(s) to idle for retry.")
         }
         "supabase_sentinel" => {
-            crate::agent::release_turn();
-            let released = conn.execute(
-                "UPDATE chat_threads SET status = 'idle', updated_at = ?1 WHERE status = 'running'",
-                params![now_ms()],
-            )?;
+            let released = release_stuck_runs(conn)?;
             db::checkpoint(conn)?;
             format!("Tier 1 heal applied: {released} stuck run(s) released, WAL checkpointed.")
         }
@@ -607,11 +737,15 @@ pub fn sentinel_remediate(conn: &Connection, home: &Path, sentinel_id: &str) -> 
             return Ok(action);
         }
         "github_sentinel" => {
-            let shadow = home.join(".shadow-git");
-            std::fs::create_dir_all(&shadow)?;
-            let stamp = now_ms();
-            std::fs::write(shadow.join(format!("ci-drift.{stamp}.txt")), format!("Drift checkpoint for {name} at {stamp}"))?;
-            "Working-tree drift checkpointed to .shadow-git so the next action run is rollback-safe.".into()
+            let (_, root) = configured_root(conn, home);
+            if clear_stale_index_lock(&root) {
+                "Removed a stale .git/index.lock older than 120s. The worktree was not otherwise changed.".to_string()
+            } else {
+                let action = "Git could not be verified, so no checkpoint was written. Fix the checkout, then scan again.".to_string();
+                log_repair(conn, 5, "sentinel_remediation", name, &action, started.elapsed().as_millis() as i64, "manual_required")?;
+                log_event(conn, id, &format!("[{name}] auto-remediate blocked → git could not be verified"))?;
+                return Ok(action);
+            }
         }
         "middleware_sentinel" => {
             let action = "Channel errors require manual review in the MCP mesh screen; no channel state was changed.".to_string();
@@ -622,9 +756,11 @@ pub fn sentinel_remediate(conn: &Connection, home: &Path, sentinel_id: &str) -> 
         _ => return Err(err("unknown sentinel")),
     };
     let ms = started.elapsed().as_millis() as i64;
-    log_repair(conn, 5, "sentinel_remediation", name, &action, ms.max(1), "repaired")?;
     log_event(conn, id, &format!("[{name}] auto-remediate → {action}"))?;
     let verify = sentinel_scan(conn, home, id)?;
+    let verify_status: String = conn.query_row("SELECT status FROM sentinels WHERE id = ?1", params![id], |r| r.get(0))?;
+    let recorded = if verify_status == "incident_detected" { "unverified" } else { "repaired" };
+    log_repair(conn, 5, "sentinel_remediation", name, &action, ms.max(1), recorded)?;
     Ok(format!("{name}: {action} Verify: {verify}"))
 }
 
@@ -633,11 +769,16 @@ pub fn record_selector_heal(bot_id: &str, from_desc: &str, to_desc: &str) {
     let db_path = crate::util::product_home().join("state.db");
     let Ok(conn) = Connection::open(&db_path) else { return };
     let _ = conn.pragma_update(None, "busy_timeout", "5000");
-    let heals: i64 = db::kv_get(&conn, "dom_heal_count").ok().flatten().and_then(|s| s.parse().ok()).unwrap_or(0) + 1;
-    let _ = db::kv_set(&conn, "dom_heal_count", &heals.to_string());
-    let _ = db::kv_set(&conn, "dom_last_heal", &format!("bot {bot_id}: {from_desc} → {to_desc}"));
-    let _ = log_repair(&conn, 2, "stale_control_remap", &format!("bot {bot_id}"), &format!("Auto-healed a stale control id: {from_desc} → {to_desc}."), 0, "repaired");
-    let _ = prune_audit_tails(&conn);
+    record_selector_heal_on(&conn, bot_id, from_desc, to_desc);
+}
+
+pub(crate) fn record_selector_heal_on(conn: &Connection, bot_id: &str, from_desc: &str, to_desc: &str) {
+    let heals: i64 = db::kv_get(conn, "dom_heal_count").ok().flatten().and_then(|s| s.parse().ok()).unwrap_or(0) + 1;
+    let _ = db::kv_set(conn, "dom_heal_count", &heals.to_string());
+    let _ = db::kv_set(conn, "dom_last_heal_at", &now_ms().to_string());
+    let _ = db::kv_set(conn, "dom_last_heal", &format!("bot {bot_id}: {from_desc} → {to_desc}"));
+    let _ = log_repair(conn, 2, "stale_control_remap", &format!("bot {bot_id}"), &format!("Auto-healed a stale control id: {from_desc} → {to_desc}."), 0, "repaired");
+    let _ = prune_audit_tails(conn);
 }
 
 /// Latest sentinel state for the snapshot.
@@ -673,9 +814,8 @@ pub fn sentinel_events(conn: &Connection) -> Result<Vec<SentinelEvent>> {
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
-/// Mark a sentinel incident as acknowledged by a person. The finding stays in
-/// place so the next scan can reopen it if the underlying condition returns,
-/// but the row stops flashing red until then.
+/// Mark a sentinel incident as acknowledged. The same finding stays quiet.
+/// A different finding, or an incident that clears and comes back, flashes again.
 pub fn sentinel_acknowledge(conn: &Connection, sentinel_id: &str) -> Result<String> {
     let known = SENTINELS.iter().find(|s| s.0 == sentinel_id).ok_or_else(|| err("unknown sentinel"))?;
     let name = known.1;
@@ -686,8 +826,8 @@ pub fn sentinel_acknowledge(conn: &Connection, sentinel_id: &str) -> Result<Stri
     if n == 0 {
         return Err(err("sentinel not found"));
     }
-    log_event(conn, sentinel_id, &format!("[{name}] acknowledged by a person; the incident stays visible until the next scan re-verifies it."))?;
-    Ok(format!("{name} acknowledged. It will reopen if the next scan still finds the condition."))
+    log_event(conn, sentinel_id, &format!("[{name}] acknowledged. It stays quiet while this same finding remains."))?;
+    Ok(format!("{name} acknowledged. It stays quiet while this same finding remains, and flags again if the finding changes or the incident returns."))
 }
 
 /// Clear an acknowledgement so the sentinel can flash red again. Idempotent.
@@ -741,7 +881,7 @@ pub fn shadow_backups(home: &Path) -> Result<Vec<ShadowBackup>> {
 /// Restore a `.shadow-git` checkpoint back to its encoded workspace-relative
 /// target. Names produced by `shadow_name` carry the target; older unencoded
 /// backups stay listed but cannot be auto-restored.
-pub fn restore_shadow_backup(home: &Path, backup_name: &str) -> Result<String> {
+pub fn restore_shadow_backup(conn: &Connection, home: &Path, backup_name: &str) -> Result<String> {
     let name = backup_name.trim();
     if name.is_empty() {
         return Err(err("backup name is required"));
@@ -762,7 +902,8 @@ pub fn restore_shadow_backup(home: &Path, backup_name: &str) -> Result<String> {
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::copy(&source, &target)?;
+    let bytes = std::fs::copy(&source, &target)?;
+    log_repair(conn, 3, "shadow_rollback", &rel, &format!("Restored {rel} from {name} ({bytes} bytes)."), 0, "repaired")?;
     Ok(format!("Restored {name} → {rel}"))
 }
 
@@ -786,8 +927,8 @@ mod fault_injection {
 
     fn seed_bot_and_thread(conn: &Connection, id: &str, status: &str, stale: bool) {
         conn.execute(
-            "INSERT INTO bot_profiles (id, handle, display_name, avatar, soul_markdown, primary_account_id, long_context_account_id, fallback_account_id, daily_wallet_limit_usd, created_at) VALUES (?1, '@sentinel', 'S', 'NW', 'soul', 'prov_ollama', 'prov_gemini', 'prov_openrouter', 1, 1)",
-            params![id],
+            "INSERT INTO bot_profiles (id, handle, display_name, avatar, soul_markdown, primary_account_id, long_context_account_id, fallback_account_id, daily_wallet_limit_usd, created_at) VALUES (?1, ?2, 'S', 'NW', 'soul', 'prov_ollama', 'prov_gemini', 'prov_openrouter', 1, 1)",
+            params![id, format!("@{id}")],
         )
         .unwrap();
         let updated = if stale { now_ms() - 300_000 } else { now_ms() };
@@ -932,6 +1073,210 @@ mod fault_injection {
         assert_eq!(statuses.len(), SENTINELS.len());
         assert!(statuses.iter().any(|s| s == "incident_detected"), "{statuses:?}");
         assert!(statuses.iter().any(|s| s == "watching"), "{statuses:?}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn tier1_releases_a_stale_run_and_leaves_a_live_reply_alone() {
+        let (home, conn) = rig("live");
+        seed_bot_and_thread(&conn, "bot_stale", "running", true);
+        seed_bot_and_thread(&conn, "bot_live", "running", false);
+        let report = run_drill(&conn, &home, 1).unwrap();
+        assert!(report.contains("1 stuck run"), "{report}");
+        let stale: String = conn.query_row("SELECT status FROM chat_threads WHERE id = 'bot_stale_thread'", [], |r| r.get(0)).unwrap();
+        let live: String = conn.query_row("SELECT status FROM chat_threads WHERE id = 'bot_live_thread'", [], |r| r.get(0)).unwrap();
+        assert_eq!(stale, "idle");
+        assert_eq!(live, "running");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn acknowledgement_sticks_for_the_same_finding_and_clears_when_it_ends() {
+        let (home, conn) = rig("ack");
+        seed_bot_and_thread(&conn, "bot_ack", "running", true);
+        sentinel_scan(&conn, &home, "supabase_sentinel").unwrap();
+        sentinel_acknowledge(&conn, "supabase_sentinel").unwrap();
+        sentinel_scan(&conn, &home, "supabase_sentinel").unwrap();
+        let ack: i64 = conn.query_row("SELECT acknowledged FROM sentinels WHERE id = 'supabase_sentinel'", [], |r| r.get(0)).unwrap();
+        assert_eq!(ack, 1, "the same finding must stay quiet");
+        conn.execute("UPDATE chat_threads SET status = 'idle' WHERE id = 'bot_ack_thread'", []).unwrap();
+        sentinel_scan(&conn, &home, "supabase_sentinel").unwrap();
+        let cleared: i64 = conn.query_row("SELECT acknowledged FROM sentinels WHERE id = 'supabase_sentinel'", [], |r| r.get(0)).unwrap();
+        assert_eq!(cleared, 0, "a resolved incident clears the acknowledgement");
+        assert_eq!(sentinel_status(&conn, "supabase_sentinel"), "healthy");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_skipped_remediation_does_not_raise_sentry() {
+        let (home, conn) = rig("skip");
+        clear_project_root(&conn);
+        sentinel_remediate(&conn, &home, "github_sentinel").unwrap();
+        let scan = sentinel_scan(&conn, &home, "sentry_sentinel").unwrap();
+        assert!(scan.contains("healthy"), "{scan}");
+        log_repair(&conn, 4, "hotpatch_drill", "harness2", "bad.js failed", 1, "failed").unwrap();
+        let raised = sentinel_scan(&conn, &home, "sentry_sentinel").unwrap();
+        assert!(raised.contains("incident_detected"), "{raised}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn hotpatch_off_does_not_rewrite_broken_json() {
+        let (home, conn) = rig("hotpatch");
+        let ext = home.join("extensions");
+        std::fs::create_dir_all(&ext).unwrap();
+        let broken = ext.join("broken.json");
+        std::fs::write(&broken, "{ \"a\": 1, }").unwrap();
+        let mut settings = db::settings_of(&conn).unwrap();
+        settings.hotpatch_enabled = false;
+        db::kv_set(&conn, "settings", &serde_json::to_string(&settings).unwrap()).unwrap();
+        let report = run_drill(&conn, &home, 4).unwrap();
+        assert!(report.contains("hotpatch is off"), "{report}");
+        let text = std::fs::read_to_string(&broken).unwrap();
+        assert!(serde_json::from_str::<serde_json::Value>(&text).is_err(), "{text}");
+        auto_hotpatch(&conn, &home).unwrap();
+        let still = std::fs::read_to_string(&broken).unwrap();
+        assert!(serde_json::from_str::<serde_json::Value>(&still).is_err(), "{still}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn auto_hotpatch_heals_once_and_stays_quiet_after() {
+        let (home, conn) = rig("auto");
+        let ext = home.join("extensions");
+        std::fs::create_dir_all(&ext).unwrap();
+        std::fs::write(ext.join("broken.json"), "{ \"a\": 1, }").unwrap();
+        auto_hotpatch(&conn, &home).unwrap();
+        let healed = std::fs::read_to_string(ext.join("broken.json")).unwrap();
+        assert!(serde_json::from_str::<serde_json::Value>(&healed).is_ok(), "{healed}");
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM remediation_logs WHERE fault_type = 'hotpatch_auto'", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1);
+        auto_hotpatch(&conn, &home).unwrap();
+        let again: i64 = conn.query_row("SELECT COUNT(*) FROM remediation_logs WHERE fault_type = 'hotpatch_auto'", [], |r| r.get(0)).unwrap();
+        assert_eq!(again, 1);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn selector_heal_stores_a_timestamp_the_tier_can_read() {
+        let (home, conn) = rig("stamp");
+        record_selector_heal_on(&conn, "bot_stamp", "[1] Save", "[4] Save");
+        let tiers = tier_status(&conn, &home, now_ms() as u64).unwrap();
+        assert!(tiers[1].last_run_at > 0, "last run {}", tiers[1].last_run_at);
+        assert!(tiers[1].badge.contains("1 auto-heal"), "{}", tiers[1].badge);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn restore_shadow_backup_writes_the_file_and_the_audit_row() {
+        let (home, conn) = rig("shadow");
+        let shadow = home.join(".shadow-git");
+        std::fs::create_dir_all(&shadow).unwrap();
+        let name = crate::util::shadow_name("extensions/skills/note.txt", now_ms());
+        std::fs::write(shadow.join(&name), "kept").unwrap();
+        let note = restore_shadow_backup(&conn, &home, &name).unwrap();
+        assert!(note.contains("extensions/skills/note.txt"), "{note}");
+        let body = std::fs::read_to_string(home.join("extensions").join("skills").join("note.txt")).unwrap();
+        assert_eq!(body, "kept");
+        let logged: i64 = conn.query_row("SELECT COUNT(*) FROM remediation_logs WHERE fault_type = 'shadow_rollback'", [], |r| r.get(0)).unwrap();
+        assert_eq!(logged, 1);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_configured_folder_that_is_not_a_checkout_is_watching() {
+        let (home, conn) = rig("notgit");
+        let mut settings = db::settings_of(&conn).unwrap();
+        settings.project_root = home.join("missing-checkout").display().to_string();
+        db::kv_set(&conn, "settings", &serde_json::to_string(&settings).unwrap()).unwrap();
+        let scan = sentinel_scan(&conn, &home, "github_sentinel").unwrap();
+        assert!(scan.contains("watching"), "{scan}");
+        assert!(scan.contains("not a Git checkout"), "{scan}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_stale_index_lock_is_removed_and_a_fresh_lock_is_kept() {
+        if crate::util::which("git").is_none() {
+            return;
+        }
+        let (home, conn) = rig("lock");
+        let repo = home.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let init = std::process::Command::new("git").args(["init"]).current_dir(&repo).status();
+        if !init.map(|s| s.success()).unwrap_or(false) {
+            let _ = std::fs::remove_dir_all(&home);
+            return;
+        }
+        let mut settings = db::settings_of(&conn).unwrap();
+        settings.project_root = repo.display().to_string();
+        db::kv_set(&conn, "settings", &serde_json::to_string(&settings).unwrap()).unwrap();
+        let lock = repo.join(".git").join("index.lock");
+        std::fs::write(&lock, "stale").unwrap();
+        let file = std::fs::File::options().write(true).open(&lock).unwrap();
+        let old = std::time::SystemTime::now().checked_sub(std::time::Duration::from_secs(600)).unwrap();
+        file.set_modified(old).unwrap();
+        drop(file);
+        let scan = sentinel_scan(&conn, &home, "github_sentinel").unwrap();
+        assert!(scan.contains("incident_detected"), "{scan}");
+        let fixed = sentinel_remediate(&conn, &home, "github_sentinel").unwrap();
+        assert!(fixed.contains("index.lock"), "{fixed}");
+        assert!(!lock.exists(), "stale lock should be gone");
+        std::fs::write(&lock, "live").unwrap();
+        let blocked = sentinel_remediate(&conn, &home, "github_sentinel").unwrap();
+        // A young lock is not deleted. git status may still exit 0, in which
+        // case the sentinel is healthy and remediation takes no action.
+        assert!(
+            blocked.contains("no checkpoint was written") || blocked.contains("No action taken"),
+            "{blocked}"
+        );
+        assert!(lock.exists(), "a fresh lock must be kept");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_dirty_tree_is_healthy_and_does_not_ask_for_a_commit() {
+        if crate::util::which("git").is_none() {
+            return;
+        }
+        let (home, conn) = rig("dirty");
+        let repo = home.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git").args(args).current_dir(&repo).status().map(|s| s.success()).unwrap_or(false)
+        };
+        if !git(&["init"])
+            || !git(&["config", "user.email", "sentinel@example.com"])
+            || !git(&["config", "user.name", "sentinel"])
+        {
+            let _ = std::fs::remove_dir_all(&home);
+            return;
+        }
+        std::fs::write(repo.join("note.txt"), "one").unwrap();
+        if !git(&["add", "note.txt"]) || !git(&["commit", "-m", "init"]) {
+            let _ = std::fs::remove_dir_all(&home);
+            return;
+        }
+        std::fs::write(repo.join("note.txt"), "two").unwrap();
+        let mut settings = db::settings_of(&conn).unwrap();
+        settings.project_root = repo.display().to_string();
+        db::kv_set(&conn, "settings", &serde_json::to_string(&settings).unwrap()).unwrap();
+        let scan = sentinel_scan(&conn, &home, "github_sentinel").unwrap();
+        assert!(scan.contains("healthy"), "{scan}");
+        assert!(scan.contains("differ from the last commit"), "{scan}");
+        assert!(!scan.to_ascii_lowercase().contains("commit before"), "{scan}");
+        let source: String = conn.query_row("SELECT source FROM sentinels WHERE id = 'github_sentinel'", [], |r| r.get(0)).unwrap();
+        assert_eq!(source, "Local git checkout (stale lock only)");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn doctor_does_not_invent_a_heartbeat_repair() {
+        let (home, conn) = rig("doctor");
+        let note = crate::repair::doctor(&conn, &home).unwrap();
+        assert!(note.contains("WAL checkpointed"), "{note}");
+        let heartbeat: i64 = conn.query_row("SELECT COUNT(*) FROM remediation_logs WHERE fault_type = 'heartbeat'", [], |r| r.get(0)).unwrap();
+        assert_eq!(heartbeat, 0);
         let _ = std::fs::remove_dir_all(&home);
     }
 }

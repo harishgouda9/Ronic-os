@@ -14,6 +14,8 @@ pub struct BotFlags {
     pub soul: String,
     pub role: String,
     pub primary: String,
+    pub long_context: String,
+    pub fallback: String,
     pub engine_kind: String,
     pub api_model: String,
     pub allow_code: bool,
@@ -78,7 +80,7 @@ fn fill_screen(conn: &Connection, profile: &mut BotProfile) {
 
 pub fn flags(conn: &Connection, id: &str) -> Result<BotFlags> {
     let row = conn.query_row(
-        "SELECT handle, soul_markdown, primary_account_id, allow_code_exec, allow_computer_use, allow_browser_use, allow_file_write, require_approval_external, require_approval_wallet, stall_timeout_ms, role, engine_kind, api_model, approval_mode FROM bot_profiles WHERE id=?1",
+        "SELECT handle, soul_markdown, primary_account_id, allow_code_exec, allow_computer_use, allow_browser_use, allow_file_write, require_approval_external, require_approval_wallet, stall_timeout_ms, role, engine_kind, api_model, approval_mode, long_context_account_id, fallback_account_id FROM bot_profiles WHERE id=?1",
         params![id],
         |row| {
             Ok((
@@ -96,6 +98,8 @@ pub fn flags(conn: &Connection, id: &str) -> Result<BotFlags> {
                 row.get::<_, String>(11)?,
                 row.get::<_, String>(12)?,
                 row.get::<_, String>(13)?,
+                row.get::<_, String>(14)?,
+                row.get::<_, String>(15)?,
             ))
         },
     ).map_err(|_| err("profile not found"))?;
@@ -104,6 +108,8 @@ pub fn flags(conn: &Connection, id: &str) -> Result<BotFlags> {
         handle: row.0,
         soul: row.1,
         primary: row.2,
+        long_context: row.14,
+        fallback: row.15,
         engine_kind: row.11,
         api_model: row.12,
         allow_code: row.3 != 0,
@@ -359,18 +365,129 @@ pub fn set_mode(conn: &Connection, group_id: &str, mode: &str) -> Result<()> {
 }
 
 pub fn set_routine(conn: &Connection, thread_id: &str, schedule: &str) -> Result<()> {
+    arm_routine(conn, thread_id, schedule, "")
+}
+
+/// Store the schedule and the instruction the clock will replay.
+/// An empty schedule clears the job. An empty job leaves a stored job as it is.
+/// A non-empty job replaces that text, or adds one new requirement, without touching the timer.
+pub fn arm_routine(conn: &Connection, thread_id: &str, schedule: &str, job: &str) -> Result<()> {
     db::require_thread(conn, thread_id)?;
     let schedule = schedule.trim();
-    conn.execute("UPDATE chat_threads SET routine_schedule=?1, updated_at=?2 WHERE id=?3", params![schedule, now_ms(), thread_id])?;
     let group_id: String = conn.query_row("SELECT group_id FROM chat_threads WHERE id=?1", params![thread_id], |row| row.get(0)).unwrap_or_default();
+    if schedule.is_empty() {
+        conn.execute(
+            "UPDATE chat_threads SET routine_schedule='', routine_job='', routine_armed_at=0, routine_fired_at=0, updated_at=?1 WHERE id=?2",
+            params![now_ms(), thread_id],
+        )?;
+        if !group_id.is_empty() {
+            conn.execute("UPDATE bot_groups SET routine_schedule='' WHERE id=?1", params![group_id])?;
+        }
+        return Ok(());
+    }
+    let (old_schedule, old_job, old_armed): (String, String, i64) = conn.query_row(
+        "SELECT routine_schedule, routine_job, routine_armed_at FROM chat_threads WHERE id=?1",
+        params![thread_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let now = now_ms();
+    let armed = if old_schedule != schedule || old_armed == 0 { now } else { old_armed };
+    let fired_reset = old_schedule != schedule;
+    let stored = if job.trim().is_empty() && old_job.trim().is_empty() {
+        snapshot_job(conn, thread_id)?
+    } else {
+        apply_job(&old_job, job)
+    };
+    if fired_reset {
+        conn.execute(
+            "UPDATE chat_threads SET routine_schedule=?1, routine_job=?2, routine_armed_at=?3, routine_fired_at=0, updated_at=?4 WHERE id=?5",
+            params![schedule, stored, armed, now, thread_id],
+        )?;
+    } else {
+        conn.execute(
+            "UPDATE chat_threads SET routine_schedule=?1, routine_job=?2, routine_armed_at=?3, updated_at=?4 WHERE id=?5",
+            params![schedule, stored, armed, now, thread_id],
+        )?;
+    }
     if !group_id.is_empty() {
         conn.execute("UPDATE bot_groups SET routine_schedule=?1 WHERE id=?2", params![schedule, group_id])?;
     }
     Ok(())
 }
 
+/// Replace the stored instruction, or add one new requirement once.
+/// Empty text, a greeting, and "thanks" leave a stored job unchanged.
+/// shortcut: an addition is a line that starts with also, and, add, plus, or include; upgrade when a real edit should merge any sentence.
+fn apply_job(stored: &str, incoming: &str) -> String {
+    let stored_raw = stored.trim();
+    let incoming_raw = incoming.trim();
+    if incoming_raw.is_empty() || (!stored_raw.is_empty() && chatter(incoming_raw)) {
+        return stored_raw.to_string();
+    }
+    if stored_raw.is_empty() {
+        return incoming_raw.to_string();
+    }
+    let old = flat(stored_raw);
+    let new = flat(incoming_raw);
+    if old == new || new.contains(&old) {
+        return incoming_raw.to_string();
+    }
+    if addition_line(incoming_raw) {
+        if old.contains(&new) {
+            return stored_raw.to_string();
+        }
+        return format!("{stored_raw}\n{incoming_raw}");
+    }
+    incoming_raw.to_string()
+}
+
+fn flat(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ").to_ascii_lowercase()
+}
+
+fn addition_line(text: &str) -> bool {
+    let mut lower = flat(text);
+    for lead in ["please ", "can you ", "could you ", "just "] {
+        if let Some(rest) = lower.strip_prefix(lead) {
+            lower = rest.to_string();
+            break;
+        }
+    }
+    const HEADS: &[&str] = &[
+        "also ", "and ", "add ", "plus ", "include ", "additionally ",
+        "as well ", "along with ", "don't forget ", "do not forget ",
+    ];
+    HEADS.iter().any(|head| lower.starts_with(head))
+}
+
+fn chatter(text: &str) -> bool {
+    if crate::coworker::is_greeting(&text.to_ascii_lowercase()) {
+        return true;
+    }
+    const NOISE: &[&str] = &[
+        "thanks", "thank you", "thx", "ty", "ok", "okay", "k", "got it", "cool", "nice", "great", "perfect", "yes", "no", "sure", "np", "done", "yep", "yeah", "alright", "sounds good",
+    ];
+    let trimmed = text.trim().trim_end_matches(['!', '?', '.', ',', ' ']).to_ascii_lowercase();
+    NOISE.iter().any(|word| trimmed == *word)
+}
+
+/// The clock replays the stored job. A later "thanks" is not the job.
+pub fn job_text(stored: &str, fallback: &str) -> String {
+    let body = if stored.trim().is_empty() { fallback.trim() } else { stored.trim() };
+    if body.is_empty() {
+        String::new()
+    } else {
+        format!("Scheduled job. Do this again: {body}")
+    }
+}
+
 pub fn routine_prompt(conn: &Connection, thread_id: &str) -> Result<String> {
     db::require_thread(conn, thread_id)?;
+    let stored: String = conn.query_row("SELECT routine_job FROM chat_threads WHERE id=?1", params![thread_id], |row| row.get(0)).unwrap_or_default();
+    Ok(job_text(&stored, &fallback_prompt(conn, thread_id)?))
+}
+
+fn fallback_prompt(conn: &Connection, thread_id: &str) -> Result<String> {
     let saved: Option<String> = conn.query_row(
         "SELECT content_markdown FROM execution_steps WHERE thread_id=?1 AND role='user' ORDER BY created_at DESC LIMIT 1",
         params![thread_id],
@@ -388,6 +505,157 @@ pub fn routine_prompt(conn: &Connection, thread_id: &str) -> Result<String> {
     }
     let title: String = conn.query_row("SELECT title FROM chat_threads WHERE id=?1", params![thread_id], |row| row.get(0))?;
     Ok(title)
+}
+
+fn snapshot_job(conn: &Connection, thread_id: &str) -> Result<String> {
+    let goal: String = conn.query_row("SELECT task_goal FROM chat_threads WHERE id=?1", params![thread_id], |row| row.get(0)).unwrap_or_default();
+    if !goal.trim().is_empty() {
+        return Ok(goal.trim().to_string());
+    }
+    let mut stmt = conn.prepare("SELECT content_markdown FROM execution_steps WHERE thread_id=?1 AND role='user' AND action_type != 'turn_activity' ORDER BY created_at DESC LIMIT 12")?;
+    let rows = stmt.query_map(params![thread_id], |row| row.get::<_, String>(0))?.collect::<std::result::Result<Vec<_>, _>>()?;
+    for text in &rows {
+        let trimmed = text.trim();
+        if trimmed.chars().count() < 12 {
+            continue;
+        }
+        if crate::coworker::is_greeting(&trimmed.to_ascii_lowercase()) {
+            continue;
+        }
+        return Ok(trimmed.to_string());
+    }
+    if let Some(text) = rows.into_iter().find(|text| !text.trim().is_empty()) {
+        return Ok(text.trim().to_string());
+    }
+    fallback_prompt(conn, thread_id)
+}
+
+pub fn read_task(conn: &Connection, thread_id: &str) -> (String, String, String) {
+    conn.query_row(
+        "SELECT task_status, task_goal, task_next FROM chat_threads WHERE id=?1",
+        params![thread_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )
+    .unwrap_or_default()
+}
+
+pub fn write_task(conn: &Connection, thread_id: &str, status: &str, goal: &str, next: &str) -> Result<()> {
+    let status = match status {
+        "doing" | "blocked" | "waiting" | "done" | "" => status,
+        _ => return Err(err("status is doing, blocked, waiting, or done")),
+    };
+    let (old_goal, old_next) = {
+        let (_, goal, next) = read_task(conn, thread_id);
+        (goal, next)
+    };
+    let goal = if goal.trim().is_empty() { old_goal } else { goal.trim().to_string() };
+    let next = if status == "done" {
+        String::new()
+    } else if next.trim().is_empty() {
+        old_next
+    } else {
+        next.trim().to_string()
+    };
+    conn.execute(
+        "UPDATE chat_threads SET task_status=?1, task_goal=?2, task_next=?3, updated_at=?4 WHERE id=?5",
+        params![status, goal, next, now_ms(), thread_id],
+    )?;
+    Ok(())
+}
+
+/// A real work turn opens a task. An open task keeps its goal. A greeting does not.
+pub fn open_work(conn: &Connection, thread_id: &str, prompt: &str) -> Result<()> {
+    let head = prompt.split("\n\nAttached files:").next().unwrap_or(prompt);
+    let lower = head.trim().to_ascii_lowercase();
+    if lower.is_empty() || crate::coworker::is_greeting(&lower) || !crate::coworker::asks_for_work(&lower) {
+        return Ok(());
+    }
+    let (status, goal, _) = read_task(conn, thread_id);
+    if matches!(status.as_str(), "doing" | "blocked" | "waiting") && !goal.trim().is_empty() {
+        return Ok(());
+    }
+    let line = head.lines().next().unwrap_or(head).trim();
+    let goal: String = line.chars().take(240).collect();
+    write_task(conn, thread_id, "doing", goal.trim(), "Start this task.")
+}
+
+/// The standing note the model uses when it revises a scheduled job.
+pub fn job_prompt(conn: &Connection, thread_id: &str) -> Option<String> {
+    let (schedule, job): (String, String) = conn
+        .query_row(
+            "SELECT routine_schedule, routine_job FROM chat_threads WHERE id=?1",
+            params![thread_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .ok()
+        .unwrap_or_default();
+    let schedule = schedule.trim();
+    if schedule.is_empty() {
+        return None;
+    }
+    let job = job.trim();
+    let shown = if job.is_empty() { "(none yet)" } else { job };
+    Some(format!(
+        "Stored job ({schedule}): {shown}\nTo revise it, call schedule_routine with this same schedule. Pass the complete new instruction to replace this text. A line that only adds a requirement is added once. Omit job to keep this text."
+    ))
+}
+
+pub fn task_prompt(conn: &Connection, thread_id: &str) -> Option<String> {
+    let (status, goal, next) = read_task(conn, thread_id);
+    if !matches!(status.as_str(), "doing" | "blocked" | "waiting") {
+        return None;
+    }
+    Some(format!("Open task ({status}): {goal}\nNext step: {next}\nContinue this task. A greeting does not close it."))
+}
+
+/// The model called set_task, so the turn must not overwrite that row.
+pub fn settle_task(conn: &Connection, thread_id: &str, turn_id: &str, user_text: &str, checks_open: bool, missing: Option<&str>) -> Result<()> {
+    let set: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM execution_steps WHERE thread_id=?1 AND turn_id=?2 AND role='tool' AND model_used='set_task'",
+            params![thread_id, turn_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    if set > 0 {
+        return Ok(());
+    }
+    let head = user_text.split("\n\nAttached files:").next().unwrap_or(user_text);
+    let lower = head.trim().to_ascii_lowercase();
+    if crate::coworker::is_greeting(&lower) {
+        return Ok(());
+    }
+    let (_, existing, _) = read_task(conn, thread_id);
+    let goal = if existing.trim().is_empty() {
+        head.lines().next().unwrap_or(head).trim().chars().take(240).collect::<String>()
+    } else {
+        existing
+    };
+    if let Some(missing) = missing {
+        return write_task(conn, thread_id, "blocked", &goal, missing);
+    }
+    if checks_open {
+        return write_task(conn, thread_id, "done", &goal, "");
+    }
+    if crate::coworker::asks_for_work(&lower) {
+        return write_task(conn, thread_id, "doing", &goal, "Turn ended. Continue if work remains.");
+    }
+    Ok(())
+}
+
+/// A new chat for one assignment. Does not bury the work in the assignee's latest personal chat.
+pub fn open_assignment(conn: &Connection, bot_id: &str, goal: &str) -> Result<String> {
+    let id = nid("thread");
+    let title: String = goal.trim().chars().take(36).collect();
+    let title = if title.trim().is_empty() { "Assignment".to_string() } else { title };
+    conn.execute(
+        "INSERT INTO chat_threads (id, bot_profile_id, title, active_model_override_id, status, compacted_context_capsule, is_pinned, updated_at) VALUES (?1,?2,?3,NULL,'doing','',0,?4)",
+        params![id, bot_id, title, now_ms()],
+    )?;
+    write_task(conn, &id, "doing", goal, "Start this assignment.")?;
+    kv_set(conn, "active_thread", &id)?;
+    kv_set(conn, "active_profile", bot_id)?;
+    Ok(id)
 }
 
 pub fn teach(conn: &Connection, home: &Path, bot_id: &str, title: &str, notes: &str, url: &str) -> Result<String> {
@@ -527,16 +795,6 @@ pub fn decide(state: &crate::AppState, step_id: &str, approve: bool, secrets: &s
     }
 }
 
-pub fn account_for_harness(harness: &str) -> Option<&'static str> {
-    match harness {
-        "claude_cli" => Some("prov_claude"),
-        "agy_cli" => Some("prov_gemini"),
-        "codex_cli" => Some("prov_chatgpt"),
-        "grok_web" => Some("prov_grok"),
-        _ => None,
-    }
-}
-
 fn takeover_key(id: &str) -> String {
     format!("takeover:{id}")
 }
@@ -657,6 +915,53 @@ mod tests {
     }
 
     #[test]
+    fn factory_model_lanes_reset_to_none_until_a_key_exists() {
+        let (_home, conn) = temp_db();
+        conn.execute(
+            "INSERT INTO bot_profiles (id, handle, display_name, avatar, soul_markdown, primary_account_id, long_context_account_id, fallback_account_id, created_at) VALUES ('bot_stamp','@stamp','Stamp','NW','soul','prov_claude','prov_gemini','prov_openrouter',1)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO bot_profiles (id, handle, display_name, avatar, soul_markdown, primary_account_id, long_context_account_id, fallback_account_id, engine_kind, created_at) VALUES ('bot_bound','@bound','Bound','NW','soul','botprov_grok','prov_gemini','prov_openrouter','openai_api',1)",
+            [],
+        ).unwrap();
+        db::clear_factory_model_lanes(&conn).unwrap();
+        let stamp: (String, String, String) = conn.query_row(
+            "SELECT primary_account_id, long_context_account_id, fallback_account_id FROM bot_profiles WHERE id='bot_stamp'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(stamp, ("".into(), "".into(), "".into()));
+        conn.execute(
+            "INSERT INTO bot_profiles (id, handle, display_name, avatar, soul_markdown, primary_account_id, long_context_account_id, fallback_account_id, created_at) VALUES ('bot_local','@local','Local','NW','soul','prov_ollama','prov_gemini','prov_openrouter',1)",
+            [],
+        ).unwrap();
+        db::clear_factory_model_lanes(&conn).unwrap();
+        let local: (String, String, String) = conn.query_row(
+            "SELECT primary_account_id, long_context_account_id, fallback_account_id FROM bot_profiles WHERE id='bot_local'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(local, ("prov_ollama".into(), "".into(), "".into()));
+        let bound: (String, String, String) = conn.query_row(
+            "SELECT primary_account_id, long_context_account_id, fallback_account_id FROM bot_profiles WHERE id='bot_bound'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        assert_eq!(bound.0, "botprov_grok");
+        assert_eq!(bound.1, "");
+        assert_eq!(bound.2, "");
+        conn.execute("UPDATE provider_accounts SET has_secret = 1 WHERE id = 'prov_claude'", []).unwrap();
+        conn.execute(
+            "UPDATE bot_profiles SET primary_account_id='prov_claude', long_context_account_id='prov_gemini', fallback_account_id='prov_openrouter' WHERE id='bot_stamp'",
+            [],
+        ).unwrap();
+        db::clear_factory_model_lanes(&conn).unwrap();
+        let kept: String = conn.query_row("SELECT primary_account_id FROM bot_profiles WHERE id='bot_stamp'", [], |row| row.get(0)).unwrap();
+        assert_eq!(kept, "prov_claude");
+    }
+
+    #[test]
     fn cloud_bot_engine_columns_round_trip() {
         let (_home, conn) = temp_db();
         bot(&conn, "bot_x", "@grokbot");
@@ -698,6 +1003,54 @@ mod tests {
         assert_eq!(next.handle, "@beta");
         assert!(external_action("submit the checkout form"));
         assert!(!external_action("summarize the docs"));
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_later_thanks_does_not_replace_the_stored_job() {
+        assert!(job_text("Check the build", "thanks").contains("Check the build"));
+        assert!(!job_text("Check the build", "thanks").contains("thanks"));
+        assert!(job_text("", "thanks").contains("thanks"));
+        let (home, conn) = temp_db();
+        bot(&conn, "bot_a", "@alpha");
+        conn.execute(
+            "INSERT INTO chat_threads (id, bot_profile_id, title, status, updated_at) VALUES ('th1','bot_a','Chat','idle',1)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO execution_steps (id, thread_id, role, content_markdown, action_type, created_at) VALUES ('s1','th1','user','Check the build and report failures','message',1)",
+            [],
+        ).unwrap();
+        arm_routine(&conn, "th1", "daily 08:00", "").unwrap();
+        conn.execute(
+            "INSERT INTO execution_steps (id, thread_id, role, content_markdown, action_type, created_at) VALUES ('s2','th1','user','thanks','message',2)",
+            [],
+        ).unwrap();
+        arm_routine(&conn, "th1", "daily 08:00", "").unwrap();
+        let prompt = routine_prompt(&conn, "th1").unwrap();
+        assert!(prompt.contains("Check the build"), "{prompt}");
+        assert!(!prompt.contains("thanks"), "{prompt}");
+        conn.execute("UPDATE chat_threads SET routine_fired_at=77 WHERE id='th1'", []).unwrap();
+        arm_routine(&conn, "th1", "daily 08:00", "thanks").unwrap();
+        arm_routine(&conn, "th1", "daily 08:00", "also check the logs").unwrap();
+        arm_routine(&conn, "th1", "daily 08:00", "also check the logs").unwrap();
+        let job: String = conn.query_row("SELECT routine_job FROM chat_threads WHERE id='th1'", [], |row| row.get(0)).unwrap();
+        assert_eq!(job, "Check the build and report failures\nalso check the logs");
+        let fired: i64 = conn.query_row("SELECT routine_fired_at FROM chat_threads WHERE id='th1'", [], |row| row.get(0)).unwrap();
+        assert_eq!(fired, 77);
+        arm_routine(&conn, "th1", "daily 08:00", "Check the build and report failures, and check the logs and the wallet").unwrap();
+        let job: String = conn.query_row("SELECT routine_job FROM chat_threads WHERE id='th1'", [], |row| row.get(0)).unwrap();
+        assert_eq!(job, "Check the build and report failures, and check the logs and the wallet");
+        let fired: i64 = conn.query_row("SELECT routine_fired_at FROM chat_threads WHERE id='th1'", [], |row| row.get(0)).unwrap();
+        assert_eq!(fired, 77);
+        assert_eq!(
+            apply_job("Check the deploy", "Check the deploy and the logs"),
+            "Check the deploy and the logs"
+        );
+        assert_eq!(apply_job("Check the deploy", ""), "Check the deploy");
+        arm_routine(&conn, "th1", "", "").unwrap();
+        let job: String = conn.query_row("SELECT routine_job FROM chat_threads WHERE id='th1'", [], |row| row.get(0)).unwrap();
+        assert!(job.is_empty());
         let _ = fs::remove_dir_all(&home);
     }
 }

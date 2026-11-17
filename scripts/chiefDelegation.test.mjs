@@ -71,6 +71,17 @@ test("complexity scores match the cost tiers", () => {
   assert.deepEqual(mod.routeAccount(70, writer), { endpoint: "prov_long", tier: "heavy" });
   const empty = bot("bare", "@bare", "", "", { primaryAccountId: "", longContextAccountId: "", fallbackAccountId: "" });
   assert.equal(mod.routeAccount(5, empty).endpoint, "");
+  const fallbackOnly = bot("bare", "@bare", "", "", { primaryAccountId: "none", longContextAccountId: "", fallbackAccountId: "prov_fast" });
+  assert.equal(mod.routeAccount(70, fallbackOnly).endpoint, "prov_fast");
+  assert.equal(mod.pickTurnAccount(fallbackOnly, 100), "prov_fast");
+  assert.equal(mod.pickTurnAccount(writer, mod.LONG_CONTEXT_CHARS), "prov_long");
+  assert.equal(mod.pickTurnAccount(writer, mod.LONG_CONTEXT_CHARS - 1), "prov_main");
+  const stamped = { engineKind: "", primaryAccountId: "prov_claude", longContextAccountId: "prov_gemini", fallbackAccountId: "prov_openrouter" };
+  assert.deepEqual(mod.normalizeModelLanes(stamped, []), { primaryAccountId: "", longContextAccountId: "", fallbackAccountId: "" });
+  assert.equal(mod.normalizeModelLanes(stamped, ["prov_claude"]).primaryAccountId, "prov_claude");
+  assert.equal(mod.normalizeModelLanes({ ...stamped, primaryAccountId: "prov_anthropic" }, []).primaryAccountId, "prov_anthropic");
+  assert.equal(mod.normalizeModelLanes({ ...stamped, engineKind: "openai_api", primaryAccountId: "botprov_grok" }, []).primaryAccountId, "botprov_grok");
+  assert.equal(mod.normalizeModelLanes(stamped, ["prov_gemini"]).longContextAccountId, "prov_gemini");
 });
 
 test("friction catches short text, a choice, two currencies, and a payment", () => {
@@ -166,6 +177,7 @@ test("phone routing, the owner allowlist, and callbacks stay closed", () => {
   assert.equal(global.ok, true);
   assert.equal(global.route.issuerId, "chief");
   assert.equal(global.route.groupId, "");
+  assert.equal(global.route.objective, "Audit the payroll ledger");
 
   const none = mod.routeMobile("Audit the payroll ledger", "", [group], bots);
   assert.equal(none.ok, false);
@@ -191,7 +203,19 @@ test("phone routing, the owner allowlist, and callbacks stay closed", () => {
   assert.match(mod.parseCallback("approve_tx_901").error, /not a delegation/);
   assert.equal(mod.parseCallback("resolve:ctr_1:short").ok, false);
 
+  const literal = mod.routeMobile("/chiefdom stays whole", "chief", [group], bots);
+  assert.equal(literal.ok, true);
+  assert.equal(literal.route.objective, "/chiefdom stays whole");
+
   assert.equal(mod.inboundChiefAction("hello from the phone"), null);
+  assert.deepEqual(mod.inboundChiefAction("#ops Patch the webhook bug"), {
+    text: "#ops Patch the webhook bug",
+    callback: "",
+  });
+  assert.deepEqual(mod.inboundChiefAction("@chief Audit the payroll ledger"), {
+    text: "@chief Audit the payroll ledger",
+    callback: "",
+  });
   assert.deepEqual(mod.inboundChiefAction("/chief Patch the webhook bug"), {
     text: "/chief Patch the webhook bug",
     callback: "",

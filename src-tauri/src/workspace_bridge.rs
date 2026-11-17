@@ -168,6 +168,141 @@ pub(crate) fn context_bundle(conn: &Connection, home: &Path, origin: &str) -> St
     }
 }
 
+/// The live workspace pack, for browser automation that writes a chat composer.
+pub fn live_context_pack(app: &AppHandle) -> String {
+    with_db(app, |conn, home| context_block(conn, home, "")).unwrap_or_default()
+}
+
+/// Hosts where typed text is a message to other people. The login is recorded.
+/// The workspace pack is not written into that message.
+pub(crate) fn channel_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    host == "slack.com"
+        || host == "app.slack.com"
+        || host.ends_with(".slack.com")
+        || host == "discord.com"
+        || host == "discordapp.com"
+        || host.ends_with(".discord.com")
+        || host.ends_with(".discordapp.com")
+        || host == "teams.microsoft.com"
+        || host == "teams.live.com"
+        || host == "web.telegram.org"
+        || host == "web.whatsapp.com"
+        || host == "mail.google.com"
+        || host == "outlook.office.com"
+        || host == "outlook.live.com"
+}
+
+/// Any non-login site the bot or workspace browser is on. Sign-in is recorded
+/// for file tools and browser tools, not only for Slack.
+pub(crate) fn session_page_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    !host.is_empty() && !is_auth_host(&host)
+}
+
+/// Private composers (chat apps, the project site, a local tool) receive the
+/// pack. Team-message hosts and account-login pages do not.
+pub(crate) fn composer_injection_host(host: &str) -> bool {
+    session_page_host(host) && !channel_host(host)
+}
+
+/// Append the workspace pack to a prompt the bot is about to type.
+/// Works for every composer that is not a team-message site.
+/// Short values with no spaces (passwords, emails, codes) are left alone.
+pub fn inject_composer_text(host: &str, pack: &str, typed: &str) -> String {
+    let typed = typed.trim();
+    if typed.is_empty() || !composer_injection_host(host) || typed.contains("[Ronic OS connection]") {
+        return typed.to_string();
+    }
+    let pack = pack.trim();
+    if pack.is_empty() || !prompt_like(typed) {
+        return typed.to_string();
+    }
+    format!("{typed}\n\n{pack}")
+}
+
+fn prompt_like(text: &str) -> bool {
+    let text = text.trim();
+    text.chars().count() >= 8 && (text.contains(' ') || text.contains('\n'))
+}
+
+pub(crate) fn session_page_url(url: &url::Url) -> bool {
+    let scheme = url.scheme();
+    if scheme != "https" && scheme != "http" {
+        return false;
+    }
+    let host = url.host_str().unwrap_or("");
+    !is_auth_host(host) && session_page_host(host)
+}
+
+/// Project folder plus signed-in browser hosts. This is the block a bot reads
+/// before it decides the workspace is unreachable.
+pub fn format_injection_brief(project_root: &str, home: &Path) -> String {
+    let project = project_root.trim();
+    let project = if project.is_empty() || project == "none" { "" } else { project };
+    let project_line = if project.is_empty() {
+        "Project folder: none. Set the project folder before reading project files.".to_string()
+    } else {
+        format!("Project folder: {project}")
+    };
+    let sessions = signed_in_hosts(home);
+    let session_line = if sessions.is_empty() {
+        "Browser sessions: none reported yet.".to_string()
+    } else {
+        format!("Browser sessions: {} signed in.", sessions.join(", "))
+    };
+    format!(
+        "Context injection:\n{project_line}\nThis context is on every tool: file tools, browser tools, and workspace webapps. It is not limited to Slack.\nRead this folder with list_files and read_file. An empty list_files path is the project folder. A project-relative path such as supabase/schema.sql opens that file. The bot terminal stays inside that bot's own workspace and cannot open this folder. Do not ask the user to attach the project folder when it is named here.\n{session_line}\nA login on any site in the workspace browser or any bot browser is one shared page session. Use inspect_page, read_page, click_control, and type_text on it. Do not ask the user to sign in again when that site is listed. Team-message sites (Slack, Discord, Teams, Telegram, WhatsApp, and mail) keep the login here and do not receive this pack inside a message to other people."
+    )
+}
+
+/// One line appended to a tool result so the same context is present on every
+/// function, including ones that never open Slack.
+pub fn injection_footer(project_root: &str, home: &Path) -> String {
+    let project = project_root.trim();
+    let project = if project.is_empty() || project == "none" {
+        "none".to_string()
+    } else {
+        project.to_string()
+    };
+    let sessions = signed_in_hosts(home);
+    let sessions = if sessions.is_empty() {
+        "none reported".to_string()
+    } else {
+        sessions.join(", ")
+    };
+    format!("Context injection applies to every tool, not only Slack. Project folder: {project}. Browser sessions: {sessions}. list_files with an empty path, and read_file with a project-relative path such as supabase/schema.sql, read that folder. The terminal cannot. Team-message sites do not get this pack written into a message.")
+}
+
+pub fn signed_in_hosts(home: &Path) -> Vec<String> {
+    let path = home.join("webapp-auth.json");
+    let Ok(text) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(root) = serde_json::from_str::<Value>(&text) else {
+        return Vec::new();
+    };
+    let Some(map) = root.as_object() else {
+        return Vec::new();
+    };
+    let mut hosts = Vec::new();
+    for entry in map.values() {
+        if entry.get("signedIn").and_then(Value::as_bool) != Some(true) {
+            continue;
+        }
+        let Some(host) = entry.get("host").and_then(Value::as_str) else {
+            continue;
+        };
+        let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        if host.is_empty() || hosts.iter().any(|item: &String| item == &host) {
+            continue;
+        }
+        hosts.push(host);
+    }
+    hosts.sort();
+    hosts
+}
+
 pub(crate) fn republish(app: &AppHandle) -> Result<(Vec<String>, String), String> {
     let token = load_token(app);
     let port = status().port;
@@ -195,8 +330,18 @@ fn rpc(app: &AppHandle, body: &Value) -> Option<Value> {
             if name == "ronic_execute_codemode" {
                 let script = crate::code_mode::script_arg(&args);
                 let home = bridge_home(app);
-                match crate::code_mode::execute(&home, &script) {
+                match crate::code_mode::execute_with(&home, &script, Some(app)) {
                     Ok(result) => Ok(json!({ "content": [{ "type": "text", "text": result.final_return_json }], "isError": !result.ok })),
+                    Err(error) => Ok(json!({ "content": [{ "type": "text", "text": error }], "isError": true })),
+                }
+            } else if crate::dock_mcp::is_dock_tool(name) {
+                // Dock apps touch webviews and client config. They stay outside
+                // the database lock, and a missing action is an error.
+                match crate::dock_mcp::drive(Some(app), None, name, &args) {
+                    Ok(value) => {
+                        let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
+                        Ok(json!({ "content": [{ "type": "text", "text": text }], "isError": false }))
+                    }
                     Err(error) => Ok(json!({ "content": [{ "type": "text", "text": error }], "isError": true })),
                 }
             } else {
@@ -249,7 +394,7 @@ pub(crate) fn run_chat_tool_with_attachments(conn: &Connection, name: &str, args
 }
 
 pub(crate) fn is_local_tool(name: &str) -> bool {
-    allowed(name) && name != "ronic_execute_codemode"
+    allowed(name) && name != "ronic_execute_codemode" && !crate::dock_mcp::is_dock_tool(name)
 }
 
 pub(crate) fn call_tool(conn: &Connection, home: &Path, name: &str, args: &Value) -> Result<String, String> {
@@ -261,8 +406,11 @@ pub(crate) fn call_tool(conn: &Connection, home: &Path, name: &str, args: &Value
 
 pub(crate) fn call_tool_with_attachments(conn: &Connection, home: &Path, name: &str, args: &Value, attachments: &[String]) -> Result<String, String> {
     let name = name.trim();
+    if crate::dock_mcp::is_dock_tool(name) {
+        return Err("workspace_webapp and desktop_app run on the desktop session, outside the database lock. Call them from MCP tools/call or Code Mode ronic.apps.".into());
+    }
     if !allowed(name) {
-        return Err("That tool is not on the Ronic OS bridge. Use list_skills, load_skill, load_skill_file, list_plugins, list_memory, search_memory, save_memory, list_files, read_file, list_mcp, list_providers, list_threads, skill_manage, workspace_manifest, ronic_search_capabilities, ronic_execute_codemode, or ronic_ask_peer_app.".into());
+        return Err("That tool is not on the Ronic OS bridge. Use list_skills, load_skill, load_skill_file, list_plugins, list_memory, search_memory, save_memory, curate_memory, update_memory_graph, list_files, read_file, list_mcp, list_providers, list_threads, skill_manage, workspace_manifest, ronic_search_capabilities, ronic_execute_codemode, or ronic_ask_peer_app.".into());
     }
     let profile = active_profile(conn);
     match name {
@@ -273,7 +421,9 @@ pub(crate) fn call_tool_with_attachments(conn: &Connection, home: &Path, name: &
         "list_plugins" => Ok(list_plugins(conn, home, &profile)),
         "list_memory" => Ok(list_memory(conn)),
         "search_memory" => Ok(search_memory(conn, arg(args, "query"))),
-        "save_memory" => save_memory(conn, &profile, arg(args, "title"), first_arg(args, &["content", "contentMarkdown"])),
+        "save_memory" => save_memory(conn, &profile, arg(args, "title"), first_arg(args, &["content", "contentMarkdown"]), arg(args, "id")),
+        "curate_memory" => curate_memory(conn, &profile, args),
+        "update_memory_graph" => update_memory_graph(conn, &profile, args),
         "list_providers" => Ok(list_providers(conn)),
         "list_threads" => Ok(list_threads(conn, &profile)),
         "list_files" => list_files(conn, arg(args, "path"), attachments),
@@ -285,7 +435,15 @@ pub(crate) fn call_tool_with_attachments(conn: &Connection, home: &Path, name: &
         "read_file" => {
             let target = first_arg(args, &["path", "file"]);
             if is_absolute_path(target) {
-                read_absolute_file(target, attachments)
+                if let Some(inside) = rel_inside_project(conn, target) {
+                    if inside.is_empty() {
+                        Err("That path is the project folder. Use list_files with an empty path to see what is inside.".into())
+                    } else {
+                        read_project_file(conn, &inside)
+                    }
+                } else {
+                    read_absolute_file(target, attachments)
+                }
             } else {
                 read_project_file(conn, target)
             }
@@ -305,6 +463,10 @@ pub(crate) fn call_tool_with_attachments(conn: &Connection, home: &Path, name: &
             crate::capabilities::install_plugin_from_source(conn, home, &profile, source, slug_opt).map_err(|e| e.0)
         }
         "connect_mcp" => {
+            let secret = first_arg(args, &["secret", "apiKey", "api_key", "token"]);
+            if !secret.is_empty() {
+                return Err("The public bridge does not store MCP keys. Connect the server from the desktop app.".into());
+            }
             let name = first_arg(args, &["name", "server"]);
             let transport = arg(args, "transport");
             let trans_opt = if transport.is_empty() { None } else { Some(transport) };
@@ -312,8 +474,6 @@ pub(crate) fn call_tool_with_attachments(conn: &Connection, home: &Path, name: &
             let cmd_opt = if command.is_empty() { None } else { Some(command) };
             let url = first_arg(args, &["url", "endpoint"]);
             let url_opt = if url.is_empty() { None } else { Some(url) };
-            let secret = first_arg(args, &["secret", "apiKey"]);
-            let sec_opt = if secret.is_empty() { None } else { Some(secret) };
             let args_list: Vec<String> = if let Some(arr) = args.get("args").and_then(|v| v.as_array()) {
                 arr.iter().filter_map(|s| s.as_str().map(str::to_string)).collect()
             } else if let Some(s) = args.get("args").and_then(|v| v.as_str()) {
@@ -321,25 +481,7 @@ pub(crate) fn call_tool_with_attachments(conn: &Connection, home: &Path, name: &
             } else {
                 Vec::new()
             };
-            crate::capabilities::connect_mcp_server(conn, home, &profile, name, trans_opt, cmd_opt, &args_list, url_opt, sec_opt).map_err(|e| e.0)
-        }
-        "workspace_webapp" => {
-            let action = first_arg(args, &["action", "op"]);
-            if action == "list" {
-                let list = crate::workspace_apps::list_available_webapps(Some(conn));
-                Ok(serde_json::to_string_pretty(&list).unwrap_or_default())
-            } else {
-                Ok(format!("workspace_webapp '{action}' completed in desktop mode."))
-            }
-        }
-        "desktop_app" => {
-            let action = first_arg(args, &["action", "op"]);
-            if action == "list" {
-                let list = crate::workspace_apps::list_available_desktop_apps();
-                Ok(serde_json::to_string_pretty(&list).unwrap_or_default())
-            } else {
-                Ok(format!("desktop_app '{action}' completed in desktop mode."))
-            }
+            crate::capabilities::connect_mcp_server(conn, home, &profile, name, trans_opt, cmd_opt, &args_list, url_opt, None).map(|done| done.note).map_err(|e| e.0)
         }
         "ronic_search_capabilities" => Ok(crate::code_mode::search_capabilities(conn, home, first_arg(args, &["query", "query_js"])).to_string()),
         "ronic_ask_peer_app" => {
@@ -362,6 +504,8 @@ fn allowed(name: &str) -> bool {
             | "list_memory"
             | "search_memory"
             | "save_memory"
+            | "curate_memory"
+            | "update_memory_graph"
             | "list_providers"
             | "list_threads"
             | "list_files"
@@ -393,9 +537,11 @@ fn context_block(conn: &Connection, home: &Path, user_text: &str) -> String {
         }
     };
     let skills: Vec<_> = view.skills.iter().filter(|skill| in_index(skill, &profile, capabilities::plugin_agent_on(&view.plugins, &skill.plugin_id, &profile))).collect();
+    let project = db::settings_of(conn).map(|settings| settings.project_root).unwrap_or_default();
     let mut lines = vec![
         "[Ronic OS connection]".into(),
         "This chat is running inside Ronic OS on the user's computer. You are connected to the local workspace and can use its skills, plugins, and memory. The lists below are live. Do not say you cannot access the workspace, its skills, its plugins, or its memory.".into(),
+        format_injection_brief(&project, home),
         format!("Profile: {label}"),
         format!("Counts: {} skills, {} plugins, {} memories.", skills.len(), view.plugins.len(), memory_count(conn)),
         "Skill index:".into(),
@@ -425,27 +571,14 @@ fn context_block(conn: &Connection, home: &Path, user_text: &str) -> String {
     lines.push("MCP servers:".into());
     lines.push(list_mcp_text(conn, home, &profile));
     lines.push("Project files stay inside the project folder. Use list_files and read_file. Shell, wallet, and API keys are not on this connection. A website cannot open the local MCP port. This attached block is the connection. Local CLIs use the Ronic OS MCP server.".into());
-    lines.push("This attached block is the connection. A website cannot run Ronic OS tools from the page, and it cannot open the local MCP port. Use the Ronic OS chat or the signed local MCP server for tools. Tools on that server: load_skill (slug), load_skill_file (slug, path), list_skills, list_plugins, list_memory, search_memory (query), save_memory (title, content), list_files (path), read_file (path), list_mcp, skill_manage (slug, description, body), list_providers, list_threads, workspace_manifest, ronic_search_capabilities (query), ronic_ask_peer_app (target, task). save_memory writes the Memory screen. skill_manage waits for approval and does not write the file. ronic_ask_peer_app stores a ticket and does not launch the other app.".into());
-    if let Some(skill) = mentioned(&skills, user_text) {
-        lines.push(format!("Skill playbook for this turn:\n{}", clip(&skill.body, 2500)));
+    lines.push("This attached block is the connection. A website cannot run Ronic OS tools from the page, and it cannot open the local MCP port. Use the Ronic OS chat or the signed local MCP server for tools. Tools on that server: load_skill (slug), load_skill_file (slug, path), list_skills, list_plugins, list_memory, search_memory (query), save_memory (title, content, id?), curate_memory (target, action, content?, oldText?), update_memory_graph (title, target, relation?, remove?), list_files (path), read_file (path), list_mcp, skill_manage (slug, description, body), list_providers, list_threads, workspace_manifest, ronic_search_capabilities (query), ronic_ask_peer_app (target, task). save_memory updates a note with the same title instead of adding a copy and rewrites its structured markdown sheet. Do not edit that file. curate_memory writes a short always-on fact and refuses a write over its cap. update_memory_graph changes one link and does not rewrite the note. skill_manage waits for approval and does not write the file. ronic_ask_peer_app stores a ticket and does not launch the other app.".into());
+    if let Some(body) = crate::capabilities::playbook(user_text, &skills, &view.plugins, &profile) {
+        lines.push(format!("Skill playbook for this turn. Follow it:\n{}", clip(&body, 2500)));
+    }
+    if let Some(note) = crate::capabilities::mcp_turn(user_text, &view.mcp_servers, &profile) {
+        lines.push(note);
     }
     clip(&lines.join("\n"), PACK_LIMIT)
-}
-
-fn mentioned<'a>(skills: &[&'a crate::models::Skill], text: &str) -> Option<&'a crate::models::Skill> {
-    let lower = text.to_lowercase();
-    if lower.is_empty() {
-        return None;
-    }
-    let token = lower.split_whitespace().next().unwrap_or("");
-    skills.iter().copied().find(|skill| {
-        let slash = skill.slash_command.to_lowercase();
-        if !slash.is_empty() && (token == slash || lower.contains(&slash)) {
-            return true;
-        }
-        let slug = skill.slug.to_lowercase();
-        slug.len() >= 4 && lower.contains("skill") && lower.contains(&slug)
-    })
 }
 
 fn list_skills(conn: &Connection, home: &Path, profile: &str) -> String {
@@ -504,8 +637,8 @@ fn list_plugins(conn: &Connection, home: &Path, profile: &str) -> String {
 }
 
 fn list_memory(conn: &Connection) -> String {
-    let rows = memory_rows(conn, "SELECT title, content_markdown FROM memory_items ORDER BY updated_at DESC LIMIT 30", params![]);
-    if rows.is_empty() { "No memories saved yet.".into() } else { rows.into_iter().map(|(title, body)| format!("# {title}\n{}", clip(&body, 500))).collect::<Vec<_>>().join("\n\n") }
+    let rows = memory_rows(conn, "SELECT id, title, content_markdown, COALESCE(scoped_bot_id, '') FROM memory_items ORDER BY updated_at DESC LIMIT 30", params![]);
+    if rows.is_empty() { "No memories saved yet.".into() } else { memory_cards(rows) }
 }
 
 fn search_memory(conn: &Connection, query: &str) -> String {
@@ -514,29 +647,29 @@ fn search_memory(conn: &Connection, query: &str) -> String {
         return latest_memory(conn);
     }
     let like = format!("%{}%", query.to_lowercase().replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
-    let rows = memory_rows(conn, "SELECT title, content_markdown FROM memory_items WHERE lower(title) LIKE ?1 ESCAPE '\\' OR lower(content_markdown) LIKE ?1 ESCAPE '\\' ORDER BY updated_at DESC LIMIT 12", params![like]);
-    if rows.is_empty() {
-        latest_memory(conn)
-    } else {
-        rows.into_iter().map(|(title, body)| format!("- {title}: {}", clip(&redact(&body), 180))).collect::<Vec<_>>().join("\n")
-    }
+    let rows = memory_rows(conn, "SELECT id, title, content_markdown, COALESCE(scoped_bot_id, '') FROM memory_items WHERE lower(title) LIKE ?1 ESCAPE '\\' OR lower(content_markdown) LIKE ?1 ESCAPE '\\' ORDER BY updated_at DESC LIMIT 12", params![like]);
+    if rows.is_empty() { latest_memory(conn) } else { memory_cards(rows) }
 }
 
 fn latest_memory(conn: &Connection) -> String {
-    let rows = memory_rows(conn, "SELECT title, content_markdown FROM memory_items ORDER BY updated_at DESC LIMIT 4", params![]);
-    if rows.is_empty() { "None saved.".into() } else { rows.into_iter().map(|(title, body)| format!("- {title}: {}", clip(&redact(&body), 180))).collect::<Vec<_>>().join("\n") }
+    let rows = memory_rows(conn, "SELECT id, title, content_markdown, COALESCE(scoped_bot_id, '') FROM memory_items ORDER BY updated_at DESC LIMIT 4", params![]);
+    if rows.is_empty() { "None saved.".into() } else { memory_cards(rows) }
 }
 
-fn memory_rows(conn: &Connection, sql: &str, args: impl rusqlite::Params) -> Vec<(String, String)> {
+fn memory_cards(rows: Vec<(String, String, String, String)>) -> String {
+    rows.into_iter().map(|(id, title, body, scope)| memory::card(&id, &title, &scope, &clip(&redact(&body), 180))).collect::<Vec<_>>().join("\n\n")
+}
+
+fn memory_rows(conn: &Connection, sql: &str, args: impl rusqlite::Params) -> Vec<(String, String, String, String)> {
     let Ok(mut stmt) = conn.prepare(sql) else { return Vec::new() };
-    stmt.query_map(args, |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))).map(|rows| rows.flatten().collect()).unwrap_or_default()
+    stmt.query_map(args, |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))).map(|rows| rows.flatten().collect()).unwrap_or_default()
 }
 
 fn memory_count(conn: &Connection) -> i64 {
     conn.query_row("SELECT COUNT(*) FROM memory_items", [], |row| row.get(0)).unwrap_or(0)
 }
 
-fn save_memory(conn: &Connection, profile: &str, title: &str, content: &str) -> Result<String, String> {
+fn save_memory(conn: &Connection, profile: &str, title: &str, content: &str, id: &str) -> Result<String, String> {
     let title = title.trim();
     let content = content.trim();
     if title.is_empty() || content.is_empty() {
@@ -545,27 +678,60 @@ fn save_memory(conn: &Connection, profile: &str, title: &str, content: &str) -> 
     if title.chars().count() > 200 || content.chars().count() > 8000 {
         return Err("That memory is too long.".into());
     }
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|time| time.as_secs()).unwrap_or(0);
-    {
-        let mut shared = SHARED.lock().unwrap_or_else(|poison| poison.into_inner());
-        if now.saturating_sub(shared.saves.0) > 60 {
-            shared.saves = (now, 0);
-        }
-        if shared.saves.1 >= 30 {
-            return Err("Too many memories were saved in the last minute.".into());
-        }
-        shared.saves.1 += 1;
-    }
+    note_rate_limit()?;
+    let id = id.trim();
     let saved = memory::remember(conn, &MemoryInput {
-        id: None,
+        id: if id.is_empty() { None } else { Some(id.to_string()) },
         title: title.into(),
         content_markdown: content.into(),
         source_type: "harness".into(),
         scoped_bot_id: if profile.is_empty() { None } else { Some(profile.to_string()) },
         file_path_or_uri: String::new(),
         engine_id: None,
+        keep_identity: true,
     }).map_err(|error| error.0)?;
     Ok(format!("{}. It is on the Memory screen.", saved.note))
+}
+
+fn note_rate_limit() -> Result<(), String> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|time| time.as_secs()).unwrap_or(0);
+    let mut shared = SHARED.lock().unwrap_or_else(|poison| poison.into_inner());
+    if now.saturating_sub(shared.saves.0) > 60 {
+        shared.saves = (now, 0);
+    }
+    if shared.saves.1 >= 30 {
+        return Err("Too many memories were saved in the last minute.".into());
+    }
+    shared.saves.1 += 1;
+    Ok(())
+}
+
+fn curate_memory(conn: &Connection, profile: &str, args: &Value) -> Result<String, String> {
+    note_rate_limit()?;
+    let bot = if profile.is_empty() { None } else { Some(profile) };
+    memory::curate(
+        conn,
+        first_arg(args, &["target", "store"]),
+        first_arg(args, &["action", "op"]),
+        first_arg(args, &["oldText", "old_text"]),
+        first_arg(args, &["content", "fact"]),
+        bot,
+    )
+    .map_err(|error| error.0)
+}
+
+fn update_memory_graph(conn: &Connection, profile: &str, args: &Value) -> Result<String, String> {
+    let key = {
+        let id = arg(args, "id");
+        if id.is_empty() { first_arg(args, &["title", "memory"]) } else { id }
+    };
+    let remove = match args.get("remove") {
+        Some(Value::Bool(value)) => *value,
+        Some(Value::String(value)) => matches!(value.trim(), "true" | "1" | "yes"),
+        _ => false,
+    };
+    let caller = if profile.is_empty() { None } else { Some(profile) };
+    memory::link_graph(conn, key, first_arg(args, &["target", "to"]), arg(args, "relation"), remove, caller).map_err(|error| error.0)
 }
 
 fn blocked_name(name: &str) -> bool {
@@ -670,6 +836,23 @@ fn is_absolute_path(raw: &str) -> bool {
 /// and 8.3 short names cannot bypass the check. An empty attachment list
 /// means no absolute path is reachable (MCP bridge / code mode / turns
 /// without attachments).
+/// Product memory sheets are a render beside the database. A bot may open that
+/// folder without an attachment. The folder must be a real directory: a symlink
+/// root would follow out of the product home. Secret-name and sensitive-path
+/// checks still run before this.
+fn in_memory_sheets(canon: &Path) -> bool {
+    under_memory_root(canon, &crate::util::product_home().join("memories"))
+}
+
+fn under_memory_root(canon: &Path, root: &Path) -> bool {
+    let Ok(meta) = root.symlink_metadata() else { return false };
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return false;
+    }
+    let Ok(root) = root.canonicalize() else { return false };
+    canon.starts_with(&root)
+}
+
 fn attachments_allow(canon: &Path, attachments: &[String]) -> bool {
     if attachments.is_empty() {
         return false;
@@ -681,10 +864,32 @@ fn attachments_allow(canon: &Path, attachments: &[String]) -> bool {
     })
 }
 
+/// Absolute path that canonicalizes inside the project root, as a
+/// project-relative path. Empty means the project folder itself.
+fn rel_inside_root(root: &Path, raw: &str) -> Option<String> {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let canon = PathBuf::from(raw.trim()).canonicalize().ok()?;
+    if !canon.starts_with(&root) {
+        return None;
+    }
+    if canon.components().any(|part| blocked_name(&part.as_os_str().to_string_lossy())) {
+        return None;
+    }
+    let rel = canon.strip_prefix(&root).ok()?;
+    Some(rel.to_string_lossy().replace('\\', "/"))
+}
+
+fn rel_inside_project(conn: &Connection, raw: &str) -> Option<String> {
+    rel_inside_root(&project_dir(conn).ok()?, raw)
+}
+
 fn list_files(conn: &Connection, rel: &str, attachments: &[String]) -> Result<String, String> {
-    // An absolute folder path is listed only when user-attached this turn;
-    // relative stays confined to the project root.
+    // An absolute path inside the project folder is the same read as a
+    // relative one. Anything else is listed only when the user attached it.
     if is_absolute_path(rel) {
+        if let Some(inside) = rel_inside_project(conn, rel) {
+            return list_files(conn, &inside, attachments);
+        }
         let dir = PathBuf::from(rel.trim());
         return list_absolute_dir(&dir, rel.trim(), attachments);
     }
@@ -725,8 +930,8 @@ fn list_absolute_dir(dir: &Path, display: &str, attachments: &[String]) -> Resul
     if sensitive_path(&canon) {
         return Err("That folder is not available on this connection.".into());
     }
-    if !attachments_allow(&canon, attachments) {
-        return Err("That folder is outside this turn's attached files. Attach the file or folder in the chat first.".into());
+    if !in_memory_sheets(&canon) && !attachments_allow(&canon, attachments) {
+        return Err("That folder is outside the project folder and was not attached in this chat. list_files with an empty path reads the project folder from Context injection. The bot terminal cannot open it.".into());
     }
     if !dir.is_dir() {
         return Err(format!("'{display}' is not a folder on this computer."));
@@ -791,8 +996,8 @@ fn read_absolute_file(raw: &str, attachments: &[String]) -> Result<String, Strin
     if canon.components().any(|part| blocked_name(&part.as_os_str().to_string_lossy())) || sensitive_path(&canon) {
         return Err("That file is not available on this connection.".into());
     }
-    if !attachments_allow(&canon, attachments) {
-        return Err("That file is outside this turn's attached files. Attach the file or its folder in the chat first.".into());
+    if !in_memory_sheets(&canon) && !attachments_allow(&canon, attachments) {
+        return Err("That file is outside the project folder and was not attached in this chat. Use a project-relative path, or list_files with an empty path. The bot terminal cannot open the project folder.".into());
     }
     if canon.is_dir() {
         return list_absolute_dir(&canon, raw.trim(), attachments);
@@ -1091,7 +1296,7 @@ fn first_arg<'a>(args: &'a Value, keys: &[&str]) -> &'a str {
 }
 
 fn instructions() -> &'static str {
-    "You are connected to Ronic OS on this computer. Use these tools for its skills, plugins, memory, and files. Do not say you cannot access the workspace or a file the user attached or referenced. save_memory writes the Memory screen. skill_manage proposes a skill and waits for approval. read_file opens a project-relative path inside the project folder, or an absolute path (e.g. a file the user attached or named) anywhere on this computer — secret files are blocked and text is redacted. list_files lists a folder the same way. Shell, wallet, and API keys are not available. ronic_search_capabilities and ronic_execute_codemode are the Code Mode surface. ronic_ask_peer_app stores a ticket for another app and does not launch it."
+    "You are connected to Ronic OS on this computer. Use these tools for its skills, plugins, memory, and files. Do not say you cannot access the workspace or a file the user attached or referenced. save_memory writes the Memory screen and rewrites its structured markdown sheet. The same title, or an id from list_memory, updates that note and keeps its vault, file, scope, and graph links. Edit that sheet with save_memory or curate_memory. Do not rewrite the file. curate_memory writes one short always-on fact (target user, memory, or bot). A write over the cap is refused. update_memory_graph adds, changes, or removes one link and does not rewrite the note. skill_manage proposes a skill and waits for approval. read_file opens a project-relative path inside the project folder, a memory sheet under the product memories folder, or an absolute path (e.g. a file the user attached or named) anywhere on this computer — secret files are blocked and text is redacted. list_files lists a folder the same way. Shell, wallet, and API keys are not available. ronic_search_capabilities and ronic_execute_codemode are the Code Mode surface. ronic_ask_peer_app stores a ticket for another app and does not launch it. workspace_webapp and desktop_app control the Dock. connect writes the local MCP server into Cursor, VS Code, or Claude Code, or opens a web app's connector page in the Dock. A site login is not an MCP connection. eval is not on this bridge."
 }
 
 fn tool_defs() -> Value {
@@ -1101,28 +1306,37 @@ fn tool_defs() -> Value {
         { "name": "load_skill", "description": "Load one SKILL.md playbook from the active profile.", "inputSchema": { "type": "object", "properties": { "slug": { "type": "string" } }, "required": ["slug"] } },
         { "name": "load_skill_file", "description": "Load one supporting reference or script from a skill.", "inputSchema": { "type": "object", "properties": { "slug": { "type": "string" }, "path": { "type": "string" } }, "required": ["slug", "path"] } },
         { "name": "list_plugins", "description": "List installed Ronic OS plugins.", "inputSchema": { "type": "object", "properties": {} } },
-        { "name": "list_memory", "description": "List workspace memories.", "inputSchema": { "type": "object", "properties": {} } },
-        { "name": "search_memory", "description": "Search memory titles and body text.", "inputSchema": { "type": "object", "properties": { "query": { "type": "string" } }, "required": ["query"] } },
-        { "name": "save_memory", "description": "Save a memory onto the Ronic OS Memory screen.", "inputSchema": { "type": "object", "properties": { "title": { "type": "string" }, "content": { "type": "string" } }, "required": ["title", "content"] } },
+        { "name": "list_memory", "description": "List workspace memories as short structured markdown cards.", "inputSchema": { "type": "object", "properties": {} } },
+        { "name": "search_memory", "description": "Search memory titles and body text. Each hit is a short structured markdown card.", "inputSchema": { "type": "object", "properties": { "query": { "type": "string" } }, "required": ["query"] } },
+        { "name": "save_memory", "description": "Save or update a memory on the Memory screen. The same title, or an id from list_memory, updates that note in place. The update keeps its vault, file, scope, and graph links. The save rewrites a structured markdown sheet. Edit with this tool, not by rewriting the file.", "inputSchema": { "type": "object", "properties": { "title": { "type": "string" }, "content": { "type": "string" }, "id": { "type": "string" } }, "required": ["title", "content"] } },
+        { "name": "curate_memory", "description": "Add, replace, or remove one short always-on fact. target is user (1375 chars), memory (2200 chars), or bot (1800 chars, this bot only). action is add, replace, or remove. replace and remove need oldText, a unique piece of one fact. A write over the cap is refused and the vault notes are not changed.", "inputSchema": { "type": "object", "properties": { "target": { "type": "string" }, "action": { "type": "string" }, "content": { "type": "string" }, "oldText": { "type": "string" } }, "required": ["target", "action"] } },
+        { "name": "update_memory_graph", "description": "Add, change, or remove one graph link on an existing memory. This does not rewrite the note. title or id picks the note. target is the other entity. relation defaults to RELATES. remove=true deletes that one link.", "inputSchema": { "type": "object", "properties": { "title": { "type": "string" }, "id": { "type": "string" }, "target": { "type": "string" }, "relation": { "type": "string" }, "remove": { "type": "boolean" } }, "required": ["target"] } },
         { "name": "list_files", "description": "List files and folders. Pass a project-relative path (or empty for the project root), or an absolute path to any folder on this computer.", "inputSchema": { "type": "object", "properties": { "path": { "type": "string" } } } },
-        { "name": "read_file", "description": "Read a text file. Pass a project-relative path inside the project folder, or an absolute path (e.g. an attached file the user referenced) anywhere on this computer. Secret files are blocked and secrets in the text are redacted.", "inputSchema": { "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] } },
+        { "name": "read_file", "description": "Read a text file. Pass a project-relative path inside the project folder, a memory sheet under the product memories folder, or an absolute path (e.g. an attached file the user referenced) anywhere on this computer. Secret files are blocked and secrets in the text are redacted.", "inputSchema": { "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] } },
         { "name": "list_mcp", "description": "List MCP servers configured in Ronic OS. This does not start them.", "inputSchema": { "type": "object", "properties": {} } },
         { "name": "list_providers", "description": "List provider names and health. Secrets are not included.", "inputSchema": { "type": "object", "properties": {} } },
         { "name": "list_threads", "description": "List task titles for the active profile.", "inputSchema": { "type": "object", "properties": {} } },
         { "name": "skill_manage", "description": "Propose a skill. It waits for approval and does not write the file.", "inputSchema": { "type": "object", "properties": { "slug": { "type": "string" }, "description": { "type": "string" }, "body": { "type": "string" } }, "required": ["slug", "body"] } },
         { "name": "ronic_search_capabilities", "description": "Filter saved MCP tools, skills, and local bridge tools by a short query.", "inputSchema": { "type": "object", "properties": { "query": { "type": "string" } }, "required": ["query"] } },
         { "name": "ronic_execute_codemode", "description": "Run one TypeScript block whose await ronic.* calls go through the local gateway.", "inputSchema": { "type": "object", "properties": { "script": { "type": "string" } }, "required": ["script"] } },
-        { "name": "ronic_ask_peer_app", "description": "Queue a task for another mesh app. This does not launch that app or edit files.", "inputSchema": { "type": "object", "properties": { "target": { "type": "string" }, "task": { "type": "string" } }, "required": ["target", "task"] } }
+        { "name": "ronic_ask_peer_app", "description": "Queue a task for another mesh app. This does not launch that app or edit files.", "inputSchema": { "type": "object", "properties": { "target": { "type": "string" }, "task": { "type": "string" } }, "required": ["target", "task"] } },
+        { "name": "workspace_webapp", "description": "Control a Dock web app. action is list, open, read, click, type, scroll, close, connect, or status. connect opens ChatGPT, Claude, or Grok connector settings in the Dock. A site login is not an MCP connection. Gemini web has no custom connector. eval is not available.", "inputSchema": { "type": "object", "properties": { "action": { "type": "string" }, "app": { "type": "string" }, "url": { "type": "string" }, "id": { "type": "number" }, "match": { "type": "string" }, "text": { "type": "string" }, "direction": { "type": "string" } }, "required": ["action"] } },
+        { "name": "desktop_app", "description": "Control a desktop app on this computer. action is list, open, inspect, click, type, status, or connect. inspect returns live controls for window (or the foreground window) and does not invent buttons. click and type take markId or match. type also needs text. connect writes the local Ronic OS MCP server into Cursor, VS Code, or Claude Code. Obsidian and Ollama do not speak MCP.", "inputSchema": { "type": "object", "properties": { "action": { "type": "string" }, "app": { "type": "string" }, "path": { "type": "string" }, "kind": { "type": "string" }, "window": { "type": "string" }, "markId": { "type": "number" }, "match": { "type": "string" }, "text": { "type": "string" } }, "required": ["action"] } }
     ])
+}
+
+fn bridge_label(label: &str) -> bool {
+    label.starts_with("webapp_")
+        || label.starts_with("ronic_webapp_")
+        || label.starts_with("harness_")
+        || (label.starts_with("ronic_mini_comp_") && label.ends_with("_chrome"))
+        || label.starts_with("ronic_squad_comp_")
 }
 
 fn watched_views(app: &AppHandle) -> Vec<tauri::Webview> {
     let mut views = Vec::new();
     for (label, view) in app.webviews() {
-        if label.starts_with("webapp_")
-            || label.starts_with("ronic_webapp_")
-            || label.starts_with("harness_")
-        {
+        if bridge_label(&label) {
             views.push(view);
         }
     }
@@ -1157,7 +1371,7 @@ fn pump(app: AppHandle) {
         if views.is_empty() {
             continue;
         }
-        let views: Vec<_> = views.into_iter().filter(chat_page_view).collect();
+        let views: Vec<_> = views.into_iter().filter(session_page_view).collect();
         if views.is_empty() {
             continue;
         }
@@ -1166,7 +1380,9 @@ fn pump(app: AppHandle) {
                 let literal = serde_json::to_string(&pack).unwrap_or_else(|_| "\"\"".into());
                 let script = format!("window.__RONIC_CACHE={literal}");
                 for view in &views {
-                    let _ = view.eval(&script);
+                    if cache_page_view(view) {
+                        let _ = view.eval(&script);
+                    }
                 }
             }
         }
@@ -1204,7 +1420,9 @@ fn clear_flight(label: &str) {
     flights.retain(|(name, _)| name != label);
 }
 
-fn chat_page_view(view: &tauri::Webview) -> bool {
+/// Pages that may hold the workspace pack in the page itself: chat composers
+/// and a custom workspace webapp. Other sites only report sign-in.
+fn cache_page_view(view: &tauri::Webview) -> bool {
     let Ok(url) = view.url() else { return false };
     if chat_page_url(&url) {
         return true;
@@ -1215,6 +1433,16 @@ fn chat_page_view(view: &tauri::Webview) -> bool {
         return !is_auth_host(host);
     }
     false
+}
+
+/// Any open bridge page except an account-login host. Sign-in on GitHub,
+/// Supabase, Notion, or Slack is recorded the same way.
+fn session_page_view(view: &tauri::Webview) -> bool {
+    let Ok(url) = view.url() else { return false };
+    if session_page_url(&url) {
+        return true;
+    }
+    cache_page_view(view)
 }
 
 pub(crate) fn chat_page_url(url: &url::Url) -> bool {
@@ -1305,6 +1533,12 @@ fn deliver(app: &AppHandle, label: &str, raw: &str) {
             save_webapp_auth(&bridge_home(app), label, host, signed_in);
             continue;
         }
+        if op == "mcp-url" {
+            let url = crate::tunnel::public_mcp_base();
+            let literal = serde_json::to_string(&url).unwrap_or_else(|_| "\"\"".into());
+            calls.push_str(&format!("window.__RONIC_DELIVER&&window.__RONIC_DELIVER({id},{literal});"));
+            continue;
+        }
         if op != "context" {
             let refusal = "Embedded pages cannot run Ronic OS tools. Use the Ronic OS chat or the signed MCP bridge.";
             let literal = serde_json::to_string(refusal).unwrap_or_else(|_| "\"\"".into());
@@ -1343,20 +1577,34 @@ fn parse_box(raw: &str) -> Vec<Value> {
 /// Keep the last sign-in signal each webapp page reported, so the mesh can
 /// show an honest "signed in" state without pretending a profile folder is an
 /// MCP connection. Writes only when the stored state changes.
+fn auth_record_id(label: &str) -> Option<String> {
+    if let Some(id) = label.strip_prefix("ronic_webapp_").or_else(|| label.strip_prefix("webapp_")) {
+        let id = id.trim_end_matches("_web").trim();
+        if id.is_empty() { None } else { Some(id.to_string()) }
+    } else if let Some(rest) = label.strip_prefix("ronic_mini_comp_") {
+        let id = rest.strip_suffix("_chrome").unwrap_or(rest).trim();
+        if id.is_empty() { None } else { Some(format!("bot-{id}")) }
+    } else if let Some(rest) = label.strip_prefix("ronic_squad_comp_") {
+        let id = rest.strip_suffix("_chrome").unwrap_or(rest).trim();
+        if id.is_empty() { None } else { Some(format!("squad-{id}")) }
+    } else if let Some(rest) = label.strip_prefix("harness_") {
+        let id = rest.trim();
+        if id.is_empty() { None } else { Some(format!("harness-{id}")) }
+    } else {
+        None
+    }
+}
+
 fn save_webapp_auth(home: &Path, label: &str, host: &str, signed_in: bool) {
-    let Some(id) = label.strip_prefix("ronic_webapp_").or_else(|| label.strip_prefix("webapp_")) else {
+    let Some(id) = auth_record_id(label) else {
         return;
     };
-    let id = id.trim_end_matches("_web");
-    if id.is_empty() {
-        return;
-    }
     let path = home.join("webapp-auth.json");
     let mut root: Value = fs::read_to_string(&path).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_else(|| json!({}));
     if !root.is_object() {
         root = json!({});
     }
-    let existing = root.get(id).cloned().unwrap_or(Value::Null);
+    let existing = root.get(&id).cloned().unwrap_or(Value::Null);
     if existing.get("signedIn").and_then(Value::as_bool) == Some(signed_in) && !host.is_empty() {
         return;
     }
@@ -1434,16 +1682,35 @@ pub(crate) fn read_request(stream: &mut TcpStream) -> std::io::Result<(String, V
 }
 
 pub(crate) fn write_response(stream: &mut TcpStream, status: u16, content_type: &str, body: &[u8]) -> std::io::Result<()> {
+    let extra: &[(String, String)] = &[];
+    write_response_extra(stream, status, content_type, body, extra)
+}
+
+pub(crate) fn write_response_extra(stream: &mut TcpStream, status: u16, content_type: &str, body: &[u8], extra: &[(String, String)]) -> std::io::Result<()> {
     let reason = match status {
         200 => "OK",
+        201 => "Created",
         202 => "Accepted",
         204 => "No Content",
+        302 => "Found",
+        400 => "Bad Request",
         401 => "Unauthorized",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        500 => "Internal Server Error",
         _ => "Error",
     };
-    let header = format!("HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: *\r\n\r\n", body.len());
+    let mut header = format!("HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\n", body.len());
+    for (name, value) in extra {
+        if name.bytes().any(|byte| byte == b'\r' || byte == b'\n') || value.bytes().any(|byte| byte == b'\r' || byte == b'\n') {
+            continue;
+        }
+        header.push_str(name);
+        header.push_str(": ");
+        header.push_str(value);
+        header.push_str("\r\n");
+    }
+    header.push_str("\r\n");
     stream.write_all(header.as_bytes())?;
     if !body.is_empty() {
         stream.write_all(body)?;
@@ -1503,34 +1770,38 @@ struct ClientFile {
     path: PathBuf,
     create: bool,
     entry: Value,
+    /// Claude, Cursor, Copilot, and Gemini use `mcpServers`. VS Code's own
+    /// `mcp.json` uses `servers`.
+    map_key: &'static str,
 }
 
 fn register_clients(port: u16, token: &str) -> (Vec<String>, String) {
     let url = format!("http://127.0.0.1:{port}/mcp");
     let headers = json!({ "Authorization": format!("Bearer {token}") });
     let claude = json!({ "type": "http", "url": &url, "headers": &headers });
-    let gemini = json!({ "type": "http", "url": &url, "httpUrl": &url, "headers": &headers });
+    let gemini = gemini_http_entry(&url, &headers);
     let cursor = json!({ "url": &url, "headers": &headers });
     let home = user_home();
     let mut files = vec![
-        ClientFile { label: "Claude Code", path: home.join(".claude.json"), create: true, entry: claude.clone() },
-        ClientFile { label: "Gemini CLI", path: home.join(".gemini").join("settings.json"), create: true, entry: gemini },
-        ClientFile { label: "Cursor", path: home.join(".cursor").join("mcp.json"), create: true, entry: cursor },
+        ClientFile { label: "Claude Code", path: home.join(".claude.json"), create: true, entry: claude.clone(), map_key: "mcpServers" },
+        ClientFile { label: "Gemini CLI", path: home.join(".gemini").join("settings.json"), create: true, entry: gemini, map_key: "mcpServers" },
+        ClientFile { label: "Cursor", path: home.join(".cursor").join("mcp.json"), create: true, entry: cursor, map_key: "mcpServers" },
+        ClientFile { label: "Copilot", path: home.join(".copilot").join("mcp-config.json"), create: true, entry: claude.clone(), map_key: "mcpServers" },
     ];
     if let Some(appdata) = std::env::var_os("APPDATA") {
         let code = PathBuf::from(&appdata).join("Code").join("User");
         if code.is_dir() {
-            files.push(ClientFile { label: "VS Code", path: code.join("mcp.json"), create: true, entry: claude.clone() });
+            files.push(ClientFile { label: "VS Code", path: code.join("mcp.json"), create: true, entry: claude.clone(), map_key: "servers" });
         }
         let desktop = PathBuf::from(appdata).join("Claude");
         if desktop.is_dir() {
-            files.push(ClientFile { label: "Claude Desktop", path: desktop.join("claude_desktop_config.json"), create: true, entry: claude.clone() });
+            files.push(ClientFile { label: "Claude Desktop", path: desktop.join("claude_desktop_config.json"), create: true, entry: claude.clone(), map_key: "mcpServers" });
         }
     }
     let mut clients = Vec::new();
     let mut problems = Vec::new();
     for file in files {
-        match upsert_mcp(&file.path, &file.entry, file.create) {
+        match upsert_mcp_map(&file.path, file.map_key, &file.entry, file.create) {
             Ok(_) => clients.push(format!("{} ({})", file.label, file.path.display())),
             Err(error) => problems.push(format!("{}: {error}", file.label)),
         }
@@ -1544,6 +1815,13 @@ fn register_clients(port: u16, token: &str) -> (Vec<String>, String) {
 }
 
 pub(crate) fn upsert_mcp(path: &Path, entry: &Value, create: bool) -> Result<bool, String> {
+    upsert_mcp_map(path, "mcpServers", entry, create)
+}
+
+/// Merge `ronic-os` under `map_key` and leave every other server in place.
+/// `mcpServers` is the Claude, Cursor, Copilot, and Gemini key. `servers` is
+/// the key in a VS Code user or workspace `mcp.json`.
+pub(crate) fn upsert_mcp_map(path: &Path, map_key: &str, entry: &Value, create: bool) -> Result<bool, String> {
     if !create && !path.is_file() {
         return Ok(false);
     }
@@ -1560,9 +1838,9 @@ pub(crate) fn upsert_mcp(path: &Path, entry: &Value, create: bool) -> Result<boo
     if !root.is_object() {
         return Err(format!("{} is not a JSON object, so it was left unchanged", path.display()));
     }
-    let servers = root.as_object_mut().unwrap().entry("mcpServers").or_insert_with(|| json!({}));
+    let servers = root.as_object_mut().unwrap().entry(map_key).or_insert_with(|| json!({}));
     if !servers.is_object() {
-        return Err(format!("mcpServers in {} is not an object, so it was left unchanged", path.display()));
+        return Err(format!("{map_key} in {} is not an object, so it was left unchanged", path.display()));
     }
     let current = servers.get("ronic-os");
     if current == Some(entry) {
@@ -1589,6 +1867,89 @@ fn write_json(path: &Path, value: &Value) -> Result<bool, String> {
     Ok(true)
 }
 
+/// Write the local MCP server into one Dock desktop client's config.
+/// Cursor, VS Code, Claude Code, and the Gemini CLI each keep their own file shape.
+pub(crate) fn connect_named_client(which: &str) -> Result<String, String> {
+    let current = status();
+    if current.port == 0 || current.endpoint.is_empty() {
+        return Err("The MCP bridge is not listening, so the client config was not written.".into());
+    }
+    let token = fs::read_to_string(crate::util::product_home().join("bridge-token")).unwrap_or_default();
+    let token = token.trim();
+    if token.len() < 32 {
+        return Err("The bridge token is missing, so the client config was not written.".into());
+    }
+    let url = current.endpoint.clone();
+    let headers = json!({ "Authorization": format!("Bearer {token}") });
+    let claude = json!({ "type": "http", "url": &url, "headers": &headers });
+    let cursor = json!({ "url": &url, "headers": &headers });
+    let gemini = gemini_http_entry(&url, &headers);
+    let home = user_home();
+    let mut notes = Vec::new();
+    match which {
+        "cursor" => notes.push(write_client("Cursor", &home.join(".cursor").join("mcp.json"), &cursor, true)?),
+        "vscode" => {
+            let mut wrote = false;
+            if let Some(appdata) = std::env::var_os("APPDATA") {
+                let dir = PathBuf::from(appdata).join("Code").join("User");
+                if dir.is_dir() {
+                    match write_client_map("VS Code", &dir.join("mcp.json"), "servers", &claude, true) {
+                        Ok(note) => {
+                            wrote = true;
+                            notes.push(note);
+                        }
+                        Err(error) => notes.push(error),
+                    }
+                } else {
+                    notes.push("VS Code's User folder is not on this account, so User/mcp.json was not written.".into());
+                }
+            } else {
+                notes.push("APPDATA is not set, so VS Code's User/mcp.json was not written.".into());
+            }
+            match write_client_map("Copilot", &home.join(".copilot").join("mcp-config.json"), "mcpServers", &claude, true) {
+                Ok(note) => {
+                    wrote = true;
+                    notes.push(note);
+                }
+                Err(error) => notes.push(error),
+            }
+            if !wrote {
+                return Err(notes.join(" "));
+            }
+        }
+        "claude-code" => {
+            notes.push(write_client("Claude Code", &home.join(".claude.json"), &claude, true)?);
+            if let Some(appdata) = std::env::var_os("APPDATA") {
+                let dir = PathBuf::from(appdata).join("Claude");
+                if dir.is_dir() {
+                    notes.push(write_client("Claude Desktop", &dir.join("claude_desktop_config.json"), &claude, true)?);
+                }
+            }
+        }
+        "gemini-cli" => notes.push(write_client("Gemini CLI", &home.join(".gemini").join("settings.json"), &gemini, true)?),
+        _ => return Err(format!("{which} does not take a local MCP config.")),
+    }
+    Ok(notes.join(" "))
+}
+
+/// Gemini CLI treats `url` as SSE and rejects a `type` field on a remote server.
+/// Streamable HTTP is `httpUrl` plus headers, and nothing else.
+pub(crate) fn gemini_http_entry(url: &str, headers: &Value) -> Value {
+    json!({ "httpUrl": url, "headers": headers })
+}
+
+fn write_client(label: &str, path: &Path, entry: &Value, create: bool) -> Result<String, String> {
+    write_client_map(label, path, "mcpServers", entry, create)
+}
+
+fn write_client_map(label: &str, path: &Path, map_key: &str, entry: &Value, create: bool) -> Result<String, String> {
+    if upsert_mcp_map(path, map_key, entry, create)? {
+        Ok(format!("{label} now includes the Ronic OS MCP server ({}). Restart it if it was already open.", path.display()))
+    } else {
+        Ok(format!("{label} already has the Ronic OS MCP server ({}).", path.display()))
+    }
+}
+
 fn clip(text: &str, max_chars: usize) -> String {
     let count = text.chars().count();
     if count <= max_chars {
@@ -1609,6 +1970,41 @@ mod tests {
         assert!(!allowed("run_sandbox"));
         assert!(allowed("list_skills"));
         assert!(allowed("save_memory"));
+        assert!(allowed("workspace_webapp"));
+        assert!(allowed("desktop_app"));
+        assert!(!is_local_tool("workspace_webapp"));
+        assert!(!is_local_tool("desktop_app"));
+    }
+
+    #[test]
+    fn connector_form_is_not_the_chat_composer() {
+        assert!(PAGE_SCRIPT.contains("op !== \"context\" && op !== \"mcp-url\""));
+        assert!(PAGE_SCRIPT.contains("example.com/mcp"));
+        assert!(PAGE_SCRIPT.contains("function connectorDialog"));
+        assert!(PAGE_SCRIPT.contains("function connectorSurface"));
+        assert!(PAGE_SCRIPT.contains("Fill MCP connector"));
+        assert!(!PAGE_SCRIPT.contains("authHost(location.hostname || \"\") || pluginPage()"));
+        assert!(PAGE_SCRIPT.contains("function stripPackFromComposer"));
+        assert!(!PAGE_SCRIPT.contains("text + \"\\n\\n\" + pack"));
+        assert!(!PAGE_SCRIPT.contains("composerBox() || document.querySelector(\"textarea"));
+    }
+
+    #[test]
+    fn dock_tools_are_advertised_and_are_not_faked_inside_the_lock() {
+        let defs = tool_defs();
+        let names: Vec<&str> = defs
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item.get("name").and_then(|name| name.as_str()))
+            .collect();
+        assert!(names.contains(&"workspace_webapp"));
+        assert!(names.contains(&"desktop_app"));
+        let conn = Connection::open_in_memory().unwrap();
+        let web = call_tool(&conn, Path::new("."), "workspace_webapp", &json!({ "action": "open", "app": "chatgpt" })).unwrap_err();
+        assert!(!web.to_ascii_lowercase().contains("completed"), "{web}");
+        let desk = call_tool(&conn, Path::new("."), "desktop_app", &json!({ "action": "open", "app": "cursor" })).unwrap_err();
+        assert!(!desk.to_ascii_lowercase().contains("completed"), "{desk}");
     }
 
     #[test]
@@ -1624,6 +2020,93 @@ mod tests {
         assert!(!chat_page_host("example.com"));
         assert!(!chat_page_host("localhost"));
         assert!(!chat_page_host("amazonaws.com"));
+        assert!(!chat_page_host("app.slack.com"));
+    }
+
+    #[test]
+    fn slack_login_is_a_session_and_not_a_composer_injection() {
+        assert!(channel_host("app.slack.com"));
+        assert!(channel_host("acme.slack.com"));
+        assert!(channel_host("discord.com"));
+        assert!(channel_host("teams.microsoft.com"));
+        assert!(channel_host("mail.google.com"));
+        assert!(session_page_host("app.slack.com"));
+        assert!(session_page_host("github.com"));
+        assert!(session_page_host("supabase.com"));
+        assert!(!session_page_host("accounts.google.com"));
+        assert!(!chat_page_host("app.slack.com"));
+        let pack = "[Ronic OS connection]\nProject folder: C:\\work\\Omni";
+        let prompt = "connect the gateway to this slack workspace";
+        assert_eq!(inject_composer_text("app.slack.com", pack, prompt), prompt);
+        assert_eq!(inject_composer_text("discord.com", pack, prompt), prompt);
+        assert_eq!(inject_composer_text("outlook.office.com", pack, prompt), prompt);
+        let injected = inject_composer_text("chatgpt.com", pack, prompt);
+        assert!(injected.starts_with(prompt));
+        assert!(injected.contains("[Ronic OS connection]"));
+        let site = inject_composer_text("supabase.com", pack, "read the listings policies in schema.sql");
+        assert!(site.contains("[Ronic OS connection]"), "{site}");
+        let github = inject_composer_text("github.com", pack, prompt);
+        assert!(github.contains("[Ronic OS connection]"), "{github}");
+        assert_eq!(inject_composer_text("chatgpt.com", pack, &injected), injected.trim());
+        assert_eq!(inject_composer_text("chatgpt.com", pack, "hunter2"), "hunter2");
+        assert_eq!(inject_composer_text("supabase.com", pack, "user@example.com"), "user@example.com");
+    }
+
+    #[test]
+    fn injection_brief_names_the_project_and_signed_in_hosts() {
+        let dir = std::env::temp_dir().join(format!("ronic-inject-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("webapp-auth.json"),
+            r#"{"slack":{"signedIn":true,"host":"app.slack.com"},"chatgpt":{"signedIn":true,"host":"chatgpt.com"},"off":{"signedIn":false,"host":"claude.ai"}}"#,
+        )
+        .unwrap();
+        let brief = format_injection_brief(r"C:\Users\haris\OneDrive\Desktop\Omni Workspace OS", &dir);
+        assert!(brief.contains(r"C:\Users\haris\OneDrive\Desktop\Omni Workspace OS"));
+        assert!(brief.contains("app.slack.com"));
+        assert!(brief.contains("chatgpt.com"));
+        assert!(!brief.contains("claude.ai"));
+        assert!(brief.contains("list_files"));
+        assert!(brief.contains("supabase/schema.sql"));
+        assert!(brief.contains("not limited to Slack"));
+        assert!(brief.contains("Do not ask the user to attach the project folder"));
+        let footer = injection_footer(r"C:\Users\haris\OneDrive\Desktop\Omni Workspace OS", &dir);
+        assert!(footer.contains("every tool, not only Slack"));
+        assert!(footer.contains("supabase/schema.sql"));
+        let hosts = signed_in_hosts(&dir);
+        assert_eq!(hosts, vec!["app.slack.com".to_string(), "chatgpt.com".to_string()]);
+        let empty = format_injection_brief("", &dir);
+        assert!(empty.contains("Project folder: none"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn absolute_project_path_is_a_relative_read() {
+        let dir = std::env::temp_dir().join(format!("ronic-proj-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join("src").join("gateway.rs"), "fn gateway() {}").unwrap();
+        let root = dir.canonicalize().unwrap();
+        let file = root.join("src").join("gateway.rs");
+        assert_eq!(rel_inside_root(&root, &file.to_string_lossy()), Some("src/gateway.rs".into()));
+        assert_eq!(rel_inside_root(&root, &root.to_string_lossy()), Some("".into()));
+        let outside = std::env::temp_dir().join(format!("ronic-out-{}", std::process::id()));
+        fs::create_dir_all(&outside).unwrap();
+        assert!(rel_inside_root(&root, &outside.canonicalize().unwrap().to_string_lossy()).is_none());
+        let secret = root.join(".env");
+        fs::write(&secret, "TOKEN=1").unwrap();
+        assert!(rel_inside_root(&root, &secret.canonicalize().unwrap().to_string_lossy()).is_none());
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn bot_browser_labels_record_a_login() {
+        assert_eq!(auth_record_id("webapp_slack").as_deref(), Some("slack"));
+        assert_eq!(auth_record_id("ronic_mini_comp_bot_spidy_chrome").as_deref(), Some("bot-bot_spidy"));
+        assert_eq!(auth_record_id("ronic_squad_comp_bot_spidy").as_deref(), Some("squad-bot_spidy"));
+        assert!(auth_record_id("main").is_none());
     }
 
     #[test]
@@ -1640,6 +2123,35 @@ mod tests {
         assert_eq!(saved["mcpServers"]["other"]["url"], "http://example");
         assert_eq!(saved["mcpServers"]["ronic-os"]["url"], "http://127.0.0.1:1/mcp");
         assert_eq!(upsert_mcp(&path, &entry, true).unwrap(), false);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn client_config_shapes_match_each_app() {
+        let headers = json!({ "Authorization": "Bearer secret" });
+        let gemini = gemini_http_entry("http://127.0.0.1:9/mcp", &headers);
+        assert_eq!(gemini["httpUrl"], "http://127.0.0.1:9/mcp");
+        assert!(gemini.get("url").is_none(), "{gemini}");
+        assert!(gemini.get("type").is_none(), "{gemini}");
+        assert_eq!(gemini["headers"]["Authorization"], "Bearer secret");
+
+        let dir = std::env::temp_dir().join(format!("ronic-vscode-shape-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mcp.json");
+        fs::write(
+            &path,
+            r#"{"mcpServers":{"other":{"url":"http://example"}},"servers":{"keep":{"type":"stdio","command":"code"}}}"#,
+        )
+        .unwrap();
+        let entry = json!({"type":"http","url":"http://127.0.0.1:9/mcp","headers":{"Authorization":"Bearer secret"}});
+        assert!(upsert_mcp_map(&path, "servers", &entry, true).unwrap());
+        let saved: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["mcpServers"]["other"]["url"], "http://example");
+        assert!(saved["mcpServers"].get("ronic-os").is_none(), "{saved}");
+        assert_eq!(saved["servers"]["keep"]["command"], "code");
+        assert_eq!(saved["servers"]["ronic-os"]["type"], "http");
+        assert_eq!(saved["servers"]["ronic-os"]["url"], "http://127.0.0.1:9/mcp");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1691,6 +2203,29 @@ mod tests {
         // When the *folder* was attached, files inside it are reachable.
         let folder_attached = vec![dir.to_string_lossy().to_string()];
         assert!(attachments_allow(&sibling.canonicalize().unwrap(), &folder_attached));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn memory_sheets_stay_inside_their_folder() {
+        let dir = std::env::temp_dir().join(format!("ronic-sheets-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("memories").join("notes")).unwrap();
+        let note = dir.join("memories").join("notes").join("a.md");
+        fs::write(&note, "fact").unwrap();
+        let root = dir.join("memories");
+        assert!(under_memory_root(&note.canonicalize().unwrap(), &root));
+        let db = dir.join("state.db");
+        fs::write(&db, "x").unwrap();
+        assert!(!under_memory_root(&db.canonicalize().unwrap(), &root));
+        let link = dir.join("linked-memories");
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_dir(&root, &link);
+        #[cfg(not(windows))]
+        let linked = std::os::unix::fs::symlink(&root, &link);
+        if linked.is_ok() {
+            assert!(!under_memory_root(&note.canonicalize().unwrap(), &link));
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 }

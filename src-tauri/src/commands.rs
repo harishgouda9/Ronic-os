@@ -7,6 +7,8 @@ use crate::AppState;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::io::{Read, Write};
+use std::net::ToSocketAddrs;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder};
@@ -186,10 +188,13 @@ pub async fn send_message(app: AppHandle, state: State<'_, AppState>, prompt: St
 }
 
 #[tauri::command]
-pub async fn set_thread_model(state: State<'_, AppState>, thread_id: String, provider_id: String) -> Result<CommandResult> {
+pub async fn set_thread_model(state: State<'_, AppState>, thread_id: String, provider_id: String, model: Option<String>) -> Result<CommandResult> {
     {
         let conn = guard(&state);
         conn.execute("UPDATE chat_threads SET active_model_override_id=?1 WHERE id=?2", params![provider_id, thread_id])?;
+        if let Some(model) = model.as_deref() {
+            crate::agent::remember_upstream(&conn, &provider_id, model);
+        }
     }
     finish(&state, None)
 }
@@ -281,11 +286,10 @@ pub async fn create_profile(state: State<'_, AppState>, draft: NewProfile) -> Re
         let id = nid("bot");
         let handle = unique_handle(&conn, &draft.handle);
         let harness = draft.harness_lane_id.trim();
-        let primary = crate::bots::account_for_harness(harness).unwrap_or("prov_ollama");
         let avatar = sanitize_mark(&draft.avatar);
         conn.execute(
-            "INSERT INTO bot_profiles (id, handle, display_name, avatar, soul_markdown, primary_account_id, long_context_account_id, fallback_account_id, allow_computer_use, allow_browser_use, allow_code_exec, scoped_obsidian_folder, daily_wallet_limit_usd, is_pinned, role, created_at, harness_lane_id, ag_ui_endpoint_url, status_line, avatar_color) VALUES (?1,?2,?3,?4,?5,?6,'prov_gemini','prov_openrouter',1,1,1,'',5,1,?7,?8,?9,?10,'Just created',?11)",
-            params![id, handle, draft.display_name, avatar, draft.soul_markdown, primary, draft.role, now_ms(), harness, draft.ag_ui_endpoint_url.trim(), draft.avatar_color.trim()],
+            "INSERT INTO bot_profiles (id, handle, display_name, avatar, soul_markdown, primary_account_id, long_context_account_id, fallback_account_id, allow_computer_use, allow_browser_use, allow_code_exec, scoped_obsidian_folder, daily_wallet_limit_usd, is_pinned, role, created_at, harness_lane_id, ag_ui_endpoint_url, status_line, avatar_color) VALUES (?1,?2,?3,?4,?5,'','','',1,1,1,'',5,1,?6,?7,?8,?9,'Just created',?10)",
+            params![id, handle, draft.display_name, avatar, draft.soul_markdown, draft.role, now_ms(), harness, draft.ag_ui_endpoint_url.trim(), draft.avatar_color.trim()],
         )?;
         crate::bots::attach_names(&conn, &state.home, &id, &draft.skills, &draft.plugins)?;
         // Enable the workspace's prebuilt skills for this new profile now,
@@ -695,6 +699,7 @@ pub async fn save_memory(state: State<'_, AppState>, draft: MemoryDraft) -> Resu
             scoped_bot_id: draft.scoped_bot_id,
             file_path_or_uri: draft.file_path_or_uri,
             engine_id: draft.engine_id,
+            keep_identity: false,
         })?
     };
     finish(&state, Some(saved.note))
@@ -985,7 +990,7 @@ pub async fn connect_mcp_server(
         let conn = guard(&state);
         let profile = db::kv_get(&conn, "active_profile")?.unwrap_or_default();
         let args_vec = args.unwrap_or_default();
-        let message = crate::capabilities::connect_mcp_server(
+        let done = crate::capabilities::connect_mcp_server(
             &conn,
             &state.home,
             &profile,
@@ -996,12 +1001,13 @@ pub async fn connect_mcp_server(
             url.as_deref(),
             Some(secret_value.as_str()),
         )?;
+        let mut message = done.note;
         if !secret_value.trim().is_empty() {
-            let server_id = crate::capabilities::server_id_for_name(&name);
             let key_guard = state.vault_key.lock().unwrap_or_else(|error| error.into_inner());
             let mut secrets = state.secrets.lock().unwrap_or_else(|error| error.into_inner());
-            secrets.insert(format!("mcp:{server_id}"), secret_value.trim().to_string());
+            secrets.insert(format!("mcp:{}", done.id), secret_value.trim().to_string());
             crate::vault::persist(&state.home, &conn, key_guard.as_ref(), &secrets)?;
+            message.push_str(" The credential is in the vault.");
         }
         message
     };
@@ -1088,7 +1094,142 @@ fn probe_local_blocking(kind: &str, path: Option<&str>) -> Result<String> {
             }
             Ok(format!("Folder {}", folder.display()))
         }
+        "redis" => probe_redis(path),
+        "op" => probe_op(path),
         _ => Err(err("Unknown local check.")),
+    }
+}
+
+fn probe_redis(raw: Option<&str>) -> Result<String> {
+    let raw = raw.unwrap_or("").trim();
+    if raw.to_ascii_lowercase().starts_with("rediss://") {
+        return Err(err("TLS Redis is not checked in this build. It was not marked connected."));
+    }
+    let rest = raw.get(8..).filter(|_| raw.len() >= 8 && raw[..8].eq_ignore_ascii_case("redis://")).ok_or_else(|| err("Redis needs a redis:// URL. It was not marked connected."))?;
+    if rest.contains("://") {
+        return Err(err("Redis needs a redis:// URL. It was not marked connected."));
+    }
+    let (password, hostport) = match rest.rsplit_once('@') {
+        Some((creds, host)) => {
+            let pass = creds.split_once(':').map(|(_, pass)| pass).unwrap_or(creds);
+            (percent_decode(pass), host.to_ascii_lowercase())
+        }
+        None => (String::new(), rest.to_ascii_lowercase()),
+    };
+    let hostport_owned = hostport;
+    let hostport = hostport_owned.split('/').next().unwrap_or("");
+    if hostport.starts_with('[') {
+        return Err(err("This build checks IPv4 Redis only. It was not marked connected."));
+    }
+    let (host, port) = match hostport.rsplit_once(':') {
+        Some((host, port)) => {
+            let port: u16 = port.parse().map_err(|_| err("Redis port is not a number. It was not marked connected."))?;
+            (host, port)
+        }
+        None => (hostport, 6379),
+    };
+    if host.is_empty() {
+        return Err(err("Redis needs a host. It was not marked connected."));
+    }
+    let addr = (host, port)
+        .to_socket_addrs()
+        .map_err(|_| err("Redis host did not resolve. It was not marked connected."))?
+        .next()
+        .ok_or_else(|| err("Redis host did not resolve. It was not marked connected."))?;
+    let mut stream = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(3))
+        .map_err(|_| err("Redis did not accept a connection. It was not marked connected."))?;
+    stream.set_read_timeout(Some(Duration::from_secs(3))).map_err(|error| err(error.to_string()))?;
+    stream.set_write_timeout(Some(Duration::from_secs(3))).map_err(|error| err(error.to_string()))?;
+    if !password.is_empty() {
+        write_resp(&mut stream, &["AUTH", &password])?;
+        let line = read_resp_line(&mut stream)?;
+        if !line.starts_with('+') {
+            return Err(err("Redis rejected that password. It was not marked connected."));
+        }
+    }
+    write_resp(&mut stream, &["PING"])?;
+    let line = read_resp_line(&mut stream)?;
+    if line.starts_with("+PONG") {
+        Ok(format!("Redis {host}:{port}"))
+    } else {
+        Err(err("Redis did not answer PONG. It was not marked connected."))
+    }
+}
+
+fn percent_decode(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let Ok(value) = u8::from_str_radix(std::str::from_utf8(&bytes[index + 1..index + 3]).unwrap_or(""), 16) {
+                out.push(value);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn write_resp(stream: &mut std::net::TcpStream, parts: &[&str]) -> Result<()> {
+    let mut body = format!("*{}\r\n", parts.len());
+    for part in parts {
+        body.push_str(&format!("${}\r\n{}\r\n", part.len(), part));
+    }
+    stream.write_all(body.as_bytes()).map_err(|_| err("Redis did not accept a connection. It was not marked connected."))?;
+    Ok(())
+}
+
+fn read_resp_line(stream: &mut std::net::TcpStream) -> Result<String> {
+    let mut buf = [0u8; 256];
+    let mut out = Vec::new();
+    loop {
+        let read = stream.read(&mut buf).map_err(|_| err("Redis did not answer. It was not marked connected."))?;
+        if read == 0 {
+            break;
+        }
+        out.extend_from_slice(&buf[..read]);
+        if out.windows(2).any(|pair| pair == b"\r\n") || out.len() > 512 {
+            break;
+        }
+    }
+    let text = String::from_utf8_lossy(&out).trim().to_string();
+    if text.is_empty() {
+        return Err(err("Redis did not answer. It was not marked connected."));
+    }
+    Ok(text)
+}
+
+fn probe_op(raw: Option<&str>) -> Result<String> {
+    let token = raw.unwrap_or("").trim();
+    if token.is_empty() || token.chars().any(|ch| ch.is_control()) {
+        return Err(err("1Password needs a service-account token. It was not marked connected."));
+    }
+    let output = std::process::Command::new("op")
+        .args(["vault", "list", "--format", "json"])
+        .env("OP_SERVICE_ACCOUNT_TOKEN", token)
+        .output()
+        .map_err(|_| err("The 1Password CLI is not on PATH. It was not marked connected."))?;
+    if !output.status.success() {
+        return Err(err("1Password did not accept that token. It was not marked connected."));
+    }
+    Ok("1Password".into())
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::probe_local_blocking;
+
+    #[test]
+    fn mcp_connect_tls_redis_is_refused() {
+        let tls = probe_local_blocking("redis", Some("rediss://127.0.0.1:6379")).unwrap_err();
+        assert!(tls.0.contains("TLS"), "{}", tls.0);
+        let closed = probe_local_blocking("redis", Some("redis://:supersecret@127.0.0.1:1")).unwrap_err();
+        assert!(closed.0.contains("did not accept"), "{}", closed.0);
+        assert!(!closed.0.contains("supersecret"), "{}", closed.0);
     }
 }
 
@@ -1314,7 +1455,10 @@ pub async fn list_shadow_backups(state: State<'_, AppState>) -> Result<CommandRe
 
 #[tauri::command]
 pub async fn restore_shadow_backup(state: State<'_, AppState>, backup_name: String) -> Result<CommandResult> {
-    let toast = crate::remediation_core::restore_shadow_backup(&state.home, &backup_name)?;
+    let toast = {
+        let conn = guard(&state);
+        crate::remediation_core::restore_shadow_backup(&conn, &state.home, &backup_name)?
+    };
     finish(&state, Some(toast))
 }
 
@@ -1865,7 +2009,7 @@ pub async fn connect_external_bot(state: State<'_, AppState>, draft: ConnectBot)
         } else {
             let id = nid("bot");
             conn.execute(
-                "INSERT INTO bot_profiles (id, handle, display_name, avatar, soul_markdown, primary_account_id, long_context_account_id, fallback_account_id, allow_computer_use, allow_browser_use, allow_code_exec, scoped_obsidian_folder, daily_wallet_limit_usd, is_pinned, role, created_at, engine, command_or_url, run_status, engine_kind, api_base, api_model, status_line) VALUES (?1,?2,?3,'XB',?4,?5,'prov_gemini','prov_openrouter',1,1,1,'',5,1,?6,?7,?8,?9,'ready',?10,?11,?12,?13)",
+                "INSERT INTO bot_profiles (id, handle, display_name, avatar, soul_markdown, primary_account_id, long_context_account_id, fallback_account_id, allow_computer_use, allow_browser_use, allow_code_exec, scoped_obsidian_folder, daily_wallet_limit_usd, is_pinned, role, created_at, engine, command_or_url, run_status, engine_kind, api_base, api_model, status_line) VALUES (?1,?2,?3,'XB',?4,?5,'','',1,1,1,'',5,1,?6,?7,?8,?9,'ready',?10,?11,?12,?13)",
                 params![id, handle, name, soul, &primary, &engine, now_ms(), &engine, &command, engine_kind, &api_base, &api_model, &status_line],
             )?;
             id
@@ -2393,17 +2537,58 @@ pub async fn run_sandbox(state: State<'_, AppState>, command: String, bot_id: Op
 }
 
 #[tauri::command]
-pub async fn memory_vault(state: State<'_, AppState>, action: String, query: Option<String>) -> Result<CommandResult> {
-    let action = action.trim();
-    let payload = {
+pub async fn memory_vault(
+    state: State<'_, AppState>,
+    action: String,
+    query: Option<String>,
+    memory_id: Option<String>,
+    target: Option<String>,
+    relation: Option<String>,
+    content: Option<String>,
+    old_text: Option<String>,
+) -> Result<CommandResult> {
+    let action = action.trim().to_string();
+    let (toast, payload) = {
         let conn = guard(&state);
-        match action {
-            "search" => crate::memory::search_vault(&conn, query.unwrap_or_default().trim())?,
-            "journal" => crate::memory::journal(&conn)?,
+        match action.as_str() {
+            "search" => (
+                "Searched the local vault.".to_string(),
+                crate::memory::search_vault(&conn, query.unwrap_or_default().trim())?,
+            ),
+            "journal" => ("Loaded the memory journal.".to_string(), crate::memory::journal(&conn)?),
+            "link" | "unlink" => {
+                let note = crate::memory::link_graph(
+                    &conn,
+                    memory_id.as_deref().unwrap_or("").trim(),
+                    target.as_deref().unwrap_or("").trim(),
+                    relation.as_deref().unwrap_or("").trim(),
+                    action == "unlink",
+                    None,
+                )?;
+                (note, json!({}))
+            }
+            "curate" => {
+                let verb = query.unwrap_or_default();
+                let note = if verb.trim() == "drop" {
+                    crate::memory::forget_curated(&conn, memory_id.as_deref().unwrap_or(""))?
+                } else {
+                    let profile = db::kv_get(&conn, "active_profile")?.unwrap_or_default();
+                    let bot = if profile.trim().is_empty() { None } else { Some(profile.trim()) };
+                    crate::memory::curate(
+                        &conn,
+                        target.as_deref().unwrap_or("").trim(),
+                        verb.trim(),
+                        old_text.as_deref().unwrap_or("").trim(),
+                        content.as_deref().unwrap_or("").trim(),
+                        bot,
+                    )?
+                };
+                let toast = note.lines().next().unwrap_or("Updated always-on notes.").to_string();
+                (toast, json!({}))
+            }
             _ => return Err(err("unknown memory action")),
         }
     };
-    let toast = if action == "search" { "Searched the local vault.".to_string() } else { "Loaded the memory journal.".to_string() };
     finish_payload(&state, Some(toast), Some(payload))
 }
 
@@ -2499,6 +2684,14 @@ pub async fn pause_workflow(state: State<'_, AppState>, id: String, node_id: Opt
             .unwrap_or(false);
 
         if wf_exists {
+            drop(conn);
+            request_pause(&id);
+            let runner_busy = WORKFLOW_RUN.try_lock().is_err();
+            if runner_busy {
+                return finish(&state, Some("Pause requested. The workflow stops before the next step.".into()));
+            }
+            clear_pause(&id);
+            let conn = guard(&state);
             let patch = WorkflowPatch { id, node_id, model: None, prompt: None, yaml_source: None };
             pause_node(&conn, &state.home, &patch)?;
         } else {
@@ -2540,7 +2733,7 @@ pub async fn resume_workflow(app: AppHandle, id: String) -> Result<CommandResult
         let note = match tauri::async_runtime::spawn_blocking(move || {
             let state = handle.state::<AppState>();
             // Resume approves a paused gate (if any) and continues the run.
-            execute_workflow(&state, &id, true)
+            execute_workflow(&state, &id, true, None)
         })
         .await
         {
@@ -2604,24 +2797,29 @@ fn apply_workflow(conn: &Connection, home: &std::path::Path, patch: &WorkflowPat
 }
 
 fn pause_node(conn: &Connection, home: &std::path::Path, patch: &WorkflowPatch) -> Result<()> {
-    let node_id = patch.node_id.clone().unwrap_or_default();
+    let requested = patch.node_id.clone().unwrap_or_default();
     let (name, triggers, mut nodes): (String, Vec<String>, Vec<WfNode>) = conn.query_row(
         "SELECT name, triggers_json, nodes_json FROM workflows WHERE id=?1",
         params![patch.id],
         |r| Ok((r.get::<_, String>(0)?, serde_json::from_str(&r.get::<_, String>(1)?).unwrap_or_default(), serde_json::from_str(&r.get::<_, String>(2)?).unwrap_or_default())),
     ).map_err(|_| err("workflow not found"))?;
-    if !node_id.is_empty() {
-        if let Some(node) = nodes.iter_mut().find(|n| n.id == node_id) {
+    let paused_id = if !requested.is_empty() {
+        if let Some(node) = nodes.iter_mut().find(|node| node.id == requested) {
             node.status = "paused".into();
         }
-    } else if let Some(node) = nodes.iter_mut().find(|n| n.status != "done") {
+        Some(requested)
+    } else if let Some(node) = nodes.iter_mut().find(|node| node.status != "done") {
+        let id = node.id.clone();
         node.status = "paused".into();
-    }
-    let yaml = crate::yaml_flow::emit(&patch.id, &name, "paused_editable", if node_id.is_empty() { None } else { Some(&node_id) }, &triggers, &nodes);
+        Some(id)
+    } else {
+        None
+    };
+    let yaml = crate::yaml_flow::emit(&patch.id, &name, "paused_editable", paused_id.as_deref(), &triggers, &nodes);
     write_workflow(home, &patch.id, &yaml)?;
     conn.execute(
         "UPDATE workflows SET yaml_source=?1, nodes_json=?2, current_status='paused_editable', paused_at_node_id=?3, updated_at=?4 WHERE id=?5",
-        params![yaml, serde_json::to_string(&nodes)?, if node_id.is_empty() { None } else { Some(&node_id) }, now_ms(), patch.id],
+        params![yaml, serde_json::to_string(&nodes)?, paused_id, now_ms(), patch.id],
     )?;
     Ok(())
 }
@@ -2677,6 +2875,125 @@ fn resolve_bot_profile(conn: &Connection, reference: &str) -> Option<String> {
 // node statuses, so two interleaved runs corrupt each other's state.
 static WORKFLOW_RUN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+// The desktop command queue cannot deliver pause_workflow until run_workflow
+// returns, so Pause invokes this flag directly and the runner observes it
+// between steps.
+static WORKFLOW_PAUSE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn request_pause(id: &str) {
+    if let Ok(mut slot) = WORKFLOW_PAUSE.lock() {
+        *slot = Some(id.to_string());
+    }
+}
+
+fn clear_pause(id: &str) {
+    if let Ok(mut slot) = WORKFLOW_PAUSE.lock() {
+        if slot.as_deref() == Some(id) {
+            *slot = None;
+        }
+    }
+}
+
+fn pause_requested(id: &str) -> bool {
+    WORKFLOW_PAUSE.lock().ok().and_then(|slot| slot.clone()).as_deref() == Some(id)
+}
+
+fn workflow_retry(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    !(lower.contains("approval") || lower.contains("wallet") || lower.contains("killswitch") || lower.contains("held for"))
+}
+
+fn step_model_choice(model: &str) -> (Option<String>, Option<String>) {
+    let model = model.trim();
+    if model.is_empty() || model.eq_ignore_ascii_case("auto") {
+        (None, None)
+    } else if model.starts_with("prov_") {
+        (Some(model.to_string()), None)
+    } else {
+        (None, Some(model.to_string()))
+    }
+}
+
+fn checkpoint_text(checkpoint: &serde_json::Map<String, Value>, node_id: &str) -> String {
+    match checkpoint.get(node_id) {
+        Some(Value::String(text)) => text.clone(),
+        Some(other) => other.to_string(),
+        None => String::new(),
+    }
+}
+
+fn fill_step_prompt(prompt: &str, node_name: &str, node_kind: &str, previous: &str, bot_handle: &str, workspace: &str) -> String {
+    let base = if prompt.trim().is_empty() {
+        format!("Workflow step '{node_name}': {}", node_kind.replace('_', " "))
+    } else {
+        prompt.trim().to_string()
+    };
+    let marked = base.contains("{{ $steps.previous.output }}") || base.contains("{{$steps.previous.output}}");
+    let mut text = base
+        .replace("{{ $steps.previous.output }}", previous)
+        .replace("{{$steps.previous.output}}", previous)
+        .replace("{{ $bot.handle }}", bot_handle)
+        .replace("{{$bot.handle}}", bot_handle);
+    if !workspace.is_empty() {
+        text = text.replace("{{ $env.WORKSPACE_ROOT }}", workspace).replace("{{$env.WORKSPACE_ROOT}}", workspace);
+    }
+    if !marked && !previous.is_empty() {
+        text.push_str("\n\nPrevious step output:\n");
+        text.push_str(previous);
+    }
+    text
+}
+
+fn rollup_status(nodes: &[WfNode]) -> &'static str {
+    if nodes.iter().any(|node| node.status == "error") {
+        "error"
+    } else if nodes.iter().any(|node| node.status == "paused") {
+        "paused_editable"
+    } else if !nodes.is_empty() && nodes.iter().all(|node| node.status == "done") {
+        "completed"
+    } else {
+        "idle"
+    }
+}
+
+fn prepare_workflow_nodes(
+    nodes: &mut [WfNode],
+    checkpoint: &mut serde_json::Map<String, Value>,
+    paused_at: &mut Option<String>,
+    approve_paused_gate: bool,
+    only_node: Option<&str>,
+) -> Result<()> {
+    if let Some(target) = only_node {
+        let node = nodes.iter_mut().find(|node| node.id == target).ok_or_else(|| err("that step is not in this workflow"))?;
+        node.status = "pending".into();
+        node.latency_ms = 0;
+        checkpoint.remove(target);
+        return Ok(());
+    }
+    if !approve_paused_gate && !nodes.is_empty() && nodes.iter().all(|node| node.status == "done") {
+        for node in nodes.iter_mut() {
+            node.status = "pending".into();
+            node.latency_ms = 0;
+        }
+        checkpoint.clear();
+        *paused_at = None;
+    }
+    Ok(())
+}
+
+struct RestoreProfile<'a> {
+    state: &'a AppState,
+    original: Option<String>,
+}
+
+impl Drop for RestoreProfile<'_> {
+    fn drop(&mut self) {
+        let conn = guard(self.state);
+        let value = self.original.clone().unwrap_or_default();
+        let _ = kv_set(&conn, "active_profile", &value);
+    }
+}
+
 fn usd_amount_from_prompt(prompt: &str) -> f64 {
     let patterns = [r"\$\s*([0-9]+(?:\.[0-9]+)?)", r"(?i)([0-9]+(?:\.[0-9]+)?)\s*usd", r"(?i)usd\s*([0-9]+(?:\.[0-9]+)?)"];
     for pattern in patterns {
@@ -2704,10 +3021,87 @@ fn rail_from_prompt(prompt: &str) -> &'static str {
     }
 }
 
-fn execute_workflow(state: &AppState, id: &str, approve_paused_gate: bool) -> Result<String> {
+fn bot_label(conn: &Connection, reference: &str) -> String {
+    let reference = reference.trim();
+    if reference.is_empty() {
+        return String::new();
+    }
+    conn.query_row("SELECT handle FROM bot_profiles WHERE id=?1", params![reference], |row| row.get::<_, String>(0)).unwrap_or_else(|_| reference.to_string())
+}
+
+fn stop_for_pause(
+    state: &AppState,
+    app: &Option<AppHandle>,
+    id: &str,
+    name: &str,
+    triggers: &[String],
+    nodes: &mut [WfNode],
+    checkpoint: &serde_json::Map<String, Value>,
+    node_id: &str,
+) -> Result<bool> {
+    if !pause_requested(id) {
+        return Ok(false);
+    }
+    if let Some(node) = nodes.iter_mut().find(|node| node.id == node_id) {
+        if node.status != "done" {
+            node.status = "paused".into();
+            node.latency_ms = 0;
+        }
+    }
+    {
+        let conn = guard(state);
+        persist_workflow(&conn, &state.home, id, name, "paused_editable", Some(node_id), triggers, nodes, checkpoint)?;
+    }
+    if let Some(app) = app {
+        use tauri::Emitter;
+        let _ = app.emit("ronic://wf-progress", json!({ "id": id, "status": "paused_editable", "nodes": nodes }));
+    }
+    clear_pause(id);
+    Ok(true)
+}
+
+enum WfAdvance {
+    Continue,
+    Paused(String),
+    OnlyDone,
+}
+
+fn advance_after_step(
+    state: &AppState,
+    app: &Option<AppHandle>,
+    id: &str,
+    name: &str,
+    triggers: &[String],
+    nodes: &mut [WfNode],
+    checkpoint: &serde_json::Map<String, Value>,
+    node_id: &str,
+    next_id: Option<&str>,
+    only_node: Option<&str>,
+) -> Result<WfAdvance> {
+    if pause_requested(id) {
+        if let Some(next_id) = next_id {
+            if stop_for_pause(state, app, id, name, triggers, nodes, checkpoint, next_id)? {
+                return Ok(WfAdvance::Paused(format!("Paused before step {next_id}. Press Resume to continue.")));
+            }
+        } else {
+            clear_pause(id);
+        }
+    }
+    if only_node == Some(node_id) {
+        return Ok(WfAdvance::OnlyDone);
+    }
+    Ok(WfAdvance::Continue)
+}
+
+pub(crate) fn run_saved_workflow(state: &AppState, id: &str) -> Result<String> {
+    execute_workflow(state, id, false, None)
+}
+
+fn execute_workflow(state: &AppState, id: &str, approve_paused_gate: bool, only_node: Option<&str>) -> Result<String> {
     use tauri::Emitter;
     let _run_guard = WORKFLOW_RUN.try_lock().map_err(|_| err("another workflow run is already in progress; wait for it to finish or pause it first"))?;
-    let (name, triggers, mut nodes, paused_at, mut checkpoint): (String, Vec<String>, Vec<WfNode>, Option<String>, serde_json::Map<String, Value>) = {
+    clear_pause(id);
+    let (name, triggers, mut nodes, mut paused_at, mut checkpoint): (String, Vec<String>, Vec<WfNode>, Option<String>, serde_json::Map<String, Value>) = {
         let conn = guard(state);
         let row = conn
             .query_row(
@@ -2729,19 +3123,26 @@ fn execute_workflow(state: &AppState, id: &str, approve_paused_gate: bool) -> Re
     if nodes.is_empty() {
         return Err(err("this workflow has no steps to run"));
     }
+    let only = only_node.map(str::to_string);
+    prepare_workflow_nodes(&mut nodes, &mut checkpoint, &mut paused_at, approve_paused_gate, only.as_deref())?;
     let app = state.app_handle.lock().ok().and_then(|g| g.clone());
     let original_profile: Option<String> = {
         let conn = guard(state);
         kv_get(&conn, "active_profile").ok().flatten().filter(|value| !value.trim().is_empty())
     };
-
-    fn step_is_done(node: &WfNode) -> bool {
-        node.status == "done"
-    }
+    let _restore_profile = RestoreProfile { state, original: original_profile };
 
     let mut index = 0;
+    let mut ran_only = false;
+    let mut ran_name = String::new();
     while index < nodes.len() {
-        if step_is_done(&nodes[index]) {
+        if let Some(target) = &only {
+            if nodes[index].id != *target {
+                index += 1;
+                continue;
+            }
+        }
+        if nodes[index].status == "done" {
             index += 1;
             continue;
         }
@@ -2752,6 +3153,9 @@ fn execute_workflow(state: &AppState, id: &str, approve_paused_gate: bool) -> Re
         let node_bot = nodes[index].bot_profile.clone();
         let node_model = nodes[index].model.trim().to_string();
         let gate = node_kind == "approval_gate" || node_kind == "wallet_execution";
+        if stop_for_pause(state, &app, id, &name, &triggers, &mut nodes, &checkpoint, &node_id)? {
+            return Ok(format!("Paused at step {node_id}. Press Resume to continue."));
+        }
 
         if gate {
             let is_paused_here = paused_at.as_deref() == Some(node_id.as_str());
@@ -2827,7 +3231,16 @@ fn execute_workflow(state: &AppState, id: &str, approve_paused_gate: bool) -> Re
                 if let Some(app) = &app {
                     let _ = app.emit("ronic://wf-progress", json!({ "id": id, "status": "running", "nodes": nodes }));
                 }
-                index += 1;
+                let next_id = if index + 1 < nodes.len() { Some(nodes[index + 1].id.clone()) } else { None };
+                match advance_after_step(state, &app, id, &name, &triggers, &mut nodes, &checkpoint, &node_id, next_id.as_deref(), only.as_deref())? {
+                    WfAdvance::Paused(note) => return Ok(note),
+                    WfAdvance::OnlyDone => {
+                        ran_name = node_name.clone();
+                        ran_only = true;
+                        break;
+                    }
+                    WfAdvance::Continue => index += 1,
+                }
                 continue;
             }
             nodes[index].status = "done".into();
@@ -2840,7 +3253,16 @@ fn execute_workflow(state: &AppState, id: &str, approve_paused_gate: bool) -> Re
             if let Some(app) = &app {
                 let _ = app.emit("ronic://wf-progress", json!({ "id": id, "status": "running", "nodes": nodes }));
             }
-            index += 1;
+            let next_id = if index + 1 < nodes.len() { Some(nodes[index + 1].id.clone()) } else { None };
+            match advance_after_step(state, &app, id, &name, &triggers, &mut nodes, &checkpoint, &node_id, next_id.as_deref(), only.as_deref())? {
+                WfAdvance::Paused(note) => return Ok(note),
+                WfAdvance::OnlyDone => {
+                    ran_name = node_name.clone();
+                    ran_only = true;
+                    break;
+                }
+                WfAdvance::Continue => index += 1,
+            }
             continue;
         }
 
@@ -2852,31 +3274,58 @@ fn execute_workflow(state: &AppState, id: &str, approve_paused_gate: bool) -> Re
         if let Some(app) = &app {
             let _ = app.emit("ronic://wf-progress", json!({ "id": id, "status": "running", "nodes": nodes }));
         }
+        if stop_for_pause(state, &app, id, &name, &triggers, &mut nodes, &checkpoint, &node_id)? {
+            return Ok(format!("Paused at step {node_id}. Press Resume to continue."));
+        }
+        let mut step_bot = String::new();
         if !node_bot.trim().is_empty() {
             let resolved = {
                 let conn = guard(state);
                 resolve_bot_profile(&conn, &node_bot)
             };
             if let Some(bot_id) = resolved {
+                step_bot = bot_id.clone();
                 let conn = guard(state);
                 kv_set(&conn, "active_profile", &bot_id)?;
             }
         }
-        let prompt = if node_prompt.trim().is_empty() {
-            format!("Workflow step '{node_name}': {}", node_kind.replace('_', " "))
-        } else {
-            node_prompt.trim().to_string()
+        let previous = if index > 0 { checkpoint_text(&checkpoint, &nodes[index - 1].id) } else { String::new() };
+        let (handle, workspace) = {
+            let conn = guard(state);
+            let handle = bot_label(&conn, &node_bot);
+            let workspace = db::settings_of(&conn).map(|settings| settings.project_root).unwrap_or_default();
+            (handle, workspace)
         };
-        let provider_override = if node_model.starts_with("prov_") { Some(node_model.clone()) } else { None };
+        let prompt = fill_step_prompt(&node_prompt, &node_name, &node_kind, &previous, &handle, &workspace);
+        let (provider_override, mut model_override) = step_model_choice(&node_model);
+        if provider_override.is_none() && model_override.is_none() {
+            let conn = guard(state);
+            let bot = if step_bot.is_empty() {
+                kv_get(&conn, "active_profile").ok().flatten().unwrap_or_default()
+            } else {
+                step_bot
+            };
+            let claimed = crate::agent::claimed_model(&conn, &bot);
+            if !claimed.is_empty() {
+                model_override = Some(claimed);
+            }
+        }
         let secrets = state.secrets.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let started = std::time::Instant::now();
-        let outcome = crate::agent::dispatch(state, &prompt, &secrets, provider_override.as_deref(), None, None, &[]);
+        let first = crate::agent::dispatch(state, &prompt, &secrets, provider_override.as_deref(), model_override.as_deref(), None, &[]);
+        let outcome = match first {
+            Err(error) if workflow_retry(&error.0) => {
+                let retry = format!("{prompt}\n\nThe previous attempt failed: {error}\nTry this step once more.");
+                crate::agent::dispatch(state, &retry, &secrets, provider_override.as_deref(), model_override.as_deref(), None, &[])
+            }
+            other => other,
+        };
         let elapsed = started.elapsed().as_millis() as i64;
         match outcome {
             Ok(reply) => {
                 nodes[index].status = "done".into();
                 nodes[index].latency_ms = elapsed;
-                let clipped: String = reply.chars().take(1200).collect();
+                let clipped: String = reply.chars().take(6000).collect();
                 checkpoint.insert(node_id.clone(), json!(clipped));
             }
             Err(error) => {
@@ -2886,14 +3335,11 @@ fn execute_workflow(state: &AppState, id: &str, approve_paused_gate: bool) -> Re
                 {
                     let conn = guard(state);
                     persist_workflow(&conn, &state.home, id, &name, "error", Some(&node_id), &triggers, &nodes, &checkpoint)?;
-                    if let Some(original) = &original_profile {
-                        kv_set(&conn, "active_profile", original)?;
-                    }
                 }
                 if let Some(app) = &app {
                     let _ = app.emit("ronic://wf-progress", json!({ "id": id, "status": "error", "nodes": nodes }));
                 }
-                return Err(err(format!("step {node_id} failed: {error}. The workflow is paused there; fix the step and resume.")));
+                return Err(err(format!("step {node_id} failed: {error}. The workflow stopped on that step. Fix it and press Resume.")));
             }
         }
         {
@@ -2903,14 +3349,37 @@ fn execute_workflow(state: &AppState, id: &str, approve_paused_gate: bool) -> Re
         if let Some(app) = &app {
             let _ = app.emit("ronic://wf-progress", json!({ "id": id, "status": "running", "nodes": nodes }));
         }
-        index += 1;
+        let next_id = if index + 1 < nodes.len() { Some(nodes[index + 1].id.clone()) } else { None };
+        match advance_after_step(state, &app, id, &name, &triggers, &mut nodes, &checkpoint, &node_id, next_id.as_deref(), only.as_deref())? {
+            WfAdvance::Paused(note) => return Ok(note),
+            WfAdvance::OnlyDone => {
+                ran_name = node_name.clone();
+                ran_only = true;
+                break;
+            }
+            WfAdvance::Continue => index += 1,
+        }
     }
+    if ran_only {
+        let status = rollup_status(&nodes);
+        let paused = if status == "paused_editable" {
+            nodes.iter().find(|node| node.status == "paused").map(|node| node.id.clone())
+        } else {
+            None
+        };
+        {
+            let conn = guard(state);
+            persist_workflow(&conn, &state.home, id, &name, status, paused.as_deref(), &triggers, &nodes, &checkpoint)?;
+        }
+        if let Some(app) = &app {
+            let _ = app.emit("ronic://wf-progress", json!({ "id": id, "status": status, "nodes": nodes }));
+        }
+        return Ok(format!("Step '{ran_name}' finished."));
+    }
+    clear_pause(id);
     {
         let conn = guard(state);
         persist_workflow(&conn, &state.home, id, &name, "completed", None, &triggers, &nodes, &checkpoint)?;
-        if let Some(original) = &original_profile {
-            kv_set(&conn, "active_profile", original)?;
-        }
     }
     if let Some(app) = &app {
         let _ = app.emit("ronic://wf-progress", json!({ "id": id, "status": "completed", "nodes": nodes }));
@@ -2923,16 +3392,17 @@ pub async fn delete_workflow(state: State<'_, AppState>, id: String) -> Result<C
     {
         let conn = guard(&state);
         conn.execute("DELETE FROM workflows WHERE id=?1", params![id])?;
+        remove_workflow_file(&state.home, &id);
     }
     finish(&state, Some("Workflow deleted.".into()))
 }
 
 #[tauri::command]
-pub async fn run_workflow(app: AppHandle, id: String) -> Result<CommandResult> {
+pub async fn run_workflow(app: AppHandle, id: String, node_id: Option<String>) -> Result<CommandResult> {
     let handle = app.clone();
     let note = match tauri::async_runtime::spawn_blocking(move || {
         let state = handle.state::<AppState>();
-        execute_workflow(&state, &id, false)
+        execute_workflow(&state, &id, false, node_id.as_deref())
     })
     .await
     {
@@ -2941,6 +3411,12 @@ pub async fn run_workflow(app: AppHandle, id: String) -> Result<CommandResult> {
     };
     let state = app.state::<AppState>();
     finish(&state, Some(note))
+}
+
+fn remove_workflow_file(home: &std::path::Path, id: &str) {
+    let Ok(id) = crate::util::safe_id_component(id) else { return };
+    let path = home.join("workflows").join(format!("{id}.workflow.yaml"));
+    let _ = std::fs::remove_file(path);
 }
 
 fn write_workflow(home: &std::path::Path, id: &str, yaml: &str) -> Result<()> {
@@ -3610,5 +4086,75 @@ mod tests {
             .flatten()
             .collect();
         assert!(names.iter().any(|name| name == "avatar_color"));
+    }
+
+    fn sample_node(id: &str, status: &str) -> WfNode {
+        WfNode {
+            id: id.into(),
+            name: id.into(),
+            kind: "llm_reasoning".into(),
+            bot_profile: String::new(),
+            model: String::new(),
+            prompt: String::new(),
+            status: status.into(),
+            latency_ms: 3,
+        }
+    }
+
+    #[test]
+    fn a_finished_workflow_starts_over_and_one_step_does_not_reset_the_rest() {
+        let mut nodes = vec![sample_node("node_1", "done"), sample_node("node_2", "done")];
+        let mut checkpoint = serde_json::Map::new();
+        checkpoint.insert("node_1".into(), json!("kept"));
+        checkpoint.insert("node_2".into(), json!("old"));
+        let mut paused = Some("node_2".into());
+        prepare_workflow_nodes(&mut nodes, &mut checkpoint, &mut paused, false, Some("node_2")).unwrap();
+        assert_eq!(nodes[0].status, "done");
+        assert_eq!(nodes[1].status, "pending");
+        assert_eq!(checkpoint.get("node_1").and_then(|value| value.as_str()), Some("kept"));
+        assert!(checkpoint.get("node_2").is_none());
+
+        let mut nodes = vec![sample_node("node_1", "done"), sample_node("node_2", "done")];
+        let mut checkpoint = serde_json::Map::new();
+        checkpoint.insert("node_1".into(), json!("old"));
+        let mut paused = Some("node_1".into());
+        prepare_workflow_nodes(&mut nodes, &mut checkpoint, &mut paused, false, None).unwrap();
+        assert!(nodes.iter().all(|node| node.status == "pending"));
+        assert!(checkpoint.is_empty());
+        assert!(paused.is_none());
+
+        let mut nodes = vec![sample_node("node_1", "done")];
+        let mut checkpoint = serde_json::Map::new();
+        let mut paused = None;
+        prepare_workflow_nodes(&mut nodes, &mut checkpoint, &mut paused, true, None).unwrap();
+        assert_eq!(nodes[0].status, "done");
+    }
+
+    #[test]
+    fn workflow_prompts_keep_the_previous_step_and_model_choice_is_split() {
+        let filled = fill_step_prompt("Use {{ $steps.previous.output }} and {{ $bot.handle }}", "Read", "llm_reasoning", "alpha", "@scout", "");
+        assert_eq!(filled, "Use alpha and @scout");
+        let chained = fill_step_prompt("Go", "Read", "browser_inspect", "alpha", "", "");
+        assert!(chained.contains("Previous step output:\nalpha"), "{chained}");
+        assert_eq!(fill_step_prompt("", "Read", "browser_inspect", "", "", ""), "Workflow step 'Read': browser inspect");
+        let rooted = fill_step_prompt("Folder {{ $env.WORKSPACE_ROOT }}", "Read", "llm_reasoning", "", "", "");
+        assert!(rooted.contains("{{ $env.WORKSPACE_ROOT }}"), "{rooted}");
+        let rooted = fill_step_prompt("Folder {{ $env.WORKSPACE_ROOT }}", "Read", "llm_reasoning", "", "", "C:\\work");
+        assert_eq!(rooted, "Folder C:\\work");
+        assert_eq!(step_model_choice("auto"), (None, None));
+        assert_eq!(step_model_choice("prov_gemini"), (Some("prov_gemini".into()), None));
+        assert_eq!(step_model_choice("gemini-2.5-pro"), (None, Some("gemini-2.5-pro".into())));
+    }
+
+    #[test]
+    fn removing_a_workflow_deletes_its_yaml() {
+        let home = std::env::temp_dir().join(format!("ronic-wf-del-{}", now_ms()));
+        let _ = std::fs::remove_dir_all(&home);
+        write_workflow(&home, "wf_demo", "id: wf_demo\n").unwrap();
+        let path = home.join("workflows").join("wf_demo.workflow.yaml");
+        assert!(path.is_file());
+        remove_workflow_file(&home, "wf_demo");
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

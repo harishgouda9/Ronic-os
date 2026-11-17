@@ -1,9 +1,11 @@
 use crate::models::{McpServer, PluginPackage, RegistryTool};
 
 pub const BUILTINS: &[(&str, &str)] = &[
-    ("list_memory", "List workspace memories."),
-    ("search_memory", "Search memory titles and body text."),
-    ("save_memory", "Save a memory onto the Memory screen."),
+    ("list_memory", "List workspace memories as short structured markdown cards."),
+    ("search_memory", "Search memory titles and body text. Each hit is a short structured markdown card."),
+    ("save_memory", "Save or update a memory. The same title updates that note and keeps its vault, file, scope, and graph links. The save rewrites a structured markdown sheet. Edit with this tool, not by rewriting the file."),
+    ("curate_memory", "Add, replace, or remove one short always-on fact. A write over the cap is refused."),
+    ("update_memory_graph", "Add, change, or remove one graph link without rewriting the note."),
     ("list_skills", "List the skill index for this profile."),
     ("list_providers", "List providers and their status."),
     ("list_threads", "List chat tasks."),

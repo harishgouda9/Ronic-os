@@ -1,11 +1,11 @@
 //! Shared setup for Claude, ChatGPT, and the other site windows.
 //!
-//! Google and Apple reject WebView2, so those pages open in installed Chrome or Edge.
-//! Chrome or Edge is started with this site's EBWebView folder as its profile.
-//! The panel closes first, because both cannot use that folder at once, and
-//! opens again when the browser releases it. OpenAI sign-in stays in the panel.
-//! The user's everyday Chrome profile is never used. Folder generation p2
-//! leaves a profile that only rendered a blank page behind.
+//! Google and Apple reject WebView2 ("this browser or app may not be secure").
+//! Those pages always open in Edge, then Chrome, on this site's EBWebView folder.
+//! The panel never loads that sign-in. It closes first, because both cannot use
+//! the folder at once, and opens again when the browser releases it. OpenAI
+//! sign-in stays in the panel. The user's everyday browser profile is never used.
+//! Folder generation p2 leaves a profile that only rendered a blank page behind.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -116,7 +116,12 @@ where
         .initialization_script(crate::workspace_bridge::PAGE_SCRIPT)
         .data_directory(profile)
         .enable_clipboard_access()
-        .on_navigation(move |url| !block_embedded_auth(&nav_app, &nav_label, &nav_profile, url, ""))
+        .on_navigation(move |url| {
+            if steer_local_authorize(&nav_app, &nav_label, url) {
+                return false;
+            }
+            !block_embedded_auth(&nav_app, &nav_label, &nav_profile, url, "")
+        })
         .on_new_window(move |url, features| {
             let owner = app.get_webview_window(&popup_owner);
             open_auth_popup(&app, owner.as_ref(), url, features, popup_profile.clone(), popup_owner.clone(), String::new())
@@ -139,7 +144,12 @@ pub fn site_child<R: Runtime>(builder: WebviewBuilder<R>, profile: PathBuf, app:
         .initialization_script(crate::workspace_bridge::PAGE_SCRIPT)
         .data_directory(profile)
         .enable_clipboard_access()
-        .on_navigation(move |url| !block_embedded_auth(&nav_app, &nav_label, &nav_profile, url, &nav_home))
+        .on_navigation(move |url| {
+            if steer_local_authorize(&nav_app, &nav_label, url) {
+                return false;
+            }
+            !block_embedded_auth(&nav_app, &nav_label, &nav_profile, url, &nav_home)
+        })
         .on_new_window(move |url, features| {
             let owner = popup_app.get_webview_window("main");
             open_auth_popup(&popup_app, owner.as_ref(), url, features, popup_profile.clone(), popup_label.clone(), popup_home.clone())
@@ -200,6 +210,9 @@ fn open_auth_popup<R: Runtime>(
 ) -> NewWindowResponse<R> {
     // Google and Apple reject this webview. Open them in Chrome or Edge on
     // this same profile. OpenAI and the site's own login page stay here.
+    if steer_local_authorize(app, &child_label, &url) {
+        return NewWindowResponse::Deny;
+    }
     if embedded_auth_blocked(&url) {
         if !child_label.is_empty() {
             let name = sign_in_name(&child_label);
@@ -230,6 +243,7 @@ fn open_auth_popup<R: Runtime>(
     let nav_child = child_label.clone();
     let nav_home = home_url.clone();
     let nav_popup = label.clone();
+    let nav_profile = profile.clone();
     let target = url.clone();
     let mut builder = WebviewWindowBuilder::new(app, &label, WebviewUrl::External(url))
         .title("Sign in")
@@ -240,8 +254,19 @@ fn open_auth_popup<R: Runtime>(
         .data_directory(profile)
         .window_features(features)
         .on_navigation(move |next| {
-            // Cancelling Google here leaves about:blank and opens Edge or
-            // Chrome, whose cookies never come back to this profile.
+            if steer_local_authorize(&nav_app, &nav_popup, &next) {
+                return false;
+            }
+            // A popup that starts blank and then goes to Google would otherwise
+            // paint the rejection page. Same profile handoff as the panel.
+            if embedded_auth_blocked(&next) {
+                if !nav_child.is_empty() && !auth_suppressed(&nav_child) {
+                    schedule_browser_sign_in(nav_app.clone(), nav_child.clone(), nav_profile.clone(), next.to_string(), nav_home.clone(), sign_in_name(&nav_child));
+                } else if nav_child.is_empty() {
+                    let _ = hand_off_embedded_auth(&next);
+                }
+                return false;
+            }
             if login_landed(&next) {
                 finish_embedded_login(nav_app.clone(), nav_child.clone(), nav_home.clone(), nav_popup.clone());
             }
@@ -283,7 +308,7 @@ fn open_auth_popup<R: Runtime>(
             eprintln!("sign-in window did not open: {error}");
             // Allow would open a window on a different profile, so the panel
             // would stay signed out after a login that looked successful.
-            if !child_label.is_empty() {
+            if !child_label.is_empty() && !embedded_auth_blocked(&target) {
                 if let Some(view) = app.get_webview(&child_label) {
                     let _ = view.navigate(target);
                 }
@@ -438,6 +463,19 @@ fn panel_login(url: &Url) -> bool {
         || host.ends_with(".grok.com")
 }
 
+fn google_accounts_host(host: &str) -> bool {
+    let Some(rest) = host.strip_prefix("accounts.google.") else {
+        return false;
+    };
+    let cc = |label: &str| label.len() == 2 && label.chars().all(|ch| ch.is_ascii_alphabetic());
+    match rest.split('.').collect::<Vec<_>>().as_slice() {
+        ["com"] => true,
+        [label] => cc(label),
+        ["co", label] | ["com", label] => cc(label),
+        _ => false,
+    }
+}
+
 pub(crate) fn embedded_auth_blocked(url: &Url) -> bool {
     if url.scheme() != "https" {
         return false;
@@ -446,11 +484,14 @@ pub(crate) fn embedded_auth_blocked(url: &Url) -> bool {
         return false;
     };
     let host = host.trim_end_matches('.').to_ascii_lowercase();
-    host == "accounts.google.com"
-        || host == "accounts.youtube.com"
+    host == "accounts.youtube.com"
+        || host.ends_with(".accounts.youtube.com")
         || host == "appleid.apple.com"
-        || host.ends_with(".accounts.google.com")
         || host.ends_with(".appleid.apple.com")
+        || host == "idmsa.apple.com"
+        || host.ends_with(".idmsa.apple.com")
+        || host.ends_with(".accounts.google.com")
+        || google_accounts_host(&host)
 }
 
 fn allowed_browser_url(url: &str) -> bool {
@@ -724,7 +765,7 @@ fn panel_id(label: &str) -> &str {
     label.strip_prefix("webapp_").unwrap_or(label)
 }
 
-fn auth_suppressed(label: &str) -> bool {
+pub(crate) fn auth_suppressed(label: &str) -> bool {
     let now = Instant::now();
     let mut map = suppress_auth_map();
     map.retain(|_, until| *until > now);
@@ -740,7 +781,32 @@ pub(crate) fn browser_sign_in_message(label: &str) -> Option<String> {
     sign_ins().get(label).cloned()
 }
 
+/// Quick-tunnel hostnames often fail on the PC that created them. Cancel that
+/// navigation and finish sign-in on the local alias instead.
+fn steer_local_authorize<R: Runtime>(app: &AppHandle<R>, label: &str, url: &Url) -> bool {
+    if label.is_empty() {
+        return false;
+    }
+    let Some(local) = crate::tunnel::browser_authorize_url(url.as_str()) else {
+        return false;
+    };
+    let Ok(target) = Url::parse(&local) else {
+        return false;
+    };
+    let app = app.clone();
+    let label = label.to_string();
+    std::thread::spawn(move || {
+        // Navigating inside the navigation callback re-enters WebView2.
+        std::thread::sleep(Duration::from_millis(40));
+        if let Some(view) = app.get_webview(&label) {
+            let _ = view.navigate(target);
+        }
+    });
+    true
+}
+
 /// True when this navigation must not stay inside WebView2.
+/// Suppression only skips opening a second browser window. The page still does not render here.
 fn block_embedded_auth<R: Runtime>(app: &AppHandle<R>, label: &str, profile: &Path, url: &Url, home_url: &str) -> bool {
     if !embedded_auth_blocked(url) {
         return false;
@@ -794,7 +860,7 @@ pub(crate) fn watch_panel<R: Runtime>(app: AppHandle<R>, label: String, profile:
         let Ok(url) = view.url() else {
             return;
         };
-        if url_is_blank(&url) || (embedded_auth_blocked(&url) && auth_suppressed(&label)) {
+        if url_is_blank(&url) {
             if let Ok(parsed) = Url::parse(&home) {
                 if !embedded_auth_blocked(&parsed) {
                     let _ = view.navigate(parsed);
@@ -803,6 +869,12 @@ pub(crate) fn watch_panel<R: Runtime>(app: AppHandle<R>, label: String, profile:
             return;
         }
         if embedded_auth_blocked(&url) {
+            if auth_suppressed(&label) {
+                if let Ok(home_url) = Url::parse(&home) {
+                    let _ = view.navigate(home_url);
+                }
+                return;
+            }
             schedule_browser_sign_in(app, label, profile, url.to_string(), home, name);
         }
     });
@@ -812,52 +884,80 @@ pub(crate) fn profile_in_use(profile: &Path) -> bool {
     lock_held(&profile.join("EBWebView").join("lockfile"))
 }
 
+/// The real browser did not take this profile. Leave the app on its own page.
+/// Loading the sign-in here is what Google answers with "may not be secure".
+fn sign_in_unavailable<R: Runtime>(app: &AppHandle<R>, label: &str, profile: &Path, home_url: &str, message: &str) {
+    forget_rejected_session(&profile.join("EBWebView"));
+    suppress_auth(label, Duration::from_secs(8));
+    finish_sign_in(app, label, message, true, home_url);
+}
+
 fn run_browser_sign_in<R: Runtime>(app: AppHandle<R>, label: String, profile: PathBuf, auth_url: String, home_url: String, app_name: String) {
     std::thread::sleep(Duration::from_millis(150));
-    let Some((browser_path, browser_name)) = installed_browser() else {
-        close_profile_views(&app, &label);
-        finish_sign_in(&app, &label, "Install Chrome or Edge, then try signing in again.", false, &home_url);
+    let browsers = installed_browsers();
+    if browsers.is_empty() {
+        sign_in_unavailable(&app, &label, &profile, &home_url, &format!("Install Microsoft Edge or Google Chrome, then sign in to {app_name} again."));
         return;
-    };
-    let message = format!("Sign in in the {browser_name} window, then close it so {app_name} can continue.");
-    set_sign_in_message(&app, &label, &message);
+    }
     close_profile_views(&app, &label);
     let data_dir = profile.join("EBWebView");
     let _ = std::fs::create_dir_all(&data_dir);
     let lock = data_dir.join("lockfile");
-    if !wait_lock(&lock, false, Duration::from_secs(10)) {
-        finish_sign_in(&app, &label, &format!("Close the {browser_name} sign-in window, then open {app_name} again."), false, &home_url);
-        return;
-    }
-    let script = match browser_launch_script(&browser_path, &data_dir, &auth_url) {
-        Ok(body) => body,
-        Err(_) => {
-            finish_sign_in(&app, &label, "That sign-in page cannot be opened from here.", true, &home_url);
+    if !wait_lock(&lock, false, Duration::from_secs(2)) {
+        release_profile_lock(&data_dir);
+        close_profile_views(&app, &label);
+        if !wait_lock(&lock, false, Duration::from_secs(8)) {
+            sign_in_unavailable(&app, &label, &profile, &home_url, &format!("Close the other window for {app_name}, then try signing in again."));
             return;
         }
+    }
+    let mut opened: Option<&'static str> = None;
+    for (browser_path, browser_name) in &browsers {
+        let script = match browser_launch_script(browser_path, &data_dir, &auth_url) {
+            Ok(body) => body,
+            Err(_) => continue,
+        };
+        let script_path = script_file();
+        if std::fs::write(&script_path, &script).is_err() {
+            continue;
+        }
+        if !launch_script(&script_path) {
+            let _ = std::fs::remove_file(&script_path);
+            continue;
+        }
+        if wait_lock(&lock, true, Duration::from_secs(12)) {
+            let _ = std::fs::remove_file(&script_path);
+            opened = Some(*browser_name);
+            break;
+        }
+        let _ = std::fs::remove_file(&script_path);
+    }
+    let Some(browser_name) = opened else {
+        sign_in_unavailable(&app, &label, &profile, &home_url, &format!("{app_name} sign-in opens in Edge or Chrome. Try again if no window appeared."));
+        return;
     };
-    let script_path = script_file();
-    if std::fs::write(&script_path, script).is_err() {
-        finish_sign_in(&app, &label, &format!("{browser_name} did not open. Try signing in again."), true, &home_url);
-        return;
-    }
-    if !launch_script(&script_path) {
-        let _ = std::fs::remove_file(&script_path);
-        finish_sign_in(&app, &label, &format!("{browser_name} did not open. Try signing in again."), true, &home_url);
-        return;
-    }
-    if !wait_lock(&lock, true, Duration::from_secs(20)) {
-        let _ = std::fs::remove_file(&script_path);
-        finish_sign_in(&app, &label, &format!("The {browser_name} sign-in window did not open. Try again."), true, &home_url);
-        return;
-    }
-    let _ = std::fs::remove_file(&script_path);
+    set_sign_in_message(&app, &label, &format!("Sign in in the {browser_name} window, then close it so {app_name} can continue."));
     if !wait_lock(&lock, false, Duration::from_secs(20 * 60)) {
         finish_sign_in(&app, &label, &format!("Close the {browser_name} sign-in window, then open {app_name} again."), false, &home_url);
         return;
     }
-    suppress_auth(&label, Duration::from_secs(12));
+    forget_rejected_session(&data_dir);
+    // A bounce back onto the sign-in host must not open another window, and must not render.
+    suppress_auth(&label, Duration::from_secs(8));
     finish_sign_in(&app, &label, &format!("{app_name} is opening again."), true, &home_url);
+}
+
+/// Drop the saved tab so the panel does not reopen Google's rejection page.
+/// Cookies stay in the profile.
+fn forget_rejected_session(data_dir: &Path) {
+    if !is_profile_data_dir(data_dir) || lock_held(&data_dir.join("lockfile")) {
+        return;
+    }
+    let default_dir = data_dir.join("Default");
+    for name in ["Current Session", "Current Tabs", "Last Session", "Last Tabs"] {
+        let _ = std::fs::remove_file(default_dir.join(name));
+    }
+    let _ = std::fs::remove_dir_all(default_dir.join("Sessions"));
 }
 
 fn finish_sign_in<R: Runtime>(app: &AppHandle<R>, label: &str, message: &str, restore: bool, home_url: &str) {
@@ -918,24 +1018,27 @@ fn restore_panel<R: Runtime>(app: &AppHandle<R>, label: &str, home_url: &str) {
 }
 
 fn browser_candidates() -> Vec<(PathBuf, &'static str)> {
+    // Edge first. This folder was written by WebView2, and Chrome often exits
+    // without taking its lock. The old fallback then painted Google's rejection page.
     let mut found = vec![
+        (PathBuf::from(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"), "Edge"),
+        (PathBuf::from(r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"), "Edge"),
         (PathBuf::from(r"C:\Program Files\Google\Chrome\Application\chrome.exe"), "Chrome"),
         (PathBuf::from(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"), "Chrome"),
     ];
     if let Ok(local) = std::env::var("LOCALAPPDATA") {
         found.push((PathBuf::from(local).join("Google").join("Chrome").join("Application").join("chrome.exe"), "Chrome"));
     }
-    found.push((PathBuf::from(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"), "Edge"));
-    found.push((PathBuf::from(r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"), "Edge"));
     found
 }
 
-fn installed_browser() -> Option<(PathBuf, &'static str)> {
-    browser_candidates().into_iter().find(|(path, _)| path.is_file())
+fn installed_browsers() -> Vec<(PathBuf, &'static str)> {
+    browser_candidates().into_iter().filter(|(path, _)| path.is_file()).collect()
 }
 
 fn vbs_safe(value: &str) -> bool {
-    !value.is_empty() && value.len() <= 8000 && !value.chars().any(|ch| ch == '"' || ch == '^' || ch.is_control())
+    // `^` is literal inside a VBS string. Rejecting it used to skip the real browser.
+    !value.is_empty() && value.len() <= 8000 && !value.chars().any(|ch| ch == '"' || ch.is_control())
 }
 
 fn path_token(path: &Path) -> Result<String, &'static str> {
@@ -954,8 +1057,8 @@ fn is_profile_data_dir(path: &Path) -> bool {
     !lower.contains("\\user data") && !lower.contains("/user data")
 }
 
-/// A hidden script so Explorer can start Chrome outside this process's job.
-/// `cmd /c start` would split the sign-in URL on `&` and expand `%`.
+/// Explorer starts the script outside this process's job.
+/// `cmd /c start` would split the sign-in URL on `&`. ShellExecute leaves `%3A%2F` intact.
 fn browser_launch_script(browser: &Path, data_dir: &Path, url: &str) -> Result<String, &'static str> {
     if !is_profile_data_dir(data_dir) || !vbs_safe(url) {
         return Err("profile");
@@ -968,10 +1071,46 @@ fn browser_launch_script(browser: &Path, data_dir: &Path, url: &str) -> Result<S
     }
     let browser = path_token(browser)?;
     let dir = path_token(data_dir)?;
-    let command = format!("\"{browser}\" --user-data-dir=\"{dir}\" --no-first-run --no-default-browser-check --new-window \"{url}\"");
-    let escaped = command.replace('"', "\"\"");
-    Ok(format!("Set shell = CreateObject(\"Wscript.Shell\")\r\nshell.Run \"{escaped}\", 1, False\r\n"))
+    // ShellExecute does not expand %3A%2F the way WScript.Shell.Run does.
+    let args = format!("--user-data-dir=\"{dir}\" --no-first-run --no-default-browser-check --new-window \"{url}\"");
+    let browser = browser.replace('"', "\"\"");
+    let args = args.replace('"', "\"\"");
+    Ok(format!("Set app = CreateObject(\"Shell.Application\")\r\napp.ShellExecute \"{browser}\", \"{args}\", \"\", \"open\", 1\r\n"))
 }
+
+fn profile_lock_token(data_dir: &Path) -> Option<String> {
+    if !is_profile_data_dir(data_dir) {
+        return None;
+    }
+    let token = data_dir.parent()?.file_name()?.to_str()?;
+    if !token.ends_with(&format!("-{PROFILE_STAMP}")) || !(8..=80).contains(&token.len()) {
+        return None;
+    }
+    if !token.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-') {
+        return None;
+    }
+    let lower = data_dir.display().to_string().to_ascii_lowercase();
+    if !lower.contains("webapps") {
+        return None;
+    }
+    Some(token.to_string())
+}
+
+/// Stop only the WebView2 process that still holds this site's profile.
+#[cfg(windows)]
+fn release_profile_lock(data_dir: &Path) {
+    let Some(token) = profile_lock_token(data_dir) else {
+        return;
+    };
+    let script = "$t = $env:RONIC_PROFILE_TOKEN; if (-not $t -or $t.Length -lt 8) { exit 0 }; Get-CimInstance Win32_Process -Filter \"Name = 'msedgewebview2.exe'\" | Where-Object { $_.CommandLine -and $_.CommandLine.Contains($t) -and $_.CommandLine.Contains('EBWebView') } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }";
+    let _ = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .env("RONIC_PROFILE_TOKEN", token)
+        .output();
+}
+
+#[cfg(not(windows))]
+fn release_profile_lock(_data_dir: &Path) {}
 
 fn script_file() -> PathBuf {
     let n = POPUP_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -1036,6 +1175,26 @@ extern "system" {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn google_rejection_page_never_stays_in_the_panel() {
+        let google = Url::parse("https://accounts.google.com/v3/signin/rejected?flow=youtube").unwrap();
+        let claude = Url::parse("https://claude.ai/login").unwrap();
+        let grok = Url::parse("https://grok.com/login").unwrap();
+        assert!(embedded_auth_blocked(&google));
+        assert!(!panel_login(&google));
+        assert!(!embedded_auth_blocked(&claude));
+        assert!(!embedded_auth_blocked(&grok));
+        assert!(panel_login(&claude));
+        assert!(panel_login(&grok));
+        assert!(embedded_auth_blocked(&Url::parse("https://accounts.google.co.uk/ServiceLogin?continue=https%3A%2F%2Fwww.youtube.com%2F").unwrap()));
+        assert!(embedded_auth_blocked(&Url::parse("https://accounts.google.com.au/").unwrap()));
+        assert!(embedded_auth_blocked(&Url::parse("https://accounts.google.de/").unwrap()));
+        assert!(embedded_auth_blocked(&Url::parse("https://idmsa.apple.com/appleauth/auth/authorize").unwrap()));
+        assert!(!embedded_auth_blocked(&Url::parse("https://accounts.google.evil.com/").unwrap()));
+        assert!(!embedded_auth_blocked(&Url::parse("https://www.youtube.com/").unwrap()));
+        assert!(!embedded_auth_blocked(&Url::parse("https://gmail.com/").unwrap()));
+    }
 
     #[test]
     fn google_and_apple_sign_in_use_the_installed_browser() {
@@ -1107,12 +1266,13 @@ mod tests {
         assert!(script.contains(r"C:\Program Files\Google\Chrome\Application\chrome.exe"));
         assert!(script.contains(r#"--user-data-dir=""C:\Users\haris\.ronicos\webapps\browser\webapp_chatgpt-p2\EBWebView""#));
         assert!(script.contains("client_id=x&redirect_uri="));
+        assert!(script.contains("https%3A%2F%2Fchatgpt.com%2F"));
         assert!(script.contains("--no-first-run"));
         assert!(script.contains("--new-window"));
-        assert!(script.contains("Wscript.Shell"));
+        assert!(script.contains("Shell.Application"));
         assert!(!script.to_ascii_lowercase().contains("user data"));
         assert!(browser_launch_script(&browser, &dir, "https://accounts.google.com/a\"b").is_err());
-        assert!(browser_launch_script(&browser, &dir, "https://accounts.google.com/a^b").is_err());
+        assert!(browser_launch_script(&browser, &dir, "https://accounts.google.com/a^b").unwrap().contains("a^b"));
         assert!(browser_launch_script(&browser, &dir, "https://accounts.google.com/a\nb").is_err());
         assert!(browser_launch_script(&browser, &PathBuf::from(r"C:\Users\haris\AppData\Local\Google\Chrome\User Data"), url).is_err());
         assert!(browser_launch_script(&browser, &dir, "https://chatgpt.com/").is_err());
@@ -1120,14 +1280,17 @@ mod tests {
     }
 
     #[test]
-    fn installed_browser_checks_chrome_before_edge() {
+    fn sign_in_browser_checks_edge_before_chrome() {
         let found = browser_candidates();
         assert!(found.len() >= 4);
-        assert_eq!(found[0].1, "Chrome");
-        assert!(found[0].0.ends_with("chrome.exe"));
-        let edge = found.iter().position(|(_, name)| *name == "Edge").unwrap();
-        assert!(found[..edge].iter().all(|(_, name)| *name == "Chrome"));
-        assert!(found[edge].0.ends_with("msedge.exe"));
-        assert!(found.iter().any(|(path, name)| *name == "Chrome" && path.ends_with("chrome.exe")));
+        assert_eq!(found[0].1, "Edge");
+        assert!(found[0].0.ends_with("msedge.exe"));
+        let chrome = found.iter().position(|(_, name)| *name == "Chrome").unwrap();
+        assert!(found[..chrome].iter().all(|(_, name)| *name == "Edge"));
+        assert!(found[chrome].0.ends_with("chrome.exe"));
+        let dir = PathBuf::from(r"C:\Users\haris\.ronicos\webapps\browser\webapp_custom_abc-p2\EBWebView");
+        assert_eq!(profile_lock_token(&dir).as_deref(), Some("webapp_custom_abc-p2"));
+        assert!(profile_lock_token(&PathBuf::from(r"C:\Users\haris\AppData\Local\Google\Chrome\User Data")).is_none());
+        assert!(profile_lock_token(&PathBuf::from(r"C:\temp\EBWebView")).is_none());
     }
 }

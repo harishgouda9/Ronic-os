@@ -13,13 +13,13 @@ import type {
   WfNode,
 } from "../types";
 import { completeChat, hasStoredSecret, openSite, pingProvider, probeModel, rememberSecret, type ChatMessage, type Effort } from "./liveChat";
-import { modelById } from "./modelPrefs";
+import { composerModelFor, modelById } from "./modelPrefs";
 import { installCatalog, installMcp, installPlugin, installSkillFromMarket, installSkillFromUrl, connectMcp, proposeSkill, removeMcp, removePlugin, removeSkill, resolveProposal, saveMcp, savePlugin, saveSkill, toggleMcp, togglePluginAgent, togglePluginDesktop, toggleSkill, trustMcp, trustPlugin } from "./capabilityState";
 import { ensurePrebuilt } from "./prebuiltSkills";
 import { inIndex, rebuildRegistry } from "./skillIndex";
 import { MARKETPLACE_CATALOG } from "./marketplaceCatalog";
-import { applyWorkspaceTool, parseToolFence, workspaceSystem, type ToolBag } from "./workspaceTools";
-import { executionCommitment, frictionReason, planDelegation, type PlanBot, type PlanGroup } from "./chiefDelegation";
+import { applyCurate, applyWorkspaceTool, parseToolFence, workspaceSystem, type ToolBag } from "./workspaceTools";
+import { executionCommitment, frictionReason, normalizeModelLanes, planDelegation, type PlanBot, type PlanGroup } from "./chiefDelegation";
 import { normalizeUpdateSettings } from "../updates/feed";
 
 function quickQuestion(text: string) {
@@ -46,6 +46,13 @@ const LEGACY_KEYS = [
   "omniworkspace.browser.v6",
 ];
 let skipGate = false;
+const FLEET: Array<[string, string, string]> = [
+  ["sentry_sentinel", "Sentry-Sentinel", "Local error surfaces (repair log, error threads)"],
+  ["supabase_sentinel", "Supabase-Sentinel", "Stuck runs stand in for slow queries"],
+  ["vercel_sentinel", "Vercel-Sentinel", "Release channel drift"],
+  ["github_sentinel", "GitHub-Sentinel", "Local git checkout (stale lock only)"],
+  ["middleware_sentinel", "Middleware / API Sentinel", "MCP server error registry"],
+];
 let state: Snapshot = load();
 
 function referenceFixture(snap: Snapshot): boolean {
@@ -103,6 +110,7 @@ function load(): Snapshot {
   }
   const snap = seed();
   ensurePrebuilt(snap);
+  ensureRepairFleet(snap);
   return snap;
 }
 
@@ -122,6 +130,9 @@ function repair(snap: Snapshot): Snapshot {
   if (!Array.isArray(snap.connectedWallets)) snap.connectedWallets = [];
   if (!Array.isArray(snap.sentinels)) snap.sentinels = [];
   if (!Array.isArray(snap.sentinelEvents)) snap.sentinelEvents = [];
+  if (!Array.isArray(snap.tierStatus)) snap.tierStatus = [];
+  if (!Array.isArray(snap.remediation)) snap.remediation = [];
+  if (!Array.isArray(snap.shadowBackups)) snap.shadowBackups = [];
   if (!Array.isArray(snap.processes)) snap.processes = [];
   if (!snap.license) snap.license = fresh.license;
   if (typeof snap.ledgerMode !== "string") snap.ledgerMode = fresh.ledgerMode;
@@ -135,11 +146,13 @@ function repair(snap: Snapshot): Snapshot {
     snap.activeThreadId = fresh.activeThreadId;
   }
   if (!Array.isArray(snap.memories)) snap.memories = [];
+  if (!Array.isArray(snap.curated)) snap.curated = [];
   snap.memories = snap.memories.filter((memory) => !(DEMO_MEMORY_IDS.has(memory.id) && DEMO_MEMORY_TITLES.has(memory.title)));
   for (const memory of snap.memories) {
     if (!Array.isArray(memory.syncedEngines)) memory.syncedEngines = [];
   }
   snap.profiles = snap.profiles.map((profile) => makeProfile(profile));
+  if (snap.chiefBotId && !snap.profiles.some((bot) => bot.id === snap.chiefBotId)) snap.chiefBotId = "";
   snap.threads = snap.threads.map((thread) => makeThread(thread));
   if (!Array.isArray(snap.plugins)) snap.plugins = [];
   if (!Array.isArray(snap.mcpServers)) snap.mcpServers = [];
@@ -164,9 +177,15 @@ function repair(snap: Snapshot): Snapshot {
         : "Not signed in. Open the site from the icon dock, or paste an API key to chat here.";
     }
   }
+  const keyedIds = snap.providers.filter((provider) => provider.hasSecret || hasStoredSecret(provider.id)).map((provider) => provider.id);
+  snap.profiles = snap.profiles.map((profile) => {
+    const lanes = normalizeModelLanes(profile, keyedIds);
+    return { ...profile, ...lanes };
+  });
   ensurePrebuilt(snap);
   adoptMem0(snap);
   snap.settings = normalizeUpdateSettings({ ...fresh.settings, ...(snap.settings ?? {}) });
+  ensureRepairFleet(snap);
   return snap;
 }
 
@@ -174,15 +193,228 @@ function save() {
   localStorage.setItem(KEY, JSON.stringify(state));
 }
 
-function ok(toast: string | null = null): CommandResult {
+function ok(toast: string | null = null, payload?: unknown): CommandResult {
   ensurePrebuilt(state);
   adoptMem0(state);
   save();
-  return { snapshot: structuredClone(state), toast };
+  return payload === undefined ? { snapshot: structuredClone(state), toast } : { snapshot: structuredClone(state), toast, payload };
+}
+
+// The chat screen only sees a snapshot when a command returns. Yield once so
+// the plan card paints while the model request is still open.
+async function showLivePreview() {
+  save();
+  const { useRonic } = await import("../store");
+  if (!useRonic.getState().snap) return;
+  useRonic.setState({ snap: structuredClone(state) });
+}
+
+let scanShortcutChecked = false;
+function isPreviewSecurityScan(prompt: string) {
+  const lower = prompt.trim().toLowerCase().replace(/[.!]+$/g, "");
+  return lower === "security" || lower === "security scan" || lower === "security audit" || lower === "scan for secrets" || lower === "run a security scan" || lower === "run security audit";
+}
+
+function previewSecurityScan(prompt: string) {
+  if (!scanShortcutChecked) {
+    scanShortcutChecked = true;
+    const task = "Reverse engineer the auth module, run a security audit, and refactor the middleware";
+    if (isPreviewSecurityScan(task) || !isPreviewSecurityScan("security audit")) {
+      throw new Error("preview security shortcut self-check failed");
+    }
+  }
+  return isPreviewSecurityScan(prompt);
 }
 
 function nid(prefix: string) {
   return `${prefix}_${Date.now().toString(16)}${Math.floor(Math.random() * 9999).toString(16)}`;
+}
+
+const STUCK_MS = 120_000;
+
+function ensureRepairFleet(snap: Snapshot) {
+  if (!Array.isArray(snap.sentinelEvents)) snap.sentinelEvents = [];
+  if (!Array.isArray(snap.remediation)) snap.remediation = [];
+  if (!Array.isArray(snap.shadowBackups)) snap.shadowBackups = [];
+  if (!Array.isArray(snap.sentinels) || snap.sentinels.length === 0) {
+    snap.sentinels = FLEET.map(([id, name, source]) => ({
+      id, name, source, status: "healthy", severity: "info", acknowledged: false, lastScan: 0, finding: "", stagedFix: "",
+    }));
+  } else {
+    for (const [id, name, source] of FLEET) {
+      const row = snap.sentinels.find((item) => item.id === id);
+      if (row) {
+        row.name = name;
+        row.source = source;
+      }
+    }
+  }
+  if (!Array.isArray(snap.tierStatus) || snap.tierStatus.length === 0) {
+    const hotpatch = snap.settings?.hotpatchEnabled !== false;
+    snap.tierStatus = [
+      { tier: 1, name: "Anti-hang watchdog", title: "Anti-Hang & WAL Unlocker", detail: "Releases chat runs that have not moved for 120 seconds. A live reply is left alone.", status: "idle", badge: "preview", repairCount: 0, lastRunAt: 0 },
+      { tier: 2, name: "Selector auto-healer", title: "Selector Auto-Recovery", detail: "Re-resolves stale control ids. The preview has no CDP session.", status: "idle", badge: "no CDP session yet", repairCount: 0, lastRunAt: 0 },
+      { tier: 3, name: "Shadow-git rollback", title: "1-Click Atomic Rollback", detail: "File checkpoints are written by the desktop shell.", status: "idle", badge: "desktop only", repairCount: 0, lastRunAt: 0 },
+      { tier: 4, name: "Script auto-patcher", title: "Recursive Script Patcher", detail: "Repairs trailing-comma JSON on disk. The preview does not rewrite files.", status: hotpatch ? "ok" : "off", badge: hotpatch ? "preview" : "disabled in settings", repairCount: 0, lastRunAt: 0 },
+    ];
+  }
+}
+
+function pushRepair(tier: number, faultType: string, target: string, action: string, status: string) {
+  state.remediation.unshift({
+    id: nid("rem"), tier, faultType, targetComponent: target, actionTaken: action, recoveryDurationMs: 1, status, createdAt: Date.now(),
+  });
+  state.remediation = state.remediation.slice(0, 40);
+}
+
+function pushSentinelEvent(sentinelId: string, message: string) {
+  state.sentinelEvents.unshift({ id: nid("sev"), sentinelId, message, createdAt: Date.now() });
+  state.sentinelEvents = state.sentinelEvents.slice(0, 40);
+}
+
+function releaseStuckThreads() {
+  const cutoff = Date.now() - STUCK_MS;
+  let released = 0;
+  for (const thread of state.threads) {
+    if (thread.status !== "running") continue;
+    if (thread.updatedAt >= cutoff) continue;
+    thread.status = "idle";
+    thread.updatedAt = Date.now();
+    released += 1;
+  }
+  return released;
+}
+
+function sentinelVerdict(id: string) {
+  const day = Date.now() - 86_400_000;
+  if (id === "sentry_sentinel") {
+    const errored = state.threads.filter((thread) => thread.status === "error").length;
+    const backlog = state.remediation.filter((row) => row.createdAt > day && (row.status === "failed" || row.status === "error")).length;
+    if (errored + backlog > 0) {
+      return { status: "incident_detected", severity: "warn", finding: `${errored} errored thread(s) and ${backlog} failed repair ${backlog === 1 ? "entry" : "entries"} in the last 24h.`, stagedFix: "Reset errored threads to idle, then scan again." };
+    }
+    return { status: "healthy", severity: "info", finding: "No errored threads or failed repairs in the last 24h.", stagedFix: "" };
+  }
+  if (id === "supabase_sentinel") {
+    const cutoff = Date.now() - STUCK_MS;
+    const stuck = state.threads.filter((thread) => thread.status === "running" && thread.updatedAt < cutoff).length;
+    if (stuck > 0) {
+      return { status: "incident_detected", severity: "error", finding: `${stuck} run(s) stuck longer than 120s.`, stagedFix: "Release stuck runs, then re-scan. A reply updated in the last 120s is left alone." };
+    }
+    return { status: "healthy", severity: "info", finding: "No stuck runs.", stagedFix: "" };
+  }
+  if (id === "vercel_sentinel") {
+    const available = state.settings.availableVersion?.trim() ?? "";
+    if (available && available !== state.settings.version) {
+      return { status: "incident_detected", severity: "warn", finding: `Deployment drift: ${available} is available, local build is ${state.settings.version}.`, stagedFix: "Review the release, then update from Settings. No unattended release is attempted." };
+    }
+    return { status: "healthy", severity: "info", finding: `Build ${state.settings.version} is current on the ${state.settings.updateChannel} channel.`, stagedFix: "" };
+  }
+  if (id === "github_sentinel") {
+    return { status: "watching", severity: "info", finding: "Git drift is checked by the desktop shell. This preview has no checkout.", stagedFix: "" };
+  }
+  const failing = (state.mcpServers ?? []).filter((server) => server.lastError);
+  if (failing.length === 0) {
+    return { status: "healthy", severity: "info", finding: "No MCP channels are reporting errors.", stagedFix: "" };
+  }
+  return { status: "incident_detected", severity: "warn", finding: `${failing.length} channel(s) reporting errors: ${failing.map((server) => server.name).join(", ")}.`, stagedFix: "Inspect the channel on the MCP mesh screen. This preview will not clear the error for you." };
+}
+
+function applySentinelScan(id: string) {
+  const row = state.sentinels.find((item) => item.id === id);
+  if (!row) throw new Error("unknown sentinel");
+  const next = sentinelVerdict(id);
+  if (next.status !== "incident_detected" || next.finding !== row.finding) row.acknowledged = false;
+  row.status = next.status;
+  row.severity = next.severity;
+  row.finding = next.finding;
+  row.stagedFix = next.stagedFix;
+  row.lastScan = Date.now();
+  pushSentinelEvent(id, `[${row.name}] scan → ${row.status} [${row.severity}]: ${row.finding}`);
+  return `${row.name} scan complete: ${row.status}. ${row.finding}`;
+}
+
+function remediateSentinel(id: string) {
+  applySentinelScan(id);
+  const row = state.sentinels.find((item) => item.id === id);
+  if (!row) throw new Error("unknown sentinel");
+  if (row.status !== "incident_detected") {
+    const action = `No action taken: ${row.name} is ${row.status === "watching" ? "in its resting watching state (nothing to fix yet)" : row.status} after a fresh scan.`;
+    pushRepair(5, "sentinel_remediation", row.name, action, "skipped");
+    return action;
+  }
+  if (id === "vercel_sentinel" || id === "middleware_sentinel" || id === "github_sentinel") {
+    const action = id === "vercel_sentinel"
+      ? "Deployment drift needs a reviewed update from Settings; no unattended release was attempted."
+      : id === "middleware_sentinel"
+        ? "Channel errors require manual review in the MCP mesh screen; no channel state was changed."
+        : "Git could not be verified, so no checkpoint was written. Fix the checkout in the desktop app.";
+    pushRepair(5, "sentinel_remediation", row.name, action, "manual_required");
+    return action;
+  }
+  let action = "";
+  if (id === "sentry_sentinel") {
+    let errored = 0;
+    for (const thread of state.threads) {
+      if (thread.status === "error") {
+        thread.status = "idle";
+        thread.updatedAt = Date.now();
+        errored += 1;
+      }
+    }
+    action = `Reset ${errored} errored thread(s) to idle for retry. The preview did not patch a file.`;
+  } else {
+    const released = releaseStuckThreads();
+    action = `Tier 1 heal applied: ${released} stuck run(s) released.`;
+  }
+  const verify = applySentinelScan(id);
+  const after = state.sentinels.find((item) => item.id === id)!;
+  pushRepair(5, "sentinel_remediation", row.name, action, after.status === "incident_detected" ? "unverified" : "repaired");
+  return `${row.name}: ${action} Verify: ${verify}`;
+}
+
+function runPreviewDrill(tier: number) {
+  const notes: string[] = [];
+  const one = (n: number) => {
+    const row = state.tierStatus.find((item) => item.tier === n);
+    const stamp = (counted: boolean) => {
+      if (!row) return;
+      row.lastRunAt = Date.now();
+      if (counted) row.repairCount += 1;
+    };
+    if (n === 1) {
+      const released = releaseStuckThreads();
+      if (row) {
+        row.status = "ok";
+        row.badge = "preview";
+      }
+      stamp(true);
+      pushRepair(1, "watchdog_drill", "watchdog", `Released ${released} stuck run(s). A live reply was left alone.`, "repaired");
+      notes.push(`Tier 1: ${released} stuck run(s) released.`);
+    } else if (n === 2) {
+      if (row) row.badge = "no CDP session in the preview";
+      stamp(false);
+      pushRepair(2, "selector_drill", "cdp_dom_healer", "Selector healer has no page session in the preview.", "skipped");
+      notes.push("Tier 2: no CDP session in the preview.");
+    } else if (n === 3) {
+      if (row) row.badge = "desktop only";
+      stamp(false);
+      pushRepair(3, "checkpoint_drill", ".shadow-git", "Shadow checkpoints are written by the desktop shell.", "skipped");
+      notes.push("Tier 3: shadow-git is desktop only.");
+    } else {
+      const off = state.settings.hotpatchEnabled === false;
+      if (row) {
+        row.status = off ? "off" : "ok";
+        row.badge = off ? "disabled in settings" : "preview";
+      }
+      stamp(false);
+      pushRepair(4, "hotpatch_drill", "harness2", off ? "Hotpatch is off, so no file was rewritten." : "The preview does not rewrite extension files.", off ? "skipped" : "skipped");
+      notes.push(off ? "Tier 4: hotpatch is off in settings, so no file was rewritten." : "Tier 4: file repair runs in the desktop app.");
+    }
+  };
+  if (tier === 0) for (const n of [1, 2, 3, 4]) one(n);
+  else one(tier);
+  return `Self-heal drill complete (${tier === 0 ? "all 4 tiers" : "single tier"}): ${notes.join(" ")}`;
 }
 
 function makeProfile(partial: Partial<BotProfile> & Pick<BotProfile, "id" | "handle" | "displayName">): BotProfile {
@@ -190,9 +422,9 @@ function makeProfile(partial: Partial<BotProfile> & Pick<BotProfile, "id" | "han
     avatar: "NW",
     avatarColor: "#8b5a2b",
     soulMarkdown: "",
-    primaryAccountId: "prov_ollama",
-    longContextAccountId: "prov_gemini",
-    fallbackAccountId: "prov_openrouter",
+    primaryAccountId: "",
+    longContextAccountId: "",
+    fallbackAccountId: "",
     allowComputerUse: true,
     allowBrowserUse: true,
     allowCodeExec: true,
@@ -495,6 +727,324 @@ function delegationBots(): PlanBot[] {
   }));
 }
 
+// shortcut: this scorer mirrors harness2_engine::score_prompt, upgrade when those rules change.
+const H2_KEY = "ronicos.browser.harness2.v1";
+const H2_COMPONENTS = ["system_prompt", "guardrails", "memory", "tool_guidance", "subagents", "skills", "scripts", "plugins"];
+const H2_KEYWORDS = ["reverse engineer", "security audit", "end-to-end", "architect", "migrate", "refactor", "backtest", "optimize", "concurrency"];
+const H2_PLAN = "Harness² local plan for this turn. Follow it as a checklist. It is a plan, not a finished edit.";
+const H2_PROBE = "Contrastive probes were not executed. The sandbox holds the plan only. The live project was not copied and no git worktree was created.";
+
+type H2Flags = {
+  mode: string;
+  recursion: string;
+  budgetK: number;
+  threshold: number;
+  escalate: boolean;
+  editorLabel: string;
+  substrate: string;
+  components: string[];
+};
+
+type H2Score = { value: number; reasons: string[]; armed: boolean; threshold: number };
+
+type H2Run = {
+  runId: string;
+  botId: string;
+  trigger: string;
+  score: number;
+  reasons: string[];
+  recursion: string;
+  budgetK: number;
+  editor: string;
+  executor: string;
+  components: string[];
+  probesExecuted: boolean;
+  probeNote: string;
+  proposal: string;
+  adopted: boolean;
+  promoted: boolean;
+  soulUntouched: boolean;
+  backupPath: string;
+  log: string;
+  outputFiles: string[];
+  backupSoul: string;
+};
+
+type H2Library = {
+  id: string;
+  botId: string;
+  domainTag: string;
+  componentType: string;
+  title: string;
+  whenToApplyRule: string;
+  behavioralEvidence: string;
+  artifactPathOrContent: string;
+  sourceRunId: string;
+  createdAt: number;
+};
+
+type H2Store = { flags: H2Flags; runs: H2Run[]; library: H2Library[] };
+
+function h2Flags(): H2Flags {
+  return {
+    mode: "auto",
+    recursion: "parallel",
+    budgetK: 1,
+    threshold: 65,
+    escalate: true,
+    editorLabel: "Local plan only",
+    substrate: "opencode",
+    components: [...H2_COMPONENTS],
+  };
+}
+
+function loadH2(): H2Store {
+  const fresh = (): H2Store => ({ flags: h2Flags(), runs: [], library: [] });
+  try {
+    const raw = localStorage.getItem(H2_KEY);
+    if (!raw) return fresh();
+    const parsed = JSON.parse(raw) as Partial<H2Store>;
+    const flags = { ...h2Flags(), ...(parsed.flags ?? {}) };
+    if (!Array.isArray(flags.components) || flags.components.length === 0) flags.components = [...H2_COMPONENTS];
+    return { flags, runs: Array.isArray(parsed.runs) ? parsed.runs : [], library: Array.isArray(parsed.library) ? parsed.library : [] };
+  } catch {
+    return fresh();
+  }
+}
+
+function saveH2(store: H2Store) {
+  localStorage.setItem(H2_KEY, JSON.stringify(store));
+}
+
+function h2Status(store: H2Store) {
+  return {
+    flags: store.flags,
+    uvPath: "",
+    repoDir: "desktop app",
+    repoPresent: false,
+    venvPresent: false,
+    demoPresent: false,
+    version: "",
+    note: "This preview scores each message as you type and attaches a local plan to the same turn. Install, the uv demo, and sandbox files run in the desktop app.",
+    lastCheck: "",
+    runCount: store.runs.length,
+    libraryCount: store.library.length,
+  };
+}
+
+function stripScoreDirectives(text: string) {
+  return text.replace(/\[APPROVAL MODE:[^\]]*\]/g, "").replace(/\[FORMATTING DIRECTIVE:[^\]]*\]/g, "").trim();
+}
+
+function h2Greeting(lower: string) {
+  const trimmed = lower.trim().replace(/[!?.,\s]+$/g, "");
+  const greetings = ["hi", "hello", "hey", "howdy", "sup", "what's up", "whats up", "good morning", "good afternoon", "good evening", "good night", "yo", "greetings"];
+  return greetings.some((item) => trimmed === item || trimmed.startsWith(`${item} `) || trimmed.startsWith(`${item},`) || trimmed.startsWith(`${item}!`));
+}
+
+function h2QuestionOnly(lower: string) {
+  const trimmed = lower.trimStart();
+  const starters = ["what ", "why ", "who ", "when ", "where ", "how ", "explain ", "describe ", "tell me ", "define "];
+  if (!starters.some((item) => trimmed.startsWith(item))) return false;
+  return !["please", "go ahead", "i need you", "i want you", "for me"].some((mark) => lower.includes(mark));
+}
+
+function h2SimpleQuestion(lower: string) {
+  const trimmed = lower.trimStart();
+  return ["what ", "what's ", "whats ", "why ", "who ", "when ", "where ", "how ", "can you explain ", "explain ", "describe ", "tell me "].some((item) => trimmed.startsWith(item));
+}
+
+function h2AsksForWork(lower: string) {
+  return ["please", "can you", "could you", "would you", "i need you", "i want you", "go ahead", "run ", "fix ", "create ", "set up", "setup ", "schedule", "automate", "click ", "open ", "build ", "install ", "write ", "update ", "edit ", "patch ", "implement", "verify ", "scrape", "save this", "save it", "make a", "make the", "add a ", "add the ", "change the", "change this", "check the", "check that", "rerun", "re-run"].some((mark) => lower.includes(mark));
+}
+
+function h2SkillCovered(prompt: string) {
+  const lower = prompt.toLowerCase();
+  for (const skill of state.skills) {
+    for (const token of [skill.slug, skill.slashCommand.replace(/^\//, "")]) {
+      const clean = token.toLowerCase();
+      if (clean.length >= 4 && lower.includes(clean)) return true;
+    }
+  }
+  return false;
+}
+
+function scoreHarness(prompt: string, attachmentCount: number, squad: boolean, skillCovered: boolean): H2Score {
+  const clean = stripScoreDirectives(prompt);
+  const lower = clean.trim().toLowerCase();
+  if (h2Greeting(lower) || !lower) {
+    return { value: 0, reasons: ["greeting or brief conversational query"], armed: false, threshold: 65 };
+  }
+  if ((h2QuestionOnly(lower) || h2SimpleQuestion(lower)) && !h2AsksForWork(lower)) {
+    return { value: 0, reasons: ["informational question (no complex engineering work requested)"], armed: false, threshold: 65 };
+  }
+  let value = 0;
+  const reasons: string[] = [];
+  let hits = 0;
+  for (const keyword of H2_KEYWORDS) {
+    if (!lower.includes(keyword) || hits >= 3) continue;
+    const weight = hits === 0 ? 40 : hits === 1 ? 25 : 15;
+    value += weight;
+    reasons.push(`keyword "${keyword}" (+${weight})`);
+    hits += 1;
+  }
+  if (hits > 0 || h2AsksForWork(lower)) {
+    if ([...clean].length > 180) {
+      value += 15;
+      reasons.push("prompt longer than 180 characters (+15)");
+    }
+    if (attachmentCount >= 2) {
+      value += 15;
+      reasons.push(`${attachmentCount} attachments (+15)`);
+    }
+    if (squad) {
+      value += 20;
+      reasons.push("squad target (+20)");
+    }
+    if (!skillCovered && hits > 0) {
+      value += 12;
+      reasons.push("no skill slug from this workspace matched the prompt (+12)");
+    }
+  }
+  return { value: Math.max(0, Math.min(100, value)), reasons, armed: false, threshold: 65 };
+}
+
+let harnessScoreChecked = false;
+function assertHarnessScore() {
+  if (harnessScoreChecked) return;
+  const simple = scoreHarness("What time is it?", 0, false, false);
+  const hard = scoreHarness("Reverse engineer the auth module, refactor our Rust middleware, and verify with tests", 0, false, false);
+  if (simple.value !== 0 || hard.value < 65) throw new Error(`harness score self-check failed (${simple.value}, ${hard.value})`);
+  harnessScoreChecked = true;
+}
+
+function h2ApplyPatch(flags: H2Flags, patch: Record<string, unknown>) {
+  if (patch.mode !== undefined) {
+    const mode = String(patch.mode);
+    if (mode !== "off" && mode !== "auto" && mode !== "force") throw new Error("mode must be off, auto, or force");
+    flags.mode = mode;
+  }
+  if (patch.recursion !== undefined) {
+    const recursion = String(patch.recursion);
+    if (recursion !== "parallel" && recursion !== "sequential") throw new Error("recursion must be parallel or sequential");
+    flags.recursion = recursion;
+  }
+  if (patch.budgetK !== undefined) {
+    const budget = Number(patch.budgetK);
+    if (budget !== 1 && budget !== 2) throw new Error("budget k must be 1 or 2");
+    flags.budgetK = budget;
+  }
+  if (patch.threshold !== undefined) {
+    const threshold = Number(patch.threshold);
+    if (!Number.isInteger(threshold) || threshold < 0 || threshold > 100) throw new Error("threshold must be 0 to 100");
+    flags.threshold = threshold;
+  }
+  if (patch.escalate !== undefined) flags.escalate = Boolean(patch.escalate);
+  if (patch.editorLabel !== undefined) {
+    const label = String(patch.editorLabel).replace(/[\n\r]/g, " ");
+    if (!label.trim() || [...label].length > 80) throw new Error("editor label must be 1 to 80 characters");
+    flags.editorLabel = label;
+  }
+  if (patch.substrate !== undefined) {
+    const substrate = String(patch.substrate);
+    if (substrate !== "opencode" && substrate !== "codex_cx" && substrate !== "claude_acp") throw new Error("substrate must be opencode, codex_cx, or claude_acp");
+    flags.substrate = substrate;
+  }
+  if (patch.components !== undefined) {
+    const components = Array.isArray(patch.components) ? patch.components.map((item) => String(item)) : [];
+    if (!components.length || components.some((item) => !H2_COMPONENTS.includes(item))) throw new Error("components must be a non-empty subset of the 8 harness fields");
+    flags.components = components;
+  }
+}
+
+function h2Proposal(prompt: string, score: H2Score, flags: H2Flags) {
+  const reasons = score.reasons.length ? score.reasons.join("; ") : "none";
+  return [
+    "Harness² plan. This file is not an executed edit.",
+    "",
+    "Task:",
+    prompt.slice(0, 500),
+    "",
+    `Local score: ${score.value}/100 (threshold ${score.threshold}). Reasons: ${reasons}.`,
+    `Mode: ${flags.mode}. Recursion setting: ${flags.recursion}. Budget k: ${flags.budgetK}. Substrate label: ${flags.substrate} (process not started).`,
+    `Editor: ${flags.editorLabel} (not called).`,
+    "",
+    "Components in scope:",
+    flags.components.join("\n"),
+    "",
+    "Soft guardrails may be drafted later under this sandbox. Wallet caps, the fail-closed gateway, and OS keychain access are not editable here.",
+    "Sandbox: browser preview (no files written).",
+    "The base soul was not modified.",
+  ].join("\n");
+}
+
+function h2Domain(prompt: string) {
+  const lower = prompt.toLowerCase();
+  if (lower.includes("rust") || lower.includes("cargo")) return "rust";
+  if (lower.includes("react") || lower.includes("typescript")) return "ui";
+  return "general";
+}
+
+function h2ScoreNow(prompt: string, attachmentCount: number) {
+  assertHarnessScore();
+  const store = loadH2();
+  const squad = prompt.toLowerCase().includes("#squad") || prompt.toLowerCase().includes("squad");
+  const score = scoreHarness(prompt, attachmentCount, squad, h2SkillCovered(prompt));
+  score.threshold = store.flags.threshold;
+  score.armed = store.flags.mode === "force" || (store.flags.mode === "auto" && score.value >= store.flags.threshold);
+  return score;
+}
+
+function h2Run(botId: string, prompt: string, trigger: string, score: H2Score, flags: H2Flags): H2Run {
+  return {
+    runId: nid("h2"),
+    botId,
+    trigger,
+    score: score.value,
+    reasons: score.reasons,
+    recursion: flags.recursion,
+    budgetK: flags.budgetK,
+    editor: flags.editorLabel,
+    executor: "not started",
+    components: [...flags.components],
+    probesExecuted: false,
+    probeNote: H2_PROBE,
+    proposal: h2Proposal(prompt, score, flags),
+    adopted: false,
+    promoted: false,
+    soulUntouched: true,
+    backupPath: "",
+    log: "",
+    outputFiles: [],
+    backupSoul: "",
+  };
+}
+
+function h2Find(store: H2Store, runId: string) {
+  const run = store.runs.find((item) => item.runId === runId);
+  if (!run) throw new Error("run not found");
+  return run;
+}
+
+function h2SyncStep(run: H2Run) {
+  const step = [...state.steps].reverse().find((item) => item.actionType === "harness2_pipeline" && String(item.actionPayload.runId ?? "") === run.runId);
+  if (step) step.actionPayload = { ...run };
+}
+
+function attachPreviewPlan(botId: string, prompt: string, attachmentCount: number, messages: ChatMessage[]) {
+  const store = loadH2();
+  if (store.flags.mode === "off" || !botId) return null;
+  const score = h2ScoreNow(prompt, attachmentCount);
+  if (!score.armed) return null;
+  const trigger = store.flags.mode === "force" ? "manual_force_on" : "auto_pre_flight";
+  const card = h2Run(botId, prompt, trigger, score, store.flags);
+  store.runs.unshift(card);
+  saveH2(store);
+  const user = [...messages].reverse().find((item) => item.role === "user");
+  if (user) user.content += `\n\n---\n${H2_PLAN}\n${card.proposal}`;
+  return card;
+}
+
 export async function browserCall(cmd: string, args: Record<string, unknown>): Promise<CommandResult> {
   const a = args as Record<string, any>;
   switch (cmd) {
@@ -690,7 +1240,7 @@ export async function browserCall(cmd: string, args: Record<string, unknown>): P
         finishThread();
         return ok("Held for your approval.");
       }
-      if (prompt.toLowerCase().includes("security")) {
+      if (previewSecurityScan(prompt)) {
         step({
           role: "tool",
           modelUsed: "local-operator",
@@ -701,7 +1251,10 @@ export async function browserCall(cmd: string, args: Record<string, unknown>): P
         finishThread();
         return ok("Message recorded.");
       }
-      const model = modelById(String(a.modelId ?? "")) ?? modelById(String(a.model ?? ""));
+      const boundEngine = addressed.engineKind === "openai_api" || addressed.engineKind === "subscription";
+      const picked = modelById(String(a.modelId ?? "")) ?? modelById(String(a.model ?? ""));
+      const fallback = !picked && !boundEngine ? composerModelFor(addressed.id) : null;
+      const model = picked ?? (fallback ? modelById(fallback.id) : null);
       if (!model) {
         step({
           role: "assistant",
@@ -714,7 +1267,6 @@ export async function browserCall(cmd: string, args: Record<string, unknown>): P
       }
       const rawEffort = String(a.effort ?? "default");
       const effort: Effort = rawEffort === "high" || rawEffort === "max" || rawEffort === "xhigh" ? rawEffort : "default";
-      const quick = quickQuestion(composed);
       const bag = bagFromState();
       const messages = foldThread(
         state.steps.filter((item) => item.threadId === thread.id),
@@ -722,6 +1274,22 @@ export async function browserCall(cmd: string, args: Record<string, unknown>): P
         thread.compactedContextCapsule,
       );
       state.skillIndexDelta = "";
+      let armedPlan = false;
+      if (!replay) {
+        const card = attachPreviewPlan(addressed.id, prompt, attachments.length, messages);
+        if (card) {
+          armedPlan = true;
+          step({
+            role: "tool",
+            modelUsed: "harness2",
+            contentMarkdown: `Supercharge plan only. Score ${card.score}/${loadH2().flags.threshold}. Probes were not started.`,
+            actionType: "harness2_pipeline",
+            actionPayload: { ...card },
+          });
+          noteActivity("Supercharge checklist is on this turn.");
+        }
+      }
+      const quick = armedPlan ? false : quickQuestion(composed);
       if (quick) {
         const system = messages.find((item) => item.role === "system");
         if (system) system.content += "\n\nThis is a short question. Answer in a few sentences. Do not call a tool.";
@@ -734,6 +1302,7 @@ export async function browserCall(cmd: string, args: Record<string, unknown>): P
       for (const item of messages) {
         if (item.role === "assistant" && !item.content.startsWith("[Earlier reply")) item.content = `[Earlier reply, not from ${selected}]\n${item.content}`;
       }
+      if (armedPlan) await showLivePreview();
       try {
         let result = await completeChat(model, messages, quick ? "default" : effort, !quick);
         let lastText = "";
@@ -878,7 +1447,6 @@ export async function browserCall(cmd: string, args: Record<string, unknown>): P
     case "create_profile": {
       const id = nid("bot");
       const harness = String(a.draft.harnessLaneId ?? "");
-      const primary = harness === "claude_cli" ? "prov_claude" : harness === "agy_cli" ? "prov_gemini" : harness === "codex_cli" ? "prov_chatgpt" : harness === "grok_web" ? "prov_grok" : "prov_ollama";
       const avatar = String(a.draft.avatar ?? "");
       state.profiles.unshift(makeProfile({
         id,
@@ -887,7 +1455,6 @@ export async function browserCall(cmd: string, args: Record<string, unknown>): P
         avatar: /^mark:[a-z]{1,16}$/.test(avatar) ? avatar : "NW",
         soulMarkdown: a.draft.soulMarkdown,
         role: a.draft.role,
-        primaryAccountId: primary,
         harnessLaneId: harness,
         agUiEndpointUrl: String(a.draft.agUiEndpointUrl ?? ""),
         statusLine: "Just created",
@@ -999,13 +1566,14 @@ export async function browserCall(cmd: string, args: Record<string, unknown>): P
         contentMarkdown: draft.contentMarkdown,
         sourceType: draft.sourceType,
         scopedBotId,
-        filePathOrUri: draft.filePathOrUri,
+        filePathOrUri: draft.filePathOrUri || previous?.filePathOrUri || "",
         wikilinks: links,
         updatedAt: Date.now(),
         engineOrigin: previous?.engineOrigin ?? engineId,
         syncedEngines: [...synced],
         validFrom: previous?.validFrom ?? Date.now(),
         invalidAt: null,
+        relations: previous?.relations ?? [],
       };
       const idx = state.memories.findIndex((m) => m.id === item.id);
       if (idx >= 0) state.memories[idx] = item;
@@ -1174,12 +1742,6 @@ export async function browserCall(cmd: string, args: Record<string, unknown>): P
           released += 1;
         }
       }
-      for (const bot of state.profiles) {
-        if (bot.runStatus === "running") {
-          bot.runStatus = "stopped";
-          bot.activePid = null;
-        }
-      }
       state.heartbeatAgeMs = 0;
       state.ipcLog.unshift(`${Date.now()} refresh/released`);
       return ok(released > 0
@@ -1187,17 +1749,50 @@ export async function browserCall(cmd: string, args: Record<string, unknown>): P
         : "Workspace refreshed. No messages were deleted.");
     }
     case "run_repair":
-      state.remediation.unshift({
-        id: nid("rem"),
-        tier: 1,
-        faultType: "manual",
-        targetComponent: "preview",
-        actionTaken: "The desktop shell runs the doctor. This preview did not patch a file.",
-        recoveryDurationMs: 0,
-        status: "noted",
-        createdAt: Date.now(),
+      ensureRepairFleet(state);
+      pushRepair(4, "manual", "preview", "The desktop shell runs the doctor. This preview did not patch a file.", "skipped");
+      return ok("The preview did not patch a file. Run doctor in the desktop app to repair extensions on disk.");
+    case "self_heal_drill": {
+      ensureRepairFleet(state);
+      const tier = Number(a.tier ?? 0);
+      if (!Number.isInteger(tier) || tier < 0 || tier > 4) throw new Error("tier must be 0 (all tiers) or an integer from 1 to 4");
+      return ok(runPreviewDrill(tier));
+    }
+    case "sentinel_scan":
+      ensureRepairFleet(state);
+      return ok(applySentinelScan(String(a.sentinelId ?? "")));
+    case "sentinel_scan_all": {
+      ensureRepairFleet(state);
+      const ids = state.sentinels.map((item) => item.id);
+      const statuses = ids.map((id) => {
+        applySentinelScan(id);
+        return state.sentinels.find((row) => row.id === id)?.status ?? "watching";
       });
-      return ok("Repair pass recorded.");
+      const incidents = statuses.filter((item) => item === "incident_detected").length;
+      const healthy = statuses.filter((item) => item === "healthy").length;
+      return ok(`Fleet scan complete: ${healthy} healthy, ${incidents} incident(s), ${statuses.length - incidents - healthy} watching.`);
+    }
+    case "sentinel_remediate":
+      ensureRepairFleet(state);
+      return ok(remediateSentinel(String(a.sentinelId ?? "")));
+    case "acknowledge_sentinel": {
+      ensureRepairFleet(state);
+      const row = state.sentinels.find((item) => item.id === String(a.sentinelId ?? ""));
+      if (!row) throw new Error("unknown sentinel");
+      row.acknowledged = true;
+      pushSentinelEvent(row.id, `[${row.name}] acknowledged. It stays quiet while this same finding remains.`);
+      return ok(`${row.name} acknowledged. It stays quiet while this same finding remains, and flags again if the finding changes or the incident returns.`);
+    }
+    case "reset_sentinel_ack": {
+      ensureRepairFleet(state);
+      const row = state.sentinels.find((item) => item.id === String(a.sentinelId ?? ""));
+      if (!row) throw new Error("unknown sentinel");
+      row.acknowledged = false;
+      pushSentinelEvent(row.id, `[${row.name}] acknowledgement cleared.`);
+      return ok(`${row.name} acknowledgement cleared.`);
+    }
+    case "restore_shadow_backup":
+      return ok("This preview has no rollback files. Restore a checkpoint in the desktop app.");
     case "preview_bug":
       state.bugPreview = redact(`category: ${a.category}\nnotes: ${a.notes}`);
       return ok(null);
@@ -1553,8 +2148,47 @@ export async function browserCall(cmd: string, args: Record<string, unknown>): P
       else state.sandboxOutput = text;
       return ok("Sandbox commands run in the desktop shell.");
     }
-    case "memory_vault":
+    case "memory_vault": {
+      const action = String(a.action ?? "");
+      if (action === "curate") {
+        if (!Array.isArray(state.curated)) state.curated = [];
+        if (String(a.query ?? "") === "drop") {
+          const id = String(a.memoryId ?? "");
+          const next = state.curated.filter((item) => item.id !== id);
+          if (next.length === state.curated.length) return ok("That always-on note was not found.");
+          state.curated = next;
+          return ok("Removed that always-on note.");
+        }
+        const result = applyCurate(
+          state.curated,
+          String(a.target ?? ""),
+          String(a.query ?? "add"),
+          String(a.oldText ?? ""),
+          String(a.content ?? ""),
+          state.activeProfileId,
+          () => nid("cur"),
+        );
+        if (result.ok) state.curated = result.entries;
+        return ok(result.message);
+      }
+      if (action === "link" || action === "unlink") {
+        const id = String(a.memoryId ?? "");
+        const target = String(a.target ?? "").trim();
+        const relation = String(a.relation ?? "RELATES").trim() || "RELATES";
+        const note = state.memories.find((item) => item.id === id);
+        if (!note || !target) return ok("That memory was not found.");
+        const relations = note.relations ?? [];
+        const index = relations.findIndex((edge) => edge.target.toLowerCase() === target.toLowerCase());
+        if (action === "unlink") {
+          if (index < 0) return ok("That graph link was not found.");
+          relations.splice(index, 1);
+        } else if (index >= 0) relations[index] = { relation, target };
+        else relations.push({ relation, target });
+        note.relations = relations;
+        return ok(action === "unlink" ? `Removed the link to "${target}". The note was not changed.` : `Linked "${note.title}" to "${target}" (${relation}). The note was not changed.`);
+      }
       return { ...ok("Vault search runs in the desktop app."), payload: { hits: [], events: [] } };
+    }
     case "workspace_git":
       return { ...ok("Git status and agent dispatch run in the desktop app."), payload: { files: [] } };
     case "install_git_package":
@@ -1602,15 +2236,24 @@ export async function browserCall(cmd: string, args: Record<string, unknown>): P
     case "run_workflow": {
       const wf = state.workflows.find((w) => w.id === a.id);
       if (!wf) return ok("Missing workflow.");
-      wf.currentStatus = "completed";
-      wf.nodes.forEach((n) => {
+      const only = String(a.nodeId ?? a.node_id ?? "");
+      const targets = only ? wf.nodes.filter((n) => n.id === only) : wf.nodes;
+      if (only && targets.length === 0) return ok("Missing step.");
+      if (!only && wf.nodes.length > 0 && wf.nodes.every((n) => n.status === "done")) {
+        wf.checkpoint = {};
+        wf.nodes.forEach((n) => {
+          n.status = "pending";
+          n.latencyMs = 0;
+        });
+      }
+      targets.forEach((n) => {
         n.status = "done";
         n.latencyMs = Math.floor(Math.random() * 350 + 120);
-        if (!wf.checkpoint[n.id]) {
-          wf.checkpoint[n.id] = `Execution result for step "${n.name}" (${n.kind}): successfully processed with ${n.model || "default agent engine"}.`;
-        }
+        wf.checkpoint[n.id] = `Execution result for step "${n.name}" (${n.kind}): successfully processed with ${n.model || "default agent engine"}.`;
       });
-      return ok("Workflow run completed.");
+      wf.currentStatus = wf.nodes.every((n) => n.status === "done") ? "completed" : "idle";
+      wf.pausedAtNodeId = null;
+      return ok(only ? "Step finished." : "Workflow run completed.");
     }
     case "pause_workflow": {
       const wf = state.workflows.find((w) => w.id === a.id);
@@ -1916,6 +2559,14 @@ export async function browserCall(cmd: string, args: Record<string, unknown>): P
       }
       return ok(bot.walletFrozen ? `${bot.handle} wallet frozen. Agent spends are rejected.` : `${bot.handle} wallet re-armed.`);
     }
+    case "set_ledger_mode": {
+      const mode = String(a.mode ?? "");
+      if (mode !== "sandbox" && mode !== "live_signer") throw new Error("ledger mode must be sandbox or live_signer");
+      state.ledgerMode = mode;
+      return ok(mode === "live_signer"
+        ? "LIVE-SIGNER armed. External network rails stay locked in this build."
+        : "Switched to the SANDBOX simulation ledger.");
+    }
     case "set_takeover": {
       const bot = state.profiles.find((item) => item.id === a.botId);
       if (!bot) return ok("Bot not found.");
@@ -1923,6 +2574,80 @@ export async function browserCall(cmd: string, args: Record<string, unknown>): P
       bot.statusLine = bot.takeover ? "You have control of this computer" : "Ready for tasks";
       return ok(bot.takeover ? "You have control of this bot's computer." : "The bot can work again.");
     }
+    case "harness2_status":
+      return ok(null, h2Status(loadH2()));
+    case "harness2_set_flags": {
+      const store = loadH2();
+      h2ApplyPatch(store.flags, (a.patch ?? {}) as Record<string, unknown>);
+      saveH2(store);
+      return ok("Supercharge updated.", h2Status(store));
+    }
+    case "harness2_score":
+      return { snapshot: state, toast: null, payload: h2ScoreNow(String(a.prompt ?? ""), Number(a.attachmentCount ?? 0)) };
+    case "harness2_library": {
+      const needle = String(a.query ?? "").trim().toLowerCase();
+      const entries = loadH2().library.filter((entry) => {
+        if (!needle) return true;
+        return `${entry.title} ${entry.domainTag} ${entry.componentType}`.toLowerCase().includes(needle);
+      });
+      return ok(null, entries.slice(0, 80));
+    }
+    case "harness2_keep": {
+      const store = loadH2();
+      const run = h2Find(store, String(a.runId ?? ""));
+      if (!run.adopted) {
+        const title = `Plan ${run.runId}`;
+        store.library.unshift({
+          id: nid("h2lib"),
+          botId: run.botId,
+          domainTag: h2Domain(run.proposal),
+          componentType: run.components[0] ?? "system_prompt",
+          title,
+          whenToApplyRule: "When a similar complex task is scored again.",
+          behavioralEvidence: run.probeNote,
+          artifactPathOrContent: run.proposal.slice(0, 500),
+          sourceRunId: run.runId,
+          createdAt: Date.now(),
+        });
+        run.adopted = true;
+        saveH2(store);
+      }
+      h2SyncStep(run);
+      return ok("Kept in the preview library.", run);
+    }
+    case "harness2_promote": {
+      const store = loadH2();
+      const run = h2Find(store, String(a.runId ?? ""));
+      if (run.promoted) return ok("Already on the base soul.", run);
+      const bot = state.profiles.find((item) => item.id === run.botId);
+      if (!bot) throw new Error("bot not found");
+      run.backupSoul = bot.soulMarkdown;
+      bot.soulMarkdown = `${bot.soulMarkdown}\n\nHarness² plan ${run.runId} (preview, not a file edit):\n${run.proposal.slice(0, 1200)}`;
+      run.promoted = true;
+      run.soulUntouched = false;
+      run.backupPath = "preview-soul";
+      h2SyncStep(run);
+      saveH2(store);
+      return ok("Plan appended to this bot's soul in the preview.", run);
+    }
+    case "harness2_revert": {
+      const store = loadH2();
+      const run = h2Find(store, String(a.runId ?? ""));
+      if (!run.promoted || !run.backupSoul) throw new Error("the base soul was not changed by this run");
+      const bot = state.profiles.find((item) => item.id === run.botId);
+      if (!bot) throw new Error("bot not found");
+      bot.soulMarkdown = run.backupSoul;
+      run.promoted = false;
+      run.soulUntouched = true;
+      run.backupPath = "";
+      h2SyncStep(run);
+      saveH2(store);
+      return ok("Preview soul restored.", run);
+    }
+    case "harness2_install":
+    case "harness2_check":
+    case "harness2_demo":
+      throw new Error("Install, the uv demo, and sandbox files run in the desktop app. This preview left those files unchanged.");
     default:
       throw new Error(`${cmd} runs in the desktop app. This preview left the workspace unchanged.`);
   }
@@ -1960,6 +2685,7 @@ function adoptMem0(snap: Snapshot) {
   for (const item of snap.memories ?? []) {
     if (!item.engineOrigin || item.engineOrigin === "openmemory_builtin" || item.engineOrigin === "mem0_sdk") item.engineOrigin = "mem0_builtin";
     if (!Array.isArray(item.syncedEngines)) item.syncedEngines = [];
+    if (!Array.isArray(item.relations)) item.relations = [];
   }
 }
 
@@ -1985,9 +2711,9 @@ function seed(): Snapshot {
     role: "Assistant & Operator",
     statusLine: "Ready for tasks",
     soulMarkdown: "You are @raj, an intelligent and reliable assistant and coworker in Ronic OS.",
-    primaryAccountId: "prov_openrouter",
-    longContextAccountId: "prov_gemini",
-    fallbackAccountId: "prov_ollama",
+    primaryAccountId: "",
+    longContextAccountId: "",
+    fallbackAccountId: "",
     isPinned: true,
     allowComputerUse: true,
     allowBrowserUse: true,
@@ -2051,6 +2777,7 @@ function seed(): Snapshot {
       app("app_openclaw", "OpenClaw", "bot_daemon", "local_command"),
     ],
     memories: initialMemories(),
+    curated: [],
     memoryEngines: memoryEngines(),
     memoryRoute: memoryRoute(),
     memoryRoutes: [memoryRoute()],
@@ -2150,7 +2877,8 @@ function seed(): Snapshot {
 function bagFromState(): ToolBag {
   const profileId = state.activeProfileId;
   return {
-    memories: state.memories.map((item) => ({ id: item.id, title: item.title, content: item.contentMarkdown })),
+    memories: state.memories.map((item) => ({ id: item.id, title: item.title, content: item.contentMarkdown, relations: item.relations ?? [] })),
+    curated: state.curated ?? [],
     skills: state.skills.map((item) => ({
       slug: item.slug,
       slash: item.slashCommand,
@@ -2169,12 +2897,14 @@ function bagFromState(): ToolBag {
 }
 
 function writeBag(bag: ToolBag) {
+  state.curated = bag.curated;
   const seen = new Set(bag.memories.map((item) => item.id));
   for (const row of bag.memories) {
     const index = state.memories.findIndex((item) => item.id === row.id);
     if (index >= 0) {
       state.memories[index].title = row.title;
       state.memories[index].contentMarkdown = row.content;
+      if (row.relations) state.memories[index].relations = row.relations;
       continue;
     }
     state.memories.unshift({
@@ -2188,6 +2918,7 @@ function writeBag(bag: ToolBag) {
       updatedAt: Date.now(),
       engineOrigin: state.memoryRoutes.find((route) => route.id === state.activeProfileId)?.engineId ?? state.memoryRoute.engineId ?? "mem0_builtin",
       syncedEngines: [],
+      relations: row.relations ?? [],
     });
   }
   state.memories = state.memories.filter((item) => seen.has(item.id));

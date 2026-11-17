@@ -168,6 +168,7 @@ pub fn ask_peer(conn: &Connection, home: &Path, source: &str, target: &str, task
                 scoped_bot_id: None,
                 file_path_or_uri: String::new(),
                 engine_id: None,
+                keep_identity: false,
             },
         )
         .map_err(|error| error.0)?;
@@ -364,6 +365,7 @@ pub fn relay(conn: &Connection, home: &Path, source: &str, scenario: &str) -> Re
                     scoped_bot_id: None,
                     file_path_or_uri: String::new(),
                     engine_id: None,
+                    keep_identity: false,
                 },
             )
             .map_err(|error| error.0)?;
@@ -655,7 +657,7 @@ fn extra_configs(conn: &Connection, home: &Path) -> Result<Vec<String>, String> 
         if insiders.is_dir() {
             let path = insiders.join("mcp.json");
             backup(home, &path);
-            match workspace_bridge::upsert_mcp(&path, &entry, true) {
+            match workspace_bridge::upsert_mcp_map(&path, "servers", &entry, true) {
                 Ok(_) => notes.push(format!("VS Code Insiders ({})", path.display())),
                 Err(error) => notes.push(error),
             }
@@ -668,7 +670,7 @@ fn extra_configs(conn: &Connection, home: &Path) -> Result<Vec<String>, String> 
         if vscode.is_dir() {
             let path = vscode.join("mcp.json");
             backup(home, &path);
-            match workspace_bridge::upsert_mcp(&path, &entry, true) {
+            match workspace_bridge::upsert_mcp_map(&path, "servers", &entry, true) {
                 Ok(_) => notes.push(format!("Workspace VS Code ({})", path.display())),
                 Err(error) => notes.push(error),
             }
@@ -810,24 +812,22 @@ fn serve_alias(app: AppHandle) {
             let method = parts.next().unwrap_or("");
             let target = parts.next().unwrap_or("/");
             let token = read_token();
-            let (status, payload) = if !target.starts_with("/mcp") {
-                (404, br#"{"error":"not found"}"#.to_vec())
-            } else if method == "OPTIONS" {
-                (204, Vec::new())
-            } else if method != "POST" {
-                (405, br#"{"error":"use POST"}"#.to_vec())
-            } else if !workspace_bridge::authorized(&token, target, &headers) {
-                (401, br#"{"error":"unauthorized"}"#.to_vec())
-            } else {
+            let reply = crate::mcp_oauth::dispatch(crate::mcp_oauth::store(), method, target, &headers, &body, &token);
+            if reply.rpc {
                 // An authorized call through this port is real evidence that a
                 // client — local or through the tunnel — spoke MCP.
                 tunnel::record_mcp_call();
                 match workspace_bridge::mcp_json_rpc(&app, &body) {
-                    Some(bytes) => (200, bytes),
-                    None => (202, Vec::new()),
+                    Some(bytes) => {
+                        let _ = workspace_bridge::write_response(&mut stream, 200, "application/json", &bytes);
+                    }
+                    None => {
+                        let _ = workspace_bridge::write_response(&mut stream, 202, "application/json", b"");
+                    }
                 }
-            };
-            let _ = workspace_bridge::write_response(&mut stream, status, "application/json", &payload);
+            } else {
+                let _ = workspace_bridge::write_response_extra(&mut stream, reply.status, reply.content_type, &reply.body, &reply.headers);
+            }
         });
     }
 }
@@ -962,6 +962,7 @@ pub async fn open_mcp_connected_webapp(app: AppHandle, app_id: String) -> Result
 
 #[tauri::command]
 pub async fn open_harness_mcp_setup(app: AppHandle, app_id: String) -> Result<String, String> {
+    crate::mcp_oauth::arm_consent();
     open_connector_setup(&app, app_id.trim())
 }
 

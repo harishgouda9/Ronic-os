@@ -9,6 +9,7 @@ use regex::Regex;
 use rusqlite::{params, Connection};
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,6 +20,27 @@ const HISTORY_BUDGET: usize = 12_000;
 const TOOL_ROUNDS: usize = 16;
 static NEXT_TICKET: AtomicU64 = AtomicU64::new(1);
 static TURN_OWNER: AtomicU64 = AtomicU64::new(0);
+std::thread_local! {
+    static PINNED_THREAD: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Run one turn on this thread without changing the chat the user has open.
+pub struct ThreadPin(Option<String>);
+
+pub fn pin_thread(id: &str) -> ThreadPin {
+    let previous = PINNED_THREAD.with(|slot| slot.replace(Some(id.to_string())));
+    ThreadPin(previous)
+}
+
+impl Drop for ThreadPin {
+    fn drop(&mut self) {
+        PINNED_THREAD.with(|slot| *slot.borrow_mut() = self.0.take());
+    }
+}
+
+fn pinned_thread() -> Option<String> {
+    PINNED_THREAD.with(|slot| slot.borrow().clone())
+}
 
 struct TurnGuard {
     ticket: u64,
@@ -36,6 +58,10 @@ pub fn release_turn() {
     TURN_OWNER.store(0, Ordering::SeqCst);
     TURN_EPOCH.fetch_add(1, Ordering::SeqCst);
     CLIENT_EPOCH.fetch_add(1, Ordering::SeqCst);
+}
+
+pub fn turn_busy() -> bool {
+    TURN_OWNER.load(Ordering::SeqCst) != 0
 }
 
 fn turn_epoch() -> u64 {
@@ -174,7 +200,8 @@ pub fn dispatch(state: &AppState, prompt: &str, secrets: &HashMap<String, String
         }
         AfterPrep::Talk { thread_id, turn_id, bot_id, composed, settings, effort, pinned, speaker_handle } => {
             let home = state.home.clone();
-            with_db(state, |conn| crate::harness2_engine::arm_chat(conn, &home, prompt, attachments));
+            let proposal = with_db(state, |conn| crate::harness2_engine::arm_chat(conn, &home, &thread_id, &turn_id, &bot_id, prompt, attachments));
+            let composed = crate::harness2_engine::compose_with_plan(composed, proposal.as_deref());
             let name = match answer_bot(state, &thread_id, &turn_id, &bot_id, secrets, model, &effort, &composed, &settings, true, pinned, attachments)? {
                 BotTurn::Paused(note) => {
                     with_db(state, |conn| finish(conn, &thread_id))?;
@@ -206,7 +233,10 @@ pub fn dispatch(state: &AppState, prompt: &str, secrets: &HashMap<String, String
                 already.push(id.clone());
                 match answer_bot(state, &thread_id, &turn_id, &id, secrets, None, &effort, &composed, &settings, false, false, attachments) {
                     Ok(BotTurn::Spoke(_)) => current = id,
-                    Ok(BotTurn::Paused(_)) => break,
+                    Ok(BotTurn::Paused(note)) => {
+                        with_db(state, |conn| finish(conn, &thread_id))?;
+                        return Ok(note);
+                    }
                     Err(error) => {
                         with_db(state, |conn| -> Result<()> {
                             insert_step_in(conn, &thread_id, &turn_id, "assistant", &handle, &error.0, "message", &json!({}), 0)?;
@@ -218,7 +248,7 @@ pub fn dispatch(state: &AppState, prompt: &str, secrets: &HashMap<String, String
             }
             let home = state.home.clone();
             with_db(state, |conn| {
-                crate::harness2_engine::note_mid_run(conn, &home, &thread_id, &turn_id);
+                crate::harness2_engine::note_mid_run(conn, &home, &thread_id, &turn_id, &current);
                 finish(conn, &thread_id)
             })?;
             Ok(name)
@@ -227,9 +257,7 @@ pub fn dispatch(state: &AppState, prompt: &str, secrets: &HashMap<String, String
 }
 
 fn prepare_turn(conn: &Connection, title_source: &str, prompt: &str, provider_override: Option<&str>, effort: Option<&str>, attachments: &[String]) -> Result<AfterPrep> {
-    ensure_thread(conn, title_source, provider_override)?;
-    let thread_id = db::kv_get(conn, "active_thread")?.ok_or_else(|| err("no active thread"))?;
-    db::require_thread(conn, &thread_id)?;
+    let thread_id = turn_thread(conn, title_source, provider_override)?;
     let owner_id: String = conn.query_row("SELECT bot_profile_id FROM chat_threads WHERE id = ?1", params![thread_id], |r| r.get(0))?;
     // Wipe any live-activity markers left by an earlier turn so the pill
     // never shows a stale "working on X" line from before this send.
@@ -260,7 +288,7 @@ fn prepare_turn(conn: &Connection, title_source: &str, prompt: &str, provider_ov
     if !replay {
         insert_step_in(conn, &thread_id, &turn_id, "user", "", &display, "message", &json!({}), 0)?;
     }
-    conn.execute("UPDATE chat_threads SET status = 'running' WHERE id = ?1", params![thread_id])?;
+    conn.execute("UPDATE chat_threads SET status = 'running', updated_at = ?1 WHERE id = ?2", params![now_ms(), thread_id])?;
 
     if !replay {
         if let Some(note) = crate::bots::apply_setup(conn, &bot_id, prompt)? {
@@ -277,6 +305,20 @@ fn prepare_turn(conn: &Connection, title_source: &str, prompt: &str, provider_ov
     }
 
     let settings = db::settings_of(conn)?;
+    if speaker.require_external && speaker.approval_mode != "auto" && crate::bots::external_action(prompt) {
+        let target = crate::bots::clip_target(prompt);
+        if crate::bots::is_denied(conn, &bot_id, "external.send", &target)? {
+            crate::bots::audit(conn, &bot_id, &thread_id, "external.send", &target, "denied_by_rule", "user_deny")?;
+            let note = format!("Denied. {} already has a deny rule for this action.", speaker.handle);
+            insert_step_in(conn, &thread_id, &turn_id, "assistant", &speaker.handle, &note, "message", &json!({}), 0)?;
+            finish(conn, &thread_id)?;
+            return Ok(AfterPrep::Done(note));
+        }
+        crate::bots::hold(conn, &thread_id, &turn_id, &speaker, "external", prompt, None, "external.send", &target)?;
+        finish(conn, &thread_id)?;
+        return Ok(AfterPrep::Done("Held for your approval.".into()));
+    }
+
     if !skip {
         if let Some(amount) = payment_amount(prompt) {
             let target = format!("${amount:.2}");
@@ -303,19 +345,6 @@ fn prepare_turn(conn: &Connection, title_source: &str, prompt: &str, provider_ov
             finish(conn, &thread_id)?;
             return Ok(AfterPrep::Done(note));
         }
-        if speaker.require_external && speaker.approval_mode != "auto" && crate::bots::external_action(prompt) {
-            let target = crate::bots::clip_target(prompt);
-            if crate::bots::is_denied(conn, &bot_id, "external.send", &target)? {
-                crate::bots::audit(conn, &bot_id, &thread_id, "external.send", &target, "denied_by_rule", "user_deny")?;
-                let note = format!("Denied. {} already has a deny rule for this action.", speaker.handle);
-                insert_step_in(conn, &thread_id, &turn_id, "assistant", &speaker.handle, &note, "message", &json!({}), 0)?;
-                finish(conn, &thread_id)?;
-                return Ok(AfterPrep::Done(note));
-            }
-            crate::bots::hold(conn, &thread_id, &turn_id, &speaker, "external", prompt, None, "external.send", &target)?;
-            finish(conn, &thread_id)?;
-            return Ok(AfterPrep::Done("Held for your approval.".into()));
-        }
     }
 
     if prompt.starts_with("/security-audit") || prompt.to_ascii_lowercase().contains("security audit") {
@@ -340,7 +369,7 @@ fn prepare_turn(conn: &Connection, title_source: &str, prompt: &str, provider_ov
 }
 
 fn answer_bot(state: &AppState, thread_id: &str, turn_id: &str, bot_id: &str, secrets: &HashMap<String, String>, model: Option<&str>, effort: &str, composed: &str, settings: &crate::models::Settings, use_composer: bool, pinned: bool, attachments: &[String]) -> Result<BotTurn> {
-    let ready = with_db(state, |conn| -> Result<std::result::Result<(crate::bots::BotFlags, String, String, Vec<Value>), String>> {
+    let ready = with_db(state, |conn| -> Result<std::result::Result<(crate::bots::BotFlags, String, String, Vec<Value>, String), String>> {
         let speaker = crate::bots::flags(conn, bot_id)?;
         if speaker.takeover {
             let note = format!("{} is paused while you have control of its computer.", speaker.handle);
@@ -357,22 +386,58 @@ fn answer_bot(state: &AppState, thread_id: &str, turn_id: &str, bot_id: &str, se
         // failover would answer as some other model while the UI still says
         // @grokbot, so both are bypassed here.
         let bound = matches!(speaker.engine_kind.as_str(), "openai_api" | "subscription");
+        let history_chars: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(LENGTH(content_markdown)), 0) FROM execution_steps WHERE thread_id=?1 AND action_type != 'turn_activity'",
+                params![thread_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        let context_chars = (history_chars.max(0) as usize).saturating_add(composed.len());
         let mut provider_id = if bound {
             speaker.primary.clone()
+        } else if let Some(chosen) = override_model.filter(|value| !crate::chief_delegation::lane_id(value).is_empty()) {
+            chosen
         } else {
-            override_model.filter(|value| !value.is_empty()).unwrap_or(speaker.primary.clone())
+            crate::chief_delegation::pick_turn_account(&speaker.primary, &speaker.long_context, &speaker.fallback, context_chars)
         };
+        if provider_id.trim().is_empty() {
+            let note = format!("{} has no model selected. Choose a model in the chat, or set Primary on the bot profile.", speaker.handle);
+            insert_step_in(conn, thread_id, turn_id, "assistant", &speaker.handle, &note, "message", &json!({}), 0)?;
+            finish(conn, thread_id)?;
+            return Ok(Err(note));
+        }
+        // Remember the requested id on the provider this turn actually chose,
+        // before a quota handoff can swap that provider.
+        if let Some(raw) = model.map(str::trim).filter(|value| !value.is_empty()) {
+            remember_upstream(conn, &provider_id, raw);
+            claim_bot_model(conn, bot_id, raw);
+        }
         // Failover is the Pro entitlement: <50ms handoff when a subscription
         // cap hits mid-task. Starter gets the honest error instead of a silent
         // provider switch; dev builds are entitled.
+        let mut handoff_for_model = String::new();
         if !pinned && !bound && crate::licensing::pro_entitled(conn) {
-            let (next, capsule) = failover(conn, &provider_id, &settings.auto_failover)?;
+            let (next, capsule) = failover(conn, &provider_id, &settings.auto_failover, &speaker.fallback)?;
             provider_id = next;
             if let Some(capsule) = capsule {
-                insert_step_in(conn, thread_id, turn_id, "system", &provider_id, "Quota handoff capsule", "handoff_capsule", &json!({"capsule": capsule}), 8)?;
+                let packed = crate::context_copy::handoff(conn, &state.home, "auto_quota_failover", &capsule);
+                if packed.starts_with("<ronic_context_copy") {
+                    handoff_for_model = packed.clone();
+                }
+                insert_step_in(conn, thread_id, turn_id, "system", &provider_id, "Quota handoff capsule", "handoff_capsule", &json!({"capsule": packed}), 8)?;
             }
         }
-        let memory = crate::memory::prompt_context(conn, composed, Some(bot_id));
+        let _ = crate::bots::open_work(conn, thread_id, composed);
+        let recall = {
+            let (status, goal, _) = crate::bots::read_task(conn, thread_id);
+            if !goal.trim().is_empty() && matches!(status.as_str(), "doing" | "blocked" | "waiting") {
+                format!("{goal}\n{composed}")
+            } else {
+                composed.to_string()
+            }
+        };
+        let memory = crate::memory::prompt_context(conn, &recall, Some(bot_id));
         let home = crate::util::product_home();
         // The role is the user's own words for what this bot is for. It has to
         // reach the model or it only ever lives in the UI.
@@ -383,32 +448,66 @@ fn answer_bot(state: &AppState, thread_id: &str, turn_id: &str, bot_id: &str, se
         } else {
             format!("You are: {}\n\n{}", speaker.role.trim(), speaker.soul)
         };
-        let system = crate::capabilities::system_for(conn, &home, bot_id, &charter, composed, &memory)?;
+        let mut system = crate::capabilities::system_for(conn, &home, bot_id, &charter, composed, &memory)?;
+        if let Some(block) = crate::bots::task_prompt(conn, thread_id) {
+            system.push_str("\n\n");
+            system.push_str(&block);
+        }
+        if let Some(block) = crate::bots::job_prompt(conn, thread_id) {
+            system.push_str("\n\n");
+            system.push_str(&block);
+        }
+        if !handoff_for_model.is_empty() {
+            system.push_str("\n\n");
+            system.push_str(&handoff_for_model);
+        }
         let tools = tool_specs(speaker.allow_code, speaker.allow_computer, speaker.allow_browser, speaker.allow_file);
-        Ok(Ok((speaker, provider_id, system, tools)))
+        let remembered = {
+            let own = remembered_bot_model(conn, bot_id);
+            if !own.is_empty() {
+                own
+            } else {
+                let shared = remembered_upstream(conn, &provider_id);
+                if model_claimed_by_other(conn, bot_id, &shared) { String::new() } else { shared }
+            }
+        };
+        Ok(Ok((speaker, provider_id, system, tools, remembered)))
     })?;
-    let (speaker, mut provider_id, system, tools) = match ready {
+    let (speaker, mut provider_id, system, tools, remembered) = match ready {
         Err(note) => return Ok(BotTurn::Paused(note)),
         Ok(ready) => ready,
     };
-    // Bound bots default to the model they were linked with; the composer can
-    // still pick a different model from that same engine's list.
-    let model = model
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .or_else(|| {
-            if matches!(speaker.engine_kind.as_str(), "openai_api" | "subscription") {
-                let own = speaker.api_model.trim().to_string();
-                if own.is_empty() { None } else { Some(own) }
-            } else {
-                None
-            }
-        });
+    // Bound bots default to the model they were linked with. A turn with no
+    // model argument uses the model this bot claimed, not another bot's.
+    let explicit = model.map(str::trim).filter(|value| !value.is_empty());
+    let model = if let Some(raw) = explicit {
+        let resolved = chosen_model(Some(raw), None);
+        if resolved.is_empty() { None } else { Some(resolved) }
+    } else if matches!(speaker.engine_kind.as_str(), "openai_api" | "subscription") {
+        let own = chosen_model(Some(speaker.api_model.trim()), None);
+        if own.is_empty() { None } else { Some(own) }
+    } else {
+        let resolved = chosen_model(None, Some(remembered.as_str()));
+        if resolved.is_empty() { None } else { Some(resolved) }
+    };
     let started = Instant::now();
     let epoch = turn_epoch();
     // Definition of done for this turn, read once from the user's own words.
-    let contract = crate::coworker::compile_contract(composed);
+    // A loaded skill adds its required tools. The keyword checks stay as they are.
+    let mut contract = crate::coworker::compile_contract(composed);
+    let extra = with_db(state, |conn| -> Vec<String> {
+        let home = crate::util::product_home();
+        let Ok(view) = crate::capabilities::view(conn, &home, bot_id) else {
+            return Vec::new();
+        };
+        let visible: Vec<_> = view
+            .skills
+            .iter()
+            .filter(|skill| crate::capabilities::in_index(skill, bot_id, crate::capabilities::plugin_agent_on(&view.plugins, &skill.plugin_id, bot_id)))
+            .collect();
+        crate::capabilities::required_tools(composed, &visible, &view.plugins, bot_id)
+    });
+    contract.tools.extend(extra);
     let (reply, failed) = match run_turn(state, thread_id, turn_id, bot_id, &provider_id, &system, secrets, model.as_deref(), effort, &tools, speaker.allow_code, speaker.allow_computer, speaker.allow_browser, speaker.allow_file, &contract, composed, attachments) {
         Err(first) if reply_was_cleared(&first) => {
             let _ = with_db(state, |conn| finish(conn, thread_id));
@@ -424,23 +523,30 @@ fn answer_bot(state: &AppState, thread_id: &str, turn_id: &str, bot_id: &str, se
                     let tools_ran: i64 = conn.query_row("SELECT COUNT(*) FROM execution_steps WHERE thread_id=?1 AND turn_id=?2 AND role='tool' AND action_type != 'turn_activity'", params![thread_id, turn_id], |row| row.get(0)).unwrap_or(0);
                     // Bound bots do not silently fail over to another provider:
                     // @grokbot answering through Gemini would be a fake reply.
-                    if pinned || tools_ran > 0 || matches!(speaker.engine_kind.as_str(), "openai_api" | "subscription") {
+                    if pinned || tools_ran > 0 || !settings.auto_failover || matches!(speaker.engine_kind.as_str(), "openai_api" | "subscription") {
                         return Ok(None);
                     }
-                    fallback_of(conn, &provider_id)
+                    Ok(next_account(conn, &provider_id, &speaker.fallback))
                 })?
             };
             if let Some(next) = next {
-                let capsule = capsule_for(composed, &first);
-                with_db(state, |conn| -> Result<()> {
-                    insert_step_in(conn, thread_id, turn_id, "system", &next, "Provider failed over", "handoff_capsule", &json!({"capsule": capsule, "error": first}), 12)?;
-                    Ok(())
+                let home = state.home.clone();
+                let handoff = with_db(state, |conn| -> Result<String> {
+                    let base = capsule_for(composed, &first);
+                    let packed = crate::context_copy::handoff(conn, &home, "auto_5h_quota_failover", &base);
+                    insert_step_in(conn, thread_id, turn_id, "system", &next, "Provider failed over", "handoff_capsule", &json!({"capsule": packed, "error": first}), 12)?;
+                    Ok(packed)
                 })?;
                 provider_id = next;
+                let retry_prompt = if handoff.starts_with("<ronic_context_copy") {
+                    format!("{composed}\n\n{handoff}")
+                } else {
+                    composed.to_string()
+                };
                 // The retry keeps the bot's own tool permissions. Overriding
                 // them here would let a fenced tool call run on failover even
                 // when the bot was configured with every tool disabled.
-                let text = match run_turn(state, thread_id, turn_id, bot_id, &provider_id, &system, secrets, model.as_deref(), effort, &tools, speaker.allow_code, speaker.allow_computer, speaker.allow_browser, speaker.allow_file, &contract, composed, attachments) {
+                let text = match run_turn(state, thread_id, turn_id, bot_id, &provider_id, &system, secrets, model.as_deref(), effort, &tools, speaker.allow_code, speaker.allow_computer, speaker.allow_browser, speaker.allow_file, &contract, &retry_prompt, attachments) {
                     Err(error) if reply_was_cleared(&error) => {
                         let _ = with_db(state, |conn| finish(conn, thread_id));
                         return Ok(BotTurn::Paused(error));
@@ -540,7 +646,7 @@ fn compose_user_text(conn: &Connection, prompt: &str, attachments: &[String]) ->
     // on the absolute path, and only if that also fails to report the specific
     // reason — never to claim it has "no files in memory" or "no access".
     if any_failed {
-        text.push_str("\n\n[ATTACHMENT NOTE] One or more attached files could not be inlined (reason is inline above). First retry by calling read_file with the full absolute path shown next to the failed file — read_file opens attached and Desktop files directly. If read_file also fails, tell the user the specific file and the exact reason in one sentence, then continue answering from the rest of the request. Never say you have no files in memory or no access.");
+        text.push_str("\n\n[ATTACHMENT NOTE] One or more attached files could not be inlined (reason is inline above). First retry by calling read_file with the full absolute path shown next to the failed file — read_file opens a file the user attached in this chat. Project files use a project-relative path, not the bot terminal. If read_file also fails, tell the user the specific file and the exact reason in one sentence, then continue answering from the rest of the request. Never say you have no files in memory or no access.");
     }
     text
 }
@@ -597,9 +703,13 @@ fn run_turn(state: &AppState, thread_id: &str, turn_id: &str, bot_id: &str, prov
     // the definition of done collects real tool proofs as the turn runs.
     let surfaces = crate::coworker::Surfaces { computer: allow_computer, browser: allow_browser, files: allow_code && allow_file };
     let mut dod_proofs: Vec<crate::coworker::Proof> = Vec::new();
+    let mut ran_tools: Vec<String> = Vec::new();
     // Live-activity writes are deduped: the pill only re-renders when the
     // detail actually changes, so identical consecutive markers skip the DB.
     let mut last_activity = String::new();
+    // A stuck browser step keeps its reason on the pill through the next model
+    // call. A generic "evaluating" line was hiding why the turn had stopped.
+    let mut hold_status = String::new();
     let mut note_activity = |conn: &rusqlite::Connection, detail: &str| {
         if detail != last_activity {
             last_activity.clear();
@@ -613,7 +723,12 @@ fn run_turn(state: &AppState, thread_id: &str, turn_id: &str, bot_id: &str, prov
             return Err("The reply was cleared. Send the question again.".into());
         }
         if _round > 0 {
-            with_db(state, |conn| note_activity(conn, "evaluating tool results and planning next step..."));
+            let detail = if hold_status.is_empty() {
+                "evaluating tool results and planning next step...".to_string()
+            } else {
+                hold_status.clone()
+            };
+            with_db(state, |conn| note_activity(conn, &detail));
         } else {
             with_db(state, |conn| note_activity(conn, "consulting model for next action..."));
         }
@@ -676,7 +791,7 @@ fn run_turn(state: &AppState, thread_id: &str, turn_id: &str, bot_id: &str, prov
                     last_failure = None;
                     continue;
                 }
-                if let Some(missing) = contract.unmet(&dod_proofs) {
+                if let Some(missing) = contract.unmet_with(&dod_proofs, &ran_tools) {
                     gates_injected += 1;
                     let required = contract.requirement_line().unwrap_or_default();
                     messages.push(ChatMsg::new(
@@ -721,19 +836,18 @@ fn run_turn(state: &AppState, thread_id: &str, turn_id: &str, bot_id: &str, prov
             }
             if calls.is_empty() {
                 note_coworker_lesson(state, bot_id, &mut first_failure, last_failure.is_some());
-                if !text.is_empty() {
-                    return Ok(text);
-                }
-                if tools_executed_total > 0 && !last_text.trim().is_empty() {
-                    return Ok(format!("{}\n\n(Finished executing tools. See details above.)", last_text));
-                }
-                if !last_text.trim().is_empty() {
-                    return Ok(last_text);
-                }
-                if tools_executed_total > 0 {
-                    return Ok("Finished executing the requested tools. Please check the steps above.".into());
-                }
-                return Ok("I have processed your request. Please let me know if you would like me to proceed or need more information.".into());
+                let text = if !text.is_empty() {
+                    text
+                } else if tools_executed_total > 0 && !last_text.trim().is_empty() {
+                    format!("{}\n\n(Finished executing tools. See details above.)", last_text)
+                } else if !last_text.trim().is_empty() {
+                    last_text.clone()
+                } else if tools_executed_total > 0 {
+                    "Finished executing the requested tools. Please check the steps above.".into()
+                } else {
+                    "I have processed your request. Please let me know if you would like me to proceed or need more information.".into()
+                };
+                return Ok(close_reply(state, thread_id, turn_id, current_user_text, contract, &dod_proofs, &ran_tools, text));
             }
         }
         if !completion.text.trim().is_empty() {
@@ -754,7 +868,6 @@ fn run_turn(state: &AppState, thread_id: &str, turn_id: &str, bot_id: &str, prov
             }
             Ok(())
         })?;
-        let mut calls = calls;
         for (index, call) in calls.iter_mut().enumerate() {
             if call.id.trim().is_empty() {
                 call.id = format!("call_{index}_{}", crate::util::nid("tc"));
@@ -776,6 +889,14 @@ fn run_turn(state: &AppState, thread_id: &str, turn_id: &str, bot_id: &str, prov
                 "install_skill" => "installing skill from source...".into(),
                 "install_plugin" => "installing plugin from source...".into(),
                 "connect_mcp" => "connecting MCP server...".into(),
+                "inspect_page" | "read_page" | "click_control" | "type_text" | "scroll_page" | "find_control" | "wait_for" | "computer_shell" => {
+                    let args_preview = serde_json::from_str::<Value>(&call.arguments).unwrap_or_else(|_| json!({}));
+                    let bit = args_preview
+                        .as_object()
+                        .and_then(|obj| obj.values().find_map(|value| value.as_str().map(str::to_owned)))
+                        .unwrap_or_default();
+                    crate::computer_subsystem::live_browser_status(&call.name, &bit)
+                }
                 _ => {
                     let args_preview = serde_json::from_str::<Value>(&call.arguments).unwrap_or_else(|_| json!({}));
                     let bit = args_preview
@@ -790,9 +911,9 @@ fn run_turn(state: &AppState, thread_id: &str, turn_id: &str, bot_id: &str, prov
             if turn_epoch() != epoch {
                 return Err("The reply was cleared. Send the question again.".into());
             }
-            tools_executed_total += 1;
-            let args = serde_json::from_str::<Value>(&call.arguments).unwrap_or_else(|_| json!({}));
             let started = Instant::now();
+            let args = serde_json::from_str::<Value>(&call.arguments).unwrap_or_else(|_| json!({}));
+            tools_executed_total += 1;
             // Dead-loop guard: a third identical attempt at an action that
             // already failed twice never reaches the tool layer. The model
             // receives the block as the tool result and must pivot.
@@ -825,11 +946,27 @@ fn run_turn(state: &AppState, thread_id: &str, turn_id: &str, bot_id: &str, prov
                 output.push_str(&format!("\n\n[SYSTEM PIVOT DIRECTIVE] {}", pivot.directive));
             } else if !blocked {
                 last_failure = None;
+                if !ran_tools.iter().any(|ran| ran == &name) {
+                    ran_tools.push(name.clone());
+                }
+                if name == "call_mcp" {
+                    if let Some(inner) = args.get("tool").and_then(|value| value.as_str()).map(str::trim).filter(|value| !value.is_empty()) {
+                        if !ran_tools.iter().any(|ran| ran == inner) {
+                            ran_tools.push(inner.to_string());
+                        }
+                    }
+                }
                 if let Some(proof) = crate::coworker::proof_of(&name, &payload, false) {
                     if !dod_proofs.contains(&proof) {
                         dod_proofs.push(proof);
                     }
                 }
+            }
+            if let Some(line) = crate::computer_subsystem::stuck_line(&output) {
+                hold_status = line.clone();
+                with_db(state, |conn| note_activity(conn, &line));
+            } else if !failed {
+                hold_status.clear();
             }
             with_db(state, |conn| -> std::result::Result<(), String> {
                 if !blocked {
@@ -860,16 +997,29 @@ fn run_turn(state: &AppState, thread_id: &str, turn_id: &str, bot_id: &str, prov
         if let Ok(synthesis) = answer(state, provider_id, &messages, secrets, model, effort, &[]) {
             let syn_text = synthesis.text.trim().to_string();
             if !syn_text.is_empty() {
-                return Ok(syn_text);
+                return Ok(close_reply(state, thread_id, turn_id, current_user_text, contract, &dod_proofs, &ran_tools, syn_text));
             }
         }
     }
 
-    Ok(if last_text.trim().is_empty() {
+    let text = if last_text.trim().is_empty() {
         "Finished tool execution. See the tool cards above for what ran.".into()
     } else {
         last_text
-    })
+    };
+    Ok(close_reply(state, thread_id, turn_id, current_user_text, contract, &dod_proofs, &ran_tools, text))
+}
+
+fn close_reply(state: &AppState, thread_id: &str, turn_id: &str, user_text: &str, contract: &crate::coworker::Contract, proofs: &[crate::coworker::Proof], ran: &[String], text: String) -> String {
+    let missing = contract.unmet_with(proofs, ran);
+    let text = if let Some(missing) = missing.as_ref() {
+        if text.contains(missing.as_str()) { text } else { format!("{text}\n\nStill open: {missing}.") }
+    } else {
+        text
+    };
+    let checks_open = !contract.checks.is_empty() || !contract.tools.is_empty();
+    let _ = with_db(state, |conn| crate::bots::settle_task(conn, thread_id, turn_id, user_text, checks_open, missing.as_deref()));
+    text
 }
 
 fn task_title(prompt: &str) -> String {
@@ -877,6 +1027,17 @@ fn task_title(prompt: &str) -> String {
     let title: String = line.chars().take(36).collect();
     let title = title.trim().to_string();
     if title.is_empty() { "New task".to_string() } else { title }
+}
+
+fn turn_thread(conn: &Connection, title_source: &str, provider_override: Option<&str>) -> Result<String> {
+    if let Some(id) = pinned_thread() {
+        db::require_thread(conn, &id)?;
+        return Ok(id);
+    }
+    ensure_thread(conn, title_source, provider_override)?;
+    let thread_id = db::kv_get(conn, "active_thread")?.ok_or_else(|| err("no active thread"))?;
+    db::require_thread(conn, &thread_id)?;
+    Ok(thread_id)
 }
 
 fn ensure_thread(conn: &Connection, prompt: &str, provider_override: Option<&str>) -> Result<()> {
@@ -918,7 +1079,7 @@ pub(crate) fn ensure_profile(conn: &Connection) -> Result<String> {
     }
     let id = crate::util::nid("bot");
     conn.execute(
-        "INSERT INTO bot_profiles (id, handle, display_name, avatar, soul_markdown, primary_account_id, long_context_account_id, fallback_account_id, allow_computer_use, allow_browser_use, allow_code_exec, scoped_obsidian_folder, daily_wallet_limit_usd, is_pinned, role, created_at) VALUES (?1,'@local','Local operator','NW','Local operator. Created when a message was sent with no bot selected.','prov_ollama','prov_gemini','prov_openrouter',1,1,1,'',5,1,'Local operator',?2)",
+        "INSERT INTO bot_profiles (id, handle, display_name, avatar, soul_markdown, primary_account_id, long_context_account_id, fallback_account_id, allow_computer_use, allow_browser_use, allow_code_exec, scoped_obsidian_folder, daily_wallet_limit_usd, is_pinned, role, created_at) VALUES (?1,'@local','Local operator','NW','Local operator. Created when a message was sent with no bot selected.','','','',1,1,1,'',5,1,'Local operator',?2)",
         params![id, now_ms()],
     )?;
     db::kv_set(conn, "active_profile", &id)?;
@@ -928,9 +1089,14 @@ pub(crate) fn ensure_profile(conn: &Connection) -> Result<String> {
 fn finish(conn: &Connection, thread_id: &str) -> Result<()> {
     conn.execute("DELETE FROM execution_steps WHERE action_type = 'turn_activity' AND thread_id = ?1", params![thread_id])?;
     let capsule = thread_capsule(conn, thread_id)?;
+    let status: String = conn.query_row("SELECT status FROM chat_threads WHERE id=?1", params![thread_id], |row| row.get(0))?;
+    let next = match status.as_str() {
+        "doing" | "blocked" | "waiting" => status,
+        _ => "completed".into(),
+    };
     conn.execute(
-        "UPDATE chat_threads SET status = 'completed', compacted_context_capsule = ?1, updated_at = ?2 WHERE id = ?3",
-        params![capsule, now_ms(), thread_id],
+        "UPDATE chat_threads SET status = ?1, compacted_context_capsule = ?2, updated_at = ?3 WHERE id = ?4",
+        params![next, capsule, now_ms(), thread_id],
     )?;
     Ok(())
 }
@@ -960,7 +1126,7 @@ fn clip(s: &str, n: usize) -> String {
     t
 }
 
-fn failover(conn: &Connection, provider_id: &str, auto: &bool) -> Result<(String, Option<String>)> {
+fn failover(conn: &Connection, provider_id: &str, auto: &bool, profile_fallback: &str) -> Result<(String, Option<String>)> {
     if !auto {
         return Ok((provider_id.to_string(), None));
     }
@@ -968,9 +1134,41 @@ fn failover(conn: &Connection, provider_id: &str, auto: &bool) -> Result<(String
     if quota < 100.0 {
         return Ok((provider_id.to_string(), None));
     }
-    match fallback_of(conn, provider_id)? {
-        Some(next) => Ok((next.clone(), Some(capsule_for("continue the active task", "previous provider quota is marked full")))),
+    match next_account(conn, provider_id, profile_fallback) {
+        Some(next) => Ok((next, Some(capsule_for("continue the active task", "previous provider quota is marked full")))),
         None => Ok((provider_id.to_string(), None)),
+    }
+}
+
+/// The bot's Fallback lane wins when it is a different provider that can
+/// answer. Otherwise use the provider account's own fallback.
+fn next_account(conn: &Connection, current: &str, profile_fallback: &str) -> Option<String> {
+    let preferred = crate::chief_delegation::lane_id(profile_fallback);
+    if !preferred.is_empty() && preferred != current {
+        if let Some(next) = usable_account(conn, preferred) {
+            return Some(next);
+        }
+    }
+    fallback_of(conn, current).ok().flatten().filter(|next| next != current)
+}
+
+fn usable_account(conn: &Connection, id: &str) -> Option<String> {
+    let id = crate::chief_delegation::lane_id(id);
+    if id.is_empty() {
+        return None;
+    }
+    let ready: Option<(String, i64)> = conn
+        .query_row(
+            "SELECT provider_type, has_secret FROM provider_accounts WHERE id = ?1",
+            params![id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .ok();
+    let (kind, has_secret) = ready?;
+    if kind == "local_ollama" || has_secret != 0 {
+        Some(id.to_string())
+    } else {
+        None
     }
 }
 
@@ -1068,9 +1266,59 @@ fn record_tool(conn: &Connection, bot_id: &str, thread_id: &str, name: &str, arg
 
 fn tool_specs(allow_code: bool, allow_computer: bool, allow_browser: bool, allow_file: bool) -> Vec<Value> {
     let mut tools = vec![
-        tool_spec("list_memory", "List workspace memories.", &[]),
-        tool_spec("search_memory", "Search memory titles and body text.", &["query"]),
-        tool_spec("save_memory", "Save a memory onto the Memory screen.", &["title", "content"]),
+        tool_spec("list_memory", "List workspace memories as short structured markdown cards.", &[]),
+        tool_spec("search_memory", "Search memory titles and body text. Each hit is a short structured markdown card.", &["query"]),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "save_memory",
+                "description": "Save or update a memory on the Memory screen. The same title, or an id from list_memory, updates that note in place. The update keeps its vault, file, scope, and graph links. It does not add a second copy. The save rewrites a structured markdown sheet. Edit with this tool, not by rewriting the file.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "title": { "type": "string" },
+                        "content": { "type": "string" },
+                        "id": { "type": "string", "description": "Existing memory id from list_memory. Omit to match by title." }
+                    },
+                    "required": ["title", "content"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "curate_memory",
+                "description": "Add, replace, or remove one short always-on fact. target is user (who the operator is, 1375 characters), memory (environment, 2200 characters), or bot (this bot only, 1800 characters). action is add, replace, or remove. replace and remove need oldText, a unique piece of one fact. add and replace need content, one line. A write over the cap is refused and nothing is saved. This does not change vault notes.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "target": { "type": "string" },
+                        "action": { "type": "string" },
+                        "content": { "type": "string" },
+                        "oldText": { "type": "string" }
+                    },
+                    "required": ["target", "action"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "update_memory_graph",
+                "description": "Add, change, or remove one graph link on an existing memory. This does not rewrite the note. title or id picks the note. target is the other entity. relation defaults to RELATES. remove=true deletes that one link.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "title": { "type": "string" },
+                        "id": { "type": "string" },
+                        "target": { "type": "string" },
+                        "relation": { "type": "string" },
+                        "remove": { "type": "boolean" }
+                    },
+                    "required": ["target"]
+                }
+            }
+        }),
         tool_spec("list_skills", "List the skill index for this profile.", &[]),
         tool_spec("load_skill", "Load one skill playbook.", &["slug"]),
         tool_spec("load_skill_file", "Load one supporting skill file.", &["slug", "path"]),
@@ -1078,35 +1326,103 @@ fn tool_specs(allow_code: bool, allow_computer: bool, allow_browser: bool, allow
         tool_spec("list_providers", "List providers and their status.", &[]),
         tool_spec("list_threads", "List chat tasks.", &[]),
         tool_spec("list_mcp", "List MCP servers saved in this workspace. This does not start them.", &[]),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "call_mcp",
+                "description": "Call a tool on a trusted remote MCP server. server is the saved name. tool is the tool name. params is a JSON object of that tool's arguments. This does not start a local command server.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "server": { "type": "string" },
+                        "tool": { "type": "string" },
+                        "params": { "type": "string", "description": "JSON object" }
+                    },
+                    "required": ["server", "tool"]
+                }
+            }
+        }),
+        tool_spec("set_task", "Record this chat's open task. status is doing, blocked, waiting, or done. next is the next step. Call this when the job is still open or when it is actually finished.", &["status", "next"]),
         tool_spec("list_plugins", "List plugins and whether each one is on for this bot.", &[]),
         tool_spec("install_skill", "Download and install any skill or playbook (from a GitHub repository URL, raw file link, web URL, or marketplace catalog slug) and enable it for this bot immediately. Call this whenever the user asks to add, download, or install a skill.", &["source"]),
         tool_spec("install_plugin", "Download and install any plugin (from a GitHub repository URL, git clone link, or package source), trust it, and enable it for this bot immediately. Call this whenever the user asks to add, download, or install a plugin.", &["source"]),
-        tool_spec("connect_mcp", "Connect, trust, and enable an MCP server for this bot so it is immediately active. Give name, transport ('stdio' or 'sse'), command (for stdio, e.g. 'npx -y @modelcontextprotocol/server-filesystem'), args, or url (for sse). Call this whenever the user asks to connect or set up an MCP server.", &["name"]),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "connect_mcp",
+                "description": "Save and trust an MCP server for this bot. name can be a catalog name (Notion, notion-mcp, mcp-notion, filesystem-mcp, Apollo.io) and fills the server when command and url are empty. An https URL with no command is a remote server. A non-local remote server needs secret. Saving a server does not prove the provider accepted the key; the Marketplace screen runs that check.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" },
+                        "transport": { "type": "string" },
+                        "command": { "type": "string" },
+                        "args": { "type": "string", "description": "JSON array or a space-separated command tail" },
+                        "url": { "type": "string" },
+                        "secret": { "type": "string" }
+                    },
+                    "required": ["name"]
+                }
+            }
+        }),
         tool_spec("save_workflow", "Save a task as a workflow on the Workflows screen. steps is one step per line: 'Title | instruction'. schedule is \"\" for an idle workflow a person starts by hand, or daily HH:MM, every 15m, every 1h, or a daily cron like 0 8 * * *.", &["name", "steps", "schedule"]),
-        tool_spec("schedule_routine", "Repeat this chat on a timer while Ronic OS is open. schedule is daily HH:MM, every 15m, every 1h, or a daily cron like 0 8 * * *.", &["schedule"]),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "schedule_routine",
+                "description": "Repeat this chat on a timer while Ronic OS is open. schedule is daily HH:MM, every 15m, every 1h, or a daily cron like 0 8 * * *. job is the full instruction that will run. Passing job replaces the stored job with that text. If job only adds a requirement (also, and, add, plus, include), the stored job is kept and that line is added once. Omit job to leave the stored job unchanged. The same schedule does not reset the timer.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "schedule": { "type": "string" },
+                        "job": { "type": "string" }
+                    },
+                    "required": ["schedule"]
+                }
+            }
+        }),
     ];
     if allow_code {
-        tools.push(tool_spec("read_file", "Read a text file. Give a project-relative path inside the project folder, or the absolute path of a file the user attached in this chat. Absolute paths outside the attached files are refused.", &["path"]));
-        tools.push(tool_spec("list_files", "List a folder. Give a project-relative path, or the absolute path of a folder the user attached in this chat.", &["path"]));
+        tools.push(tool_spec("read_file", "Read a text file in the project folder named by Context injection. Give a project-relative path. An absolute path works only for a file the user attached in this chat. The bot terminal cannot open this folder.", &["path"]));
+        tools.push(tool_spec("list_files", "List the project folder named by Context injection. An empty path lists that folder. A relative path stays inside it. An absolute path works only for a folder the user attached in this chat.", &["path"]));
         if allow_file {
             tools.push(tool_spec("propose_diff", "Propose a file write. It is not saved until a person accepts the diff.", &["path", "body"]));
         }
     }
     if allow_computer {
-        tools.push(tool_spec("terminal_command", "Run an allowlisted command in this bot's own workspace folder. It cannot read another bot's files or the user's profile.", &["command"]));
-        tools.push(tool_spec("sandbox_command", "Run an allowlisted command in this bot's own workspace folder. Output stays on this bot's computer.", &["command"]));
+        tools.push(tool_spec("terminal_command", "Run an allowlisted command in this bot's own workspace folder. That folder is not the project folder. It cannot read the project, another bot's files, or the user's profile. Read the project with list_files and read_file.", &["command"]));
+        tools.push(tool_spec("sandbox_command", "Run an allowlisted command in this bot's own workspace folder. Output stays on this bot's computer. This is not the project folder.", &["command"]));
         tools.push(tool_spec("terminal_write", "Send raw keystrokes to the workspace terminal session.", &["data"]));
-        tools.push(tool_spec("desktop_app", "Control and launch desktop applications on this computer (VS Code, Cursor, Claude Code, Obsidian, Ollama, or any local desktop app). Actions: 'list' (list desktop apps and status), 'open' (launch/open the desktop app), 'inspect' (read UI controls and windows using Windows UIAutomation), 'click' (click an interface control), 'type' (type text into a desktop window), 'status'.", &["action"]));
+        tools.push(json!({
+            "type": "function",
+            "function": {
+                "name": "desktop_app",
+                "description": "Control a desktop application on this computer. action is list, open, inspect, click, type, or status. inspect reads the live window (window, or the foreground window) and returns mark ids. It does not invent controls. click takes mark_id or match. type needs text plus mark_id or match. open takes app.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string"},
+                        "app": {"type": "string"},
+                        "window": {"type": "string"},
+                        "mark_id": {"type": "string"},
+                        "match": {"type": "string"},
+                        "text": {"type": "string"},
+                        "path": {"type": "string"}
+                    },
+                    "required": ["action"]
+                }
+            }
+        }));
     }
     if allow_browser {
         tools.push(tool_spec("workspace_webapp", "Access, inspect, and auto-control the webapps running inside this workspace right beside your chat (like ChatGPT, Claude, Gemini, Perplexity, or custom webapps). Use this to control the user's workspace session. Actions: 'list' (list available & open webapps), 'open' (open/switch a webapp beside you on the right side), 'read' (read the current page text, title, url, and numbered interactive controls), 'click' (click a button or control by id or match text), 'type' (type text into an input by id), 'submit' (submit/press enter on an input), 'scroll' (scroll up/down), 'eval' (evaluate JavaScript), 'close'.", &["action"]));
-        tools.push(tool_spec("inspect_page", "Open an https page, or http on localhost, as a tab in this bot's own mini computer's Chrome (a visible window with its own isolated browser profile and desktop) and read its text and controls. The user sees this window.", &["url"]));
-        tools.push(tool_spec("read_page", "Read the page already open in this bot's mini computer window: text, numbered visible controls, and (when a video is present) whether it is actually playing. Usually not needed right after inspect_page, click_control, or type_text: those already return the fresh page state.", &[]));
-        tools.push(tool_spec("click_control", "Click in this bot's mini computer window. Give id (the number from the last read) OR match (text to look for, like \"add to cart\" — the window picks and clicks the best visible match itself and reports what it clicked). Clicks are synthetic; the user's mouse never moves. Returns the fresh page state.", &["id"]));
-        tools.push(tool_spec("type_text", "Type into a text field in this bot's mini computer window. id is the control. text is what to type. Returns the fresh page state.", &["id", "text"]));
-        tools.push(tool_spec("scroll_page", "Scroll the page in this bot's mini computer window one viewport down (or up) and return the fresh state. Use it to reach buttons and fields below the fold.", &["direction"]));
+        tools.push(tool_spec("inspect_page", "Open an https page, or http on localhost, as a tab in this bot's own mini computer's Chrome (a visible window) and read its text and controls. The user sees this window. Site sign-in is shared: a login in any bot's browser is reused by the other bots, so do not ask the user to sign in again if another bot already did. If the result starts with Stuck:, say that reason to the user and whether the turn is still running.", &["url"]));
+        tools.push(tool_spec("read_page", "Read the page already open in this bot's mini computer window: text, numbered visible controls, and (when a video is present) whether it is actually playing. An ad is not the video — the window presses Skip as soon as that button appears. Usually not needed right after inspect_page, click_control, or type_text: those already return the fresh page state. A line starting with Stuck: is the reason the prompt cannot be written yet.", &[]));
+        tools.push(tool_spec("click_control", "Click in this bot's mini computer window. Give id (the number from the last read) OR match (text to look for, like \"add to cart\" or \"Create\" — the window picks and clicks the best visible match itself and reports what it clicked). A link is opened directly. An ad covering the page is skipped first. Clicks are synthetic; the user's mouse never moves. Returns the fresh page state.", &["id"]));
+        tools.push(tool_spec("type_text", "Type into a text field in this bot's mini computer window. id is the control from the last read (use the one labeled prompt on Google Flow). text is what to type. Context injection appends the Ronic OS connection pack to a real prompt on any composer that is not a team message (Slack, Discord, Teams, Telegram, WhatsApp, or mail). Those sites keep the login and do not get the pack written into the message. Every tool result also carries the project folder and signed-in sites. The write uses the page's real composer and fails if the text does not stick. Returns the fresh page state. On Flow, click Create after a successful write.", &["id", "text"]));
+        tools.push(tool_spec("scroll_page", "Scroll the page in this bot's mini computer window one viewport down (or up) and return the fresh state. Scrolls the panel under the middle of the window when the page itself does not move. Use it to reach buttons and fields below the fold.", &["direction"]));
         tools.push(tool_spec("find_control", "Search the page for visible controls matching the query, ranked best-first, like find \"checkout\". Returns numbered ids you can click or type into immediately.", &["query"]));
-        tools.push(tool_spec("wait_for", "Wait efficiently instead of re-reading: pause until a control matching query appears on the page, or — with media: \"playing\" — until the page's video is actually playing. ms caps the wait (default 6000). Use after a click that opens or loads something.", &["query"]));
+        tools.push(tool_spec("wait_for", "Wait efficiently instead of re-reading: pause until a control matching query appears on the page, or — with media: \"playing\" — until the real video is playing. An ad does not count; Skip is pressed as soon as it appears. If the ad has no Skip button, leave the page instead of watching it. ms caps the wait (default 6000, longer when waiting on a video). Use after a click that opens or loads something.", &["query"]));
         tools.push(tool_spec("computer_shell", "Drive your mini computer's DESKTOP itself: action open_app (app: chrome | files | terminal | desktop), open_tab (url), focus_tab (tabId), close_tab (tabId), list_tabs, back, forward, reload, or status. Use it to work across your whole computer — read files, run something in the terminal, then return to the browser — instead of living in one page.", &["action"]));
     }
     tools
@@ -1323,7 +1639,31 @@ fn fence_call(text: &str) -> Option<ToolCall> {
     calls.into_iter().next()
 }
 
+
 fn execute_tool(state: &AppState, thread_id: &str, bot_id: &str, name: &str, args: &Value, allow_code: bool, allow_computer: bool, allow_browser: bool, allow_file: bool, attachments: &[String]) -> (String, Value, String) {
+    let (kind, payload, text) = execute_tool_raw(state, thread_id, bot_id, name, args, allow_code, allow_computer, allow_browser, allow_file, attachments);
+    if text.starts_with("That tool is off") || text.starts_with("File write is off") || text.starts_with("That computer belongs to another bot.") {
+        return (kind, payload, text);
+    }
+    (kind, payload, attach_injection(state, text))
+}
+
+fn attach_injection(state: &AppState, text: String) -> String {
+    if text.contains("Context injection applies to every tool") || text.contains("Context injection:\n") {
+        return text;
+    }
+    let home = state.home.clone();
+    let footer = with_db(state, |conn| {
+        let project = crate::db::settings_of(conn).map(|settings| settings.project_root).unwrap_or_default();
+        crate::workspace_bridge::injection_footer(&project, &home)
+    });
+    if footer.is_empty() {
+        return text;
+    }
+    format!("{text}\n\n{footer}")
+}
+
+fn execute_tool_raw(state: &AppState, thread_id: &str, bot_id: &str, name: &str, args: &Value, allow_code: bool, allow_computer: bool, allow_browser: bool, allow_file: bool, attachments: &[String]) -> (String, Value, String) {
     let refused = ("message".into(), json!({}), "That tool is off for this bot.".into());
     let file_off = ("message".into(), json!({}), "File write is off for this bot.".into());
     match name {
@@ -1648,26 +1988,34 @@ fn execute_tool(state: &AppState, thread_id: &str, bot_id: &str, name: &str, arg
                                 "name": n.name,
                                 "type": n.control_type,
                                 "rect": n.bounds,
-                                "center": n.center_xy
+                                "center": n.center_xy,
+                                "origin": n.origin
                             })).collect();
-                            ("desktop_app".into(), json!({"nodes": summary}), format!("Inspected window controls for '{}':\n{}", filter, serde_json::to_string_pretty(&json!(summary)).unwrap_or_default()))
+                            let window = crate::computer_subsystem::last_desktop_window();
+                            ("desktop_app".into(), json!({"window": window, "nodes": summary}), format!("Inspected live controls for '{window}':\n{}", serde_json::to_string_pretty(&json!(summary)).unwrap_or_default()))
                         }
                         Err(err) => ("message".into(), json!({}), format!("Failed to inspect desktop window: {}", err.0)),
                     }
                 }
-                "click" => {
-                    let mark_id = args.get("mark_id").or_else(|| args.get("id")).and_then(|v| v.as_u64()).map(|n| n as u32).unwrap_or(1);
-                    match crate::computer_subsystem::som_click_sync(mark_id) {
+                "click" => match crate::computer_subsystem::resolve_desktop_mark(args) {
+                    Ok(mark_id) => match crate::computer_subsystem::som_click_sync(mark_id) {
                         Ok(msg) => ("desktop_app".into(), json!({"mark_id": mark_id, "action": "click"}), msg),
                         Err(err) => ("message".into(), json!({}), format!("Click failed: {err}")),
-                    }
-                }
+                    },
+                    Err(err) => ("message".into(), json!({}), format!("Click failed: {err}")),
+                },
                 "type" => {
-                    let mark_id = args.get("mark_id").or_else(|| args.get("id")).and_then(|v| v.as_u64()).map(|n| n as u32).unwrap_or(1);
                     let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                    match crate::computer_subsystem::som_type_sync(mark_id, text) {
-                        Ok(msg) => ("desktop_app".into(), json!({"mark_id": mark_id, "action": "type"}), msg),
-                        Err(err) => ("message".into(), json!({}), format!("Type failed: {err}")),
+                    if text.is_empty() {
+                        ("message".into(), json!({}), "Type failed: type needs the text to write".into())
+                    } else {
+                        match crate::computer_subsystem::resolve_desktop_mark(args) {
+                            Ok(mark_id) => match crate::computer_subsystem::som_type_sync(mark_id, text) {
+                                Ok(msg) => ("desktop_app".into(), json!({"mark_id": mark_id, "action": "type"}), msg),
+                                Err(err) => ("message".into(), json!({}), format!("Type failed: {err}")),
+                            },
+                            Err(err) => ("message".into(), json!({}), format!("Type failed: {err}")),
+                        }
                     }
                 }
                 "status" => {
@@ -1700,7 +2048,7 @@ fn execute_tool(state: &AppState, thread_id: &str, bot_id: &str, name: &str, arg
             let transport = args.get("transport").and_then(|v| v.as_str());
             let command = args.get("command").or_else(|| args.get("cmd")).and_then(|v| v.as_str());
             let url = args.get("url").or_else(|| args.get("endpoint")).and_then(|v| v.as_str());
-            let secret = args.get("secret").or_else(|| args.get("apiKey")).and_then(|v| v.as_str());
+            let secret = args.get("secret").or_else(|| args.get("apiKey")).or_else(|| args.get("api_key")).or_else(|| args.get("token")).and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
             let args_list: Vec<String> = if let Some(arr) = args.get("args").and_then(|v| v.as_array()) {
                 arr.iter().filter_map(|s| s.as_str().map(str::to_string)).collect()
             } else if let Some(s) = args.get("args").and_then(|v| v.as_str()) {
@@ -1709,12 +2057,24 @@ fn execute_tool(state: &AppState, thread_id: &str, bot_id: &str, name: &str, arg
                 Vec::new()
             };
             let home = state.home.clone();
-            with_db(state, |conn| match crate::capabilities::connect_mcp_server(conn, &home, bot_id, name, transport, command, &args_list, url, secret) {
-                Ok(msg) => ("mcp_connect".into(), json!({"name": name, "status": "connected"}), msg),
+            with_db(state, |conn| match crate::capabilities::connect_mcp_server(conn, &home, bot_id, name, transport, command, &args_list, url, Some(secret.as_str())) {
+                Ok(done) => {
+                    let mut note = done.note;
+                    if !secret.is_empty() {
+                        let key_guard = state.vault_key.lock().unwrap_or_else(|error| error.into_inner());
+                        let mut secrets = state.secrets.lock().unwrap_or_else(|error| error.into_inner());
+                        secrets.insert(format!("mcp:{}", done.id), secret.clone());
+                        match crate::vault::persist(&home, conn, key_guard.as_ref(), &secrets) {
+                            Ok(()) => note.push_str(" The credential is in the vault."),
+                            Err(error) => return ("message".into(), json!({}), format!("The server was saved, but the credential was not: {}", error.0)),
+                        }
+                    }
+                    ("mcp_connect".into(), json!({"name": name, "id": done.id, "status": "saved"}), note)
+                }
                 Err(error) => ("message".into(), json!({}), error.0),
             })
         }
-        "list_memory" | "search_memory" | "save_memory" | "list_skills" | "load_skill" | "load_skill_file" | "skill_manage" | "list_providers" | "list_threads" | "list_mcp" | "list_plugins" | "read_file" | "list_files" => {
+        "list_memory" | "search_memory" | "save_memory" | "curate_memory" | "update_memory_graph" | "list_skills" | "load_skill" | "load_skill_file" | "skill_manage" | "list_providers" | "list_threads" | "list_mcp" | "list_plugins" | "read_file" | "list_files" => {
             with_db(state, |conn| match crate::workspace_bridge::run_chat_tool_with_attachments(conn, name, args, attachments) {
                 Ok(text) => ("message".into(), json!({}), text),
                 Err(error) => ("message".into(), json!({}), error),
@@ -1730,15 +2090,45 @@ fn execute_tool(state: &AppState, thread_id: &str, bot_id: &str, name: &str, arg
                 Err(error) => ("message".into(), json!({}), error),
             })
         }
+        "set_task" => {
+            let status = args.get("status").and_then(|item| item.as_str()).unwrap_or("").trim().to_string();
+            let next = args.get("next").and_then(|item| item.as_str()).unwrap_or("").trim().to_string();
+            let goal = args.get("goal").and_then(|item| item.as_str()).unwrap_or("").trim().to_string();
+            with_db(state, |conn| match crate::bots::write_task(conn, thread_id, &status, &goal, &next) {
+                Ok(()) => ("task".into(), json!({"status": status}), format!("Task saved as {status}.")),
+                Err(error) => ("message".into(), json!({}), error.0),
+            })
+        }
+        "call_mcp" => {
+            let server = args.get("server").and_then(|item| item.as_str()).unwrap_or("").trim().to_string();
+            let tool = args.get("tool").and_then(|item| item.as_str()).unwrap_or("").trim().to_string();
+            let params = match args.get("params") {
+                Some(Value::String(text)) => serde_json::from_str(text).unwrap_or_else(|_| json!({})),
+                Some(other) => other.clone(),
+                None => json!({}),
+            };
+            let home = state.home.clone();
+            with_db(state, |conn| match crate::code_mode::mcp_call(conn, &home, bot_id, &server, &tool, params) {
+                Ok(value) => ("mcp_call".into(), value.clone(), value.to_string()),
+                Err(error) => ("message".into(), json!({}), error),
+            })
+        }
         "schedule_routine" => {
             let raw = args.get("schedule").and_then(|item| item.as_str()).unwrap_or("");
+            let job = args.get("job").and_then(|item| item.as_str()).unwrap_or("").trim().to_string();
             match crate::coworker::normalize_schedule(raw) {
-                Some(schedule) => with_db(state, |conn| match crate::bots::set_routine(conn, thread_id, &schedule) {
-                    Ok(()) => (
-                        "routine".into(),
-                        json!({"threadId": thread_id, "schedule": schedule}),
-                        format!("This chat now runs {schedule} while Ronic OS is open. Change or clear it any time from the chat header."),
-                    ),
+                Some(schedule) => with_db(state, |conn| match crate::bots::arm_routine(conn, thread_id, &schedule, &job) {
+                    Ok(()) => {
+                        let saved: String = conn
+                            .query_row("SELECT routine_job FROM chat_threads WHERE id=?1", params![thread_id], |row| row.get(0))
+                            .unwrap_or_default();
+                        let shown = if saved.trim().is_empty() { "(none)" } else { saved.trim() };
+                        (
+                            "routine".into(),
+                            json!({"threadId": thread_id, "schedule": schedule, "job": saved}),
+                            format!("This chat runs {schedule} while Ronic OS is open. Stored job: {shown}"),
+                        )
+                    }
                     Err(error) => ("message".into(), json!({}), error.0),
                 }),
                 None => ("message".into(), json!({}), "That schedule is not one this app can store. Use daily HH:MM, every 15m, every 1h, or a daily cron like 0 8 * * *.".into()),
@@ -1817,7 +2207,7 @@ fn control_id(args: &Value) -> std::result::Result<i64, String> {
     let id = value
         .and_then(|item| item.as_i64().or_else(|| item.as_str().and_then(|text| text.trim().parse().ok())))
         .unwrap_or(0);
-    if (1..=40).contains(&id) {
+    if (1..=240).contains(&id) {
         Ok(id)
     } else {
         Err("that control is not on this page".into())
@@ -1859,15 +2249,33 @@ fn remember_mini_window(state: &AppState, bot_id: &str, hit: crate::computer_sub
     if let Some(note) = &hit.note {
         text.insert_str(0, format!("{note}\n").as_str());
     }
+    // The stuck line has to stay the first line. Failure detection only treats
+    // a step as stuck when the tool output starts with "Stuck:".
+    if let Some(line) = crate::computer_subsystem::page_status_line(&hit.url, &hit.blocker, &hit.title) {
+        text.insert_str(0, &format!("{line}\n"));
+    }
     if let Some(media) = &hit.media {
+        if !media.ad.is_empty() {
+            let ad_text = match media.ad.as_str() {
+                "skipped" => "skipped the ad",
+                "waiting" => "ad on screen — Skip is pressed as soon as the button appears",
+                "unskippable" => "ad has no Skip button — leave the page instead of watching it",
+                other => other,
+            };
+            text.push_str(&format!("\nad: {ad_text}"));
+        }
         let state_text = if media.playing {
             format!("playing at {}s of {}s{}", media.current_time, media.duration, if media.muted { " (muted)" } else { "" })
         } else if media.paused {
             format!("paused at {}s of {}s", media.current_time, media.duration)
-        } else {
+        } else if media.ad.is_empty() {
             "not started".into()
+        } else {
+            String::new()
         };
-        text.push_str(&format!("\nmedia: {state_text}"));
+        if !state_text.is_empty() {
+            text.push_str(&format!("\nmedia: {state_text}"));
+        }
     }
     (kind, payload, text)
 }
@@ -2180,6 +2588,89 @@ fn api_route(id: &str, endpoint: &str) -> (&'static str, String) {
         "prov_tokenrouter" => ("openai", if endpoint.contains("tokenrouter") { endpoint.trim_end_matches('/').into() } else { "https://api.tokenrouter.io/v1".into() }),
         _ => ("openai", endpoint.trim_end_matches('/').to_string()),
     }
+}
+
+/// The model id for this turn. An explicit request wins. Otherwise the last
+/// upstream id remembered for the provider is used. Display names are rejected.
+fn chosen_model(requested: Option<&str>, remembered: Option<&str>) -> String {
+    let raw = requested
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| remembered.map(str::trim).filter(|value| !value.is_empty()));
+    let Some(raw) = raw else { return String::new() };
+    let model = upstream_model(raw);
+    if model.is_empty() || model.contains(char::is_whitespace) {
+        String::new()
+    } else {
+        model
+    }
+}
+
+pub(crate) fn remember_upstream(conn: &Connection, provider_id: &str, model: &str) {
+    let model = chosen_model(Some(model), None);
+    let provider_id = provider_id.trim();
+    if model.is_empty() || provider_id.is_empty() {
+        return;
+    }
+    let _ = db::kv_set(conn, &format!("upstream_model:{provider_id}"), &model);
+}
+
+/// One upstream model belongs to one bot. A later bot that picks it takes it.
+fn claim_bot_model(conn: &Connection, bot_id: &str, model: &str) {
+    let model = chosen_model(Some(model), None);
+    let bot_id = bot_id.trim();
+    if model.is_empty() || bot_id.is_empty() {
+        return;
+    }
+    let rows = bot_model_rows(conn);
+    for (key, value) in rows {
+        if value == model && key != format!("bot_model:{bot_id}") {
+            let _ = db::kv_set(conn, &key, "");
+        }
+    }
+    let _ = db::kv_set(conn, &format!("bot_model:{bot_id}"), &model);
+}
+
+pub(crate) fn claimed_model(conn: &Connection, bot_id: &str) -> String {
+    remembered_bot_model(conn, bot_id)
+}
+
+fn remembered_bot_model(conn: &Connection, bot_id: &str) -> String {
+    let bot_id = bot_id.trim();
+    if bot_id.is_empty() {
+        return String::new();
+    }
+    db::kv_get(conn, &format!("bot_model:{bot_id}")).ok().flatten().unwrap_or_default()
+}
+
+fn model_claimed_by_other(conn: &Connection, bot_id: &str, model: &str) -> bool {
+    let model = model.trim();
+    if model.is_empty() {
+        return false;
+    }
+    let mine = format!("bot_model:{}", bot_id.trim());
+    bot_model_rows(conn).into_iter().any(|(key, value)| value == model && key != mine)
+}
+
+fn bot_model_rows(conn: &Connection) -> Vec<(String, String)> {
+    let Ok(mut stmt) = conn.prepare("SELECT key, value FROM app_kv WHERE key LIKE 'bot_model:%'") else {
+        return Vec::new();
+    };
+    let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)));
+    let Ok(rows) = rows else { return Vec::new() };
+    rows.filter_map(|row| row.ok()).filter(|(_, value)| !value.is_empty()).collect()
+}
+
+fn remembered_upstream(conn: &Connection, provider_id: &str) -> String {
+    let provider_id = provider_id.trim();
+    if provider_id.is_empty() {
+        return String::new();
+    }
+    db::kv_get(conn, &format!("upstream_model:{provider_id}"))
+        .ok()
+        .flatten()
+        .map(|value| chosen_model(Some(&value), None))
+        .unwrap_or_default()
 }
 
 fn upstream_model(id: &str) -> String {
@@ -3088,8 +3579,35 @@ fn group_name(id: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{fold_history, gemini_contents, quick_question, wire_messages, ChatMsg, ToolCall};
+    use super::{chosen_model, fold_history, gemini_contents, pin_thread, quick_question, turn_thread, wire_messages, ChatMsg, ToolCall};
     use serde_json::json;
+
+    #[test]
+    fn a_pinned_routine_does_not_steal_the_open_chat() {
+        let dir = std::env::temp_dir().join(format!("ronic-pin-{}-{}", std::process::id(), crate::util::now_ms()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = crate::db::open(&dir.join("state.db")).unwrap();
+        crate::db::migrate(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO bot_profiles (id, handle, display_name, avatar, soul_markdown, primary_account_id, long_context_account_id, fallback_account_id, created_at) VALUES ('bot','@bot','Bot','NW','soul','','','',1)",
+            [],
+        ).unwrap();
+        for (id, title) in [("thread_a", "Open"), ("thread_b", "Routine")] {
+            conn.execute(
+                "INSERT INTO chat_threads (id, bot_profile_id, title, active_model_override_id, status, compacted_context_capsule, is_pinned, updated_at) VALUES (?1,'bot',?2,'','idle','',0,1)",
+                rusqlite::params![id, title],
+            ).unwrap();
+        }
+        crate::db::kv_set(&conn, "active_thread", "thread_a").unwrap();
+        let _pin = pin_thread("thread_b");
+        let chosen = turn_thread(&conn, "job", None).unwrap();
+        assert_eq!(chosen, "thread_b");
+        let still = crate::db::kv_get(&conn, "active_thread").unwrap().unwrap();
+        assert_eq!(still, "thread_a");
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     fn row(role: &str, model: &str, content: &str, action: &str) -> (String, String, String, String) {
         (role.into(), model.into(), content.into(), action.into())
@@ -3136,6 +3654,18 @@ mod tests {
         assert!(folded.iter().any(|message| message.content == "latest question"));
         assert!(!folded.iter().any(|message| message.role == "user" && message.content == long));
         assert!(folded.len() > 1);
+    }
+
+    #[test]
+    fn a_missing_turn_model_uses_the_remembered_upstream_id() {
+        assert_eq!(chosen_model(None, Some("nvidia/nemotron-3.5")), "nvidia/nemotron-3.5");
+        assert_eq!(chosen_model(Some("nvidia/nemotron-3.5"), Some("other")), "nvidia/nemotron-3.5");
+        assert_eq!(chosen_model(Some("  "), Some("nvidia/nemotron-3.5")), "nvidia/nemotron-3.5");
+        assert_eq!(chosen_model(None, Some("nim-nemotron")), "nvidia/llama-3.1-nemotron-70b-instruct");
+        assert_eq!(chosen_model(Some("prov_nvidia:nvidia/nemotron-3.5"), None), "nvidia/nemotron-3.5");
+        assert_eq!(chosen_model(Some("a display name"), None), "");
+        assert_eq!(chosen_model(None, None), "");
+        assert_eq!(chosen_model(None, Some("")), "");
     }
 
     #[test]

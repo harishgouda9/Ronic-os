@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-take-auth-callback"
+description = "Enables the take_auth_callback command without any pre-configured scope."
+commands.allow = ["take_auth_callback"]
+
+[[permission]]
+identifier = "deny-take-auth-callback"
+description = "Denies the take_auth_callback command without any pre-configured scope."
+commands.deny = ["take_auth_callback"]

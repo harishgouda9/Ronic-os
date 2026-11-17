@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-connect-dock-app"
+description = "Enables the connect_dock_app command without any pre-configured scope."
+commands.allow = ["connect_dock_app"]
+
+[[permission]]
+identifier = "deny-connect-dock-app"
+description = "Denies the connect_dock_app command without any pre-configured scope."
+commands.deny = ["connect_dock_app"]

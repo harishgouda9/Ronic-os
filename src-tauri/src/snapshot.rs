@@ -4,6 +4,7 @@ use crate::models::*;
 use crate::util::now_ms;
 use rusqlite::{params, Connection};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::Path;
 
 pub struct Meta {
@@ -75,6 +76,7 @@ pub fn load(conn: &Connection, meta: &Meta) -> Result<Snapshot> {
         providers: providers(conn)?,
         apps: apps(conn)?,
         memories: memories(conn)?,
+        curated: crate::memory::list_curated(conn)?,
         memory_engines: memory_engines(conn)?,
         memory_route: memory_route(conn)?,
         memory_routes: memory_routes(conn)?,
@@ -295,11 +297,13 @@ fn apps(conn: &Connection) -> Result<Vec<LinkedApp>> {
 }
 
 fn memories(conn: &Connection) -> Result<Vec<MemoryItem>> {
+    let relations = memory_relations(conn)?;
     let mut stmt = conn.prepare("SELECT id, source_type, scoped_bot_id, file_path_or_uri, title, content_markdown, wikilinks_json, updated_at, engine_origin, sync_json, valid_from, invalid_at FROM memory_items ORDER BY updated_at DESC")?;
     let rows = stmt.query_map([], |r| {
         let raw: String = r.get(6)?;
+        let id: String = r.get(0)?;
         Ok(MemoryItem {
-            id: r.get(0)?,
+            id: id.clone(),
             source_type: r.get(1)?,
             scoped_bot_id: r.get(2)?,
             file_path_or_uri: r.get(3)?,
@@ -311,9 +315,21 @@ fn memories(conn: &Connection) -> Result<Vec<MemoryItem>> {
             synced_engines: synced_memory_engines(&r.get::<_, String>(9)?),
             valid_from: r.get(10)?,
             invalid_at: r.get(11)?,
+            relations: relations.get(&id).cloned().unwrap_or_default(),
         })
     })?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+fn memory_relations(conn: &Connection) -> Result<HashMap<String, Vec<MemoryRelation>>> {
+    let mut stmt = conn.prepare("SELECT memory_id, relation, target FROM memory_edges ORDER BY updated_at")?;
+    let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))?;
+    let mut grouped: HashMap<String, Vec<MemoryRelation>> = HashMap::new();
+    for row in rows {
+        let (memory_id, relation, target) = row?;
+        grouped.entry(memory_id).or_default().push(MemoryRelation { relation, target });
+    }
+    Ok(grouped)
 }
 
 fn synced_memory_engines(raw: &str) -> Vec<String> {

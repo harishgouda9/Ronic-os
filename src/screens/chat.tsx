@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 
-import { AlertCircle, Brain, Check, ChevronDown, ChevronLeft, ChevronUp, Copy, Download, Eye, EyeOff, FileText, Folder, Globe, Image, Minimize2, Minus, Plus, RefreshCw, Reply, Sparkles, Square, Terminal as TerminalIcon, X } from "lucide-react";
+import { AlertCircle, Brain, Check, ChevronDown, ChevronLeft, ChevronUp, ClipboardCopy, Copy, Download, Eye, EyeOff, FileText, Folder, Globe, Image, Minimize2, Minus, Plus, RefreshCw, Reply, Sparkles, Square, Terminal as TerminalIcon, X } from "lucide-react";
 
 import ReactMarkdown from "react-markdown";
 
@@ -12,7 +12,7 @@ import { clipName, customAsWebApp, newCustomId, readCustomApps, readHiddenApps, 
 
 import { chatProviderLinks, DOWNLOADS, hasStoredSecret, WEB_APPS, type ChatModel, type WebApp } from "../kernel/liveChat";
 
-import { addCustom, catalog, effortFor, hideModel, loadConnectedModels, saveEdit, setEffort, starIds, toggleStar } from "../kernel/modelPrefs";
+import { addCustom, assignBotModel, catalog, effortFor, EFFORT_OPTIONS, hideModel, keepBotModel, loadConnectedModels, modelClaimedBy, modelForBot, readBotModels, saveEdit, setEffort, starIds, toggleStar } from "../kernel/modelPrefs";
 
 import { inIndex, proposedDiff } from "../kernel/skillIndex";
 
@@ -28,21 +28,32 @@ import { DockAccounts } from "../ui/DockAccounts";
 
 import { DockCapabilities } from "../ui/DockCapabilities";
 
+import { connectDockTile, DockMesh, dockSpeaksMcp } from "../ui/DockMesh";
+
 import { AppLogo } from "../ui/appLogos";
 
 import { ModelMenu } from "../ui/ModelMenu";
 
-import { BotFace, botName, botPresence, ComputerDock, CoworkerSidebar, GatewayCard, HandoffLine, MODES, modeLabel, ProfileSlide } from "../ui/BotCoworkers";
+import { BotFace, botName, botPresence, BotModelPick, ComputerDock, CoworkerSidebar, GatewayCard, HandoffLine, MODES, modeLabel, ProfileSlide } from "../ui/BotCoworkers";
+import { lightUserHighlight } from "../ui/userHighlight";
 
 import { Harness2PipelineCard, SuperchargeControl } from "../components/Harness2Studio";
 
-import { markFired, markSeen, oneLine, readTabs, rememberModel, safePageUrl, writeTabs } from "../kernel/workspaceChrome";
+import { ChoiceSelect } from "../ui/ChoiceSelect";
+
+import { markSeen, oneLine, readTabs, rememberModel, safePageUrl, writeTabs } from "../kernel/workspaceChrome";
 
 import { LiveBrowser } from "../ui/LiveBrowser";
 
 import { MicButton } from "../ui/MicButton";
 
 import { ScheduledJobs } from "../ui/ScheduledJobs";
+
+import { PluginSide } from "../ui/PluginSide";
+
+import { sidePlugins } from "../kernel/pluginScreen";
+
+import { ContextCapsule } from "../components/ContextCopyHub";
 
 import { PaneButton, PaneEdge, usePane } from "../ui/PaneEdge";
 
@@ -338,59 +349,33 @@ export function ApprovalModeControl() {
 
   return (
 
-    <div className="approval-mode-control" role="group" aria-label="Bot Approval Mode">
+    <ChoiceSelect
 
-      <button
+      compact
 
-        type="button"
+      menu="up"
 
-        className={`approval-mode-btn ${mode === "auto" ? "active auto" : ""}`}
+      ariaLabel="Approval mode"
 
-        onClick={() => void handleSelect("auto")}
+      title="How much this bot does before it checks with you"
 
-        title="Auto Approve: Bot researches, plans, decides autonomously, and builds without asking questions (only asks for critical actions or credentials)."
+      value={mode}
 
-      >
+      tone={mode}
 
-        <Sparkles size={11} />
+      options={[
 
-        <span>Auto</span>
+        { value: "auto", label: "Auto", hint: "Researches, plans, and builds. Pauses only for critical steps or credentials." },
 
-      </button>
+        { value: "ask", label: "Ask", hint: "Checks with you before external actions and wallet spend." },
 
-      <button
+        { value: "manual", label: "Manual", hint: "Holds every step for you to confirm." },
 
-        type="button"
+      ]}
 
-        className={`approval-mode-btn ${mode === "ask" ? "active ask" : ""}`}
+      onChange={(next) => void handleSelect(next as "auto" | "ask" | "manual")}
 
-        onClick={() => void handleSelect("ask")}
-
-        title="Ask: Bot asks clarifying questions and checks with user before executing major tasks."
-
-      >
-
-        <span>Ask</span>
-
-      </button>
-
-      <button
-
-        type="button"
-
-        className={`approval-mode-btn ${mode === "manual" ? "active manual" : ""}`}
-
-        onClick={() => void handleSelect("manual")}
-
-        title="Manual: Bot confirms each step manually before execution."
-
-      >
-
-        <span>Manual</span>
-
-      </button>
-
-    </div>
+    />
 
   );
 
@@ -426,6 +411,10 @@ export function Chat() {
 
   const [modelId, setModelId] = useState(readSelected);
 
+  const modelIdRef = useRef(modelId);
+
+  modelIdRef.current = modelId;
+
   const [modelsReady, setModelsReady] = useState(false);
 
   const [models, setModels] = useState<ChatModel[]>([]);
@@ -447,6 +436,8 @@ export function Chat() {
   const [refreshing, setRefreshing] = useState(false);
 
   const [effortTick, setEffortTick] = useState(0);
+
+  const [effortOpen, setEffortOpen] = useState(false);
 
   const [skillsOpen, setSkillsOpen] = useState(false);
 
@@ -525,6 +516,14 @@ export function Chat() {
   const [browserOpen, setBrowserOpen] = useState(false);
 
   const [jobsOpen, setJobsOpen] = useState(false);
+
+  const [copyOpen, setCopyOpen] = useState(false);
+
+  const [pluginOpen, setPluginOpen] = useState("");
+
+  const screens = sidePlugins(snap.plugins);
+
+  const openScreen = screens.find((plugin) => plugin.id === pluginOpen) ?? null;
 
   const [jobsNudge, setJobsNudge] = useState(0);
 
@@ -733,6 +732,8 @@ export function Chat() {
 
   const accessBot = inspected && (!activeGroup || activeGroup.memberBotIds.includes(inspected.id)) ? inspected : profile;
 
+  const userTint = accessBot ? lightUserHighlight(accessBot.avatarColor, accessBot.id) : null;
+
   const tasks = snap.threads.filter((item) => activeGroup ? item.groupId === activeGroup.id : item.targetType !== "bot_group" && item.botProfileId === (profile?.id ?? ""));
 
   const talkTo = activeGroup ? activeGroup.title.replace(/^#/, "") || activeGroup.groupHandle : botName(accessBot);
@@ -838,9 +839,9 @@ export function Chat() {
 
     if (snap.turnActivity && snap.turnActivity.trim()) return snap.turnActivity.trim();
 
-    if (pending === "send_message" || busy) return "bot is working in background...";
+    if (pending === "send_message" || busy) return "Working in this chat…";
 
-    return "working in background...";
+    return "Working in this chat…";
 
   }, [deskBusy, deskMode, pending, snap.turnActivity, busy]);
 
@@ -992,7 +993,7 @@ export function Chat() {
 
       setMenuStatus(result.notes.join(" "));
 
-      setModelId((current) => next.some((item) => item.id === current) ? current : (next[0]?.id ?? ""));
+      setModelId((current) => keepBotModel(accessBot?.id ?? "", current, next.map((item) => item.id)));
 
       requestAnimationFrame(() => {
 
@@ -1060,7 +1061,7 @@ export function Chat() {
 
       setMenuStatus(result.notes.join(" "));
 
-      setModelId((current) => next.some((item) => item.id === current) ? current : (next[0]?.id ?? ""));
+      setModelId((current) => keepBotModel(accessBot?.id ?? "", current, next.map((item) => item.id)));
 
       requestAnimationFrame(() => {
 
@@ -1112,6 +1113,48 @@ export function Chat() {
 
   useEffect(() => {
 
+    const botId = accessBot?.id ?? "";
+
+    if (!botId || !modelsReady) return;
+
+    const apply = () => {
+
+      const owned = modelForBot(botId);
+
+      if (owned && models.some((item) => item.id === owned)) {
+
+        if (modelIdRef.current !== owned) setModelId(owned);
+
+        return;
+
+      }
+
+      const current = modelIdRef.current;
+
+      if (current && models.some((item) => item.id === current) && !modelClaimedBy(readBotModels(), current, botId)) {
+
+        assignBotModel(botId, current);
+
+        return;
+
+      }
+
+      if (current) setModelId("");
+
+    };
+
+    apply();
+
+    window.addEventListener("ronic-bot-model", apply);
+
+    return () => window.removeEventListener("ronic-bot-model", apply);
+
+  }, [accessBot?.id, models, modelsReady]);
+
+
+
+  useEffect(() => {
+
     const prefill = sessionStorage.getItem("ronic.prefillPrompt");
 
     if (prefill) {
@@ -1146,37 +1189,19 @@ export function Chat() {
 
       setModelId((current) => {
 
+        const botId = accessBot?.id ?? "";
+
+        const free = (id: string) => Boolean(id) && !modelClaimedBy(readBotModels(), id, botId);
+
         if (focus) {
 
-          const match = next.find((item) => item.providerId === focus);
+          const match = next.find((item) => item.providerId === focus && free(item.id));
 
           if (match) return match.id;
 
         }
 
-        if (current && next.some((item) => item.id === current)) return current;
-
-        const saved = readSelected();
-
-        if (saved && next.some((item) => item.id === saved)) return saved;
-
-        if (thread?.activeModelOverrideId) {
-
-          const match = next.find((item) => item.providerId === thread.activeModelOverrideId);
-
-          if (match) return match.id;
-
-        }
-
-        if (profile?.primaryAccountId) {
-
-          const match = next.find((item) => item.providerId === profile.primaryAccountId);
-
-          if (match) return match.id;
-
-        }
-
-        return next[0]?.id ?? "";
+        return keepBotModel(botId, current || readSelected(), next.map((item) => item.id));
 
       });
 
@@ -1601,6 +1626,32 @@ export function Chat() {
     window.addEventListener("pointermove", move);
 
     window.addEventListener("pointerup", end);
+
+  }
+
+
+
+  function connectTile(id: string, kind: "web" | "desktop") {
+
+    const starting = kind === "web"
+
+      ? "Opening the connector. Starting the public tunnel if it is not already up."
+
+      : "Writing the local MCP config.";
+
+    window.dispatchEvent(new CustomEvent("ronic-dock-mesh", { detail: starting }));
+
+    void connectDockTile(id, kind).then((message) => {
+
+      window.dispatchEvent(new CustomEvent("ronic-dock-mesh", { detail: message }));
+
+    }).catch((error: unknown) => {
+
+      const message = error instanceof Error ? error.message : String(error);
+
+      window.dispatchEvent(new CustomEvent("ronic-dock-mesh", { detail: message }));
+
+    });
 
   }
 
@@ -2150,17 +2201,25 @@ export function Chat() {
 
   function runJob(threadId: string) {
 
-    if (!model) return;
-
-    markFired(threadId, Date.now());
-
-    void run("run_routine", { threadId, providerId: model.providerId, model: model.upstreamModel, modelId: model.id, effort: effortFor(model.id) });
+    void run("run_routine", { threadId });
 
   }
 
 
 
   function chooseModel(id: string) {
+
+    const botId = accessBot?.id ?? "";
+
+    if (botId) {
+
+      const released = id ? modelClaimedBy(readBotModels(), id, botId) : "";
+
+      assignBotModel(botId, id);
+
+      if (released) setMenuStatus("That model was on another bot. It is only on this bot now.");
+
+    }
 
     setModelId(id);
 
@@ -2180,7 +2239,7 @@ export function Chat() {
 
     if (!next) return;
 
-    if (thread) void run("set_thread_model", { threadId: thread.id, providerId: next.providerId });
+    if (thread) void run("set_thread_model", { threadId: thread.id, providerId: next.providerId, model: next.upstreamModel });
 
   }
 
@@ -2294,7 +2353,7 @@ export function Chat() {
 
               return (
 
-                <div key={id} className={`chat-tab ${on ? "on" : ""}`}>
+                <div key={id} className={`chat-tab ${on ? "on" : ""}`} data-copy-chat={id}>
 
                   <button type="button" onClick={() => void run("select_thread", { threadId: id })}>{title}</button>
 
@@ -2322,7 +2381,7 @@ export function Chat() {
 
               onCover={(on) => setScreenMode(on ? "takeover" : "preview")}
 
-              onRunRoutine={thread && model ? () => void run("run_routine", { threadId: thread.id, providerId: model.providerId, model: model.upstreamModel, modelId: model.id, effort: effortFor(model.id) }) : undefined}
+              onRunRoutine={thread ? () => void run("run_routine", { threadId: thread.id }) : undefined}
 
               initialTab={screenDockTab}
 
@@ -2348,7 +2407,7 @@ export function Chat() {
 
                     <button key={id} type="button" className="face-btn" title={`Edit ${botName(member)}`} aria-label={`Edit ${botName(member)}`} onClick={() => openProfile(id)}>
 
-                      <BotFace seed={member.id} mark={member.avatar} size={28} state={botPresence(member)} />
+                      <BotFace seed={member.id} mark={member.avatar} size={28} state={botPresence(member)} color={member.avatarColor} />
 
                     </button>
 
@@ -2362,7 +2421,7 @@ export function Chat() {
 
               <button type="button" className="face-btn" title={`Edit ${botName(accessBot)}`} aria-label={`Edit ${botName(accessBot)}`} onClick={() => openProfile(accessBot.id)}>
 
-                <BotFace seed={accessBot.id} mark={accessBot.avatar} state={botPresence(accessBot)} />
+                <BotFace seed={accessBot.id} mark={accessBot.avatar} state={botPresence(accessBot)} color={accessBot.avatarColor} />
 
               </button>
 
@@ -2370,7 +2429,13 @@ export function Chat() {
 
             <div className="who">
 
-              <strong>{talkTo}</strong>
+              <div className="who-line">
+
+                <strong>{talkTo}</strong>
+
+                {!activeGroup && accessBot?.id === (snap.chiefBotId || "") ? <span className="chief-tag">Chief</span> : null}
+
+              </div>
 
               {isWorking ? (
 
@@ -2410,7 +2475,7 @@ export function Chat() {
 
                 {tasks.map((item) => (
 
-                  <button key={item.id} type="button" className={item.id === thread?.id ? "on" : ""} onClick={() => { setChatsOpen(false); void run("select_thread", { threadId: item.id }); }}>{item.title}</button>
+                  <button key={item.id} type="button" data-copy-chat={item.id} className={item.id === thread?.id ? "on" : ""} onClick={() => { setChatsOpen(false); void run("select_thread", { threadId: item.id }); }}>{item.title}</button>
 
                 ))}
 
@@ -2512,7 +2577,7 @@ export function Chat() {
 
           </div>
 
-          <div className="pane-b transcript" ref={transcriptRef} onScroll={handleTranscriptScroll}>
+          <div className="pane-b transcript" ref={transcriptRef} onScroll={handleTranscriptScroll} style={userTint ? { ["--user-bg" as string]: userTint.bg, ["--user-border" as string]: userTint.border, ["--user-ink" as string]: "#111111" } : undefined}>
 
             {snap.skillProposals.filter((item) => item.profileId === profile?.id && item.status === "pending").map((proposal) => (
 
@@ -2666,7 +2731,7 @@ export function Chat() {
 
                   <span className="queued-text">
 
-                    <strong>{messageQueue.length} queued {messageQueue.length === 1 ? "message" : "messages"}</strong> (auto-delivers when bot finishes background work)
+                    <strong>{messageQueue.length} queued {messageQueue.length === 1 ? "message" : "messages"}</strong> (auto-delivers when this chat turn finishes)
 
                   </span>
 
@@ -2890,7 +2955,7 @@ export function Chat() {
 
                   isWorking
 
-                    ? `Bot is working in background. Type message to queue for ${talkTo}…`
+                    ? `Working in this chat. Type a message to queue for ${talkTo}…`
 
                     : model
 
@@ -2954,11 +3019,11 @@ export function Chat() {
 
                   <button type="button" className="plus-btn" aria-label="Add" aria-expanded={plusOpen} onClick={() => { setMenuOpen(false); setPlusOpen((open) => !open); }}>+</button>
 
-                  <SuperchargeControl compact />
+                  <SuperchargeControl compact menu="up" />
 
                   <ApprovalModeControl />
 
-                  <button type="button" className="model-trigger" data-model-trigger aria-haspopup="listbox" aria-expanded={menuOpen} onClick={() => { setPlusOpen(false); setMenuMode("list"); setMenuOpen(true); }}>
+                  <button type="button" className="model-trigger" data-model-trigger aria-haspopup="listbox" aria-expanded={menuOpen} onClick={() => { setPlusOpen(false); setEffortOpen(false); setMenuMode("list"); setMenuOpen(true); }}>
 
                     {model?.label ?? (models.length ? `Select a model (${models.length})` : "Select a model")}
 
@@ -2966,11 +3031,33 @@ export function Chat() {
 
                   {model ? (
 
-                    <button type="button" className="model-trigger" data-model-trigger onClick={() => { setPlusOpen(false); setMenuMode("list"); setMenuOpen(true); }}>
+                    <span className="composer-effort">
 
-                      {effort === "default" ? "Default" : effort === "xhigh" ? "XHigh" : effort[0].toUpperCase() + effort.slice(1)}
+                      <button type="button" className="model-trigger" aria-haspopup="menu" aria-expanded={effortOpen} onClick={() => { setPlusOpen(false); setMenuOpen(false); setEffortOpen((open) => !open); }}>
 
-                    </button>
+                        {effort === "default" ? "Default" : effort === "xhigh" ? "XHigh" : effort[0].toUpperCase() + effort.slice(1)}
+
+                      </button>
+
+                      {effortOpen ? (
+
+                        <div className="effort-menu" role="menu" aria-label="Performance">
+
+                          {EFFORT_OPTIONS.map((item) => (
+
+                            <button key={item.id} type="button" role="menuitem" className={item.id === effort ? "on" : ""} onClick={() => { setEffort(model.id, item.id); setEffortTick((tick) => tick + 1); setEffortOpen(false); }}>
+
+                              {item.label}
+
+                            </button>
+
+                          ))}
+
+                        </div>
+
+                      ) : null}
+
+                    </span>
 
                   ) : null}
 
@@ -3126,7 +3213,7 @@ export function Chat() {
 
                   setModels(next);
 
-                  setModelId((current) => next.some((item) => item.id === current) ? current : (next[0]?.id ?? ""));
+                  setModelId((current) => keepBotModel(accessBot?.id ?? "", current, next.map((item) => item.id)));
 
                   setMenuStatus(result.notes.join(" "));
 
@@ -3148,9 +3235,9 @@ export function Chat() {
 
                 setModels(next);
 
-                setModelId(next.some((item) => item.id === created.id) ? created.id : (next[0]?.id ?? ""));
+                if (next.some((item) => item.id === created.id)) chooseModel(created.id);
 
-                if (thread) void run("set_thread_model", { threadId: thread.id, providerId: created.providerId });
+                if (thread) void run("set_thread_model", { threadId: thread.id, providerId: created.providerId, model: created.upstreamModel });
 
                 setMenuMode("list");
 
@@ -3176,7 +3263,9 @@ export function Chat() {
 
                 setModels(next);
 
-                setModelId((current) => current === id ? (next[0]?.id ?? "") : current);
+                if (accessBot && modelForBot(accessBot.id) === id) assignBotModel(accessBot.id, "");
+
+                setModelId((current) => current === id ? "" : current);
 
               }}
 
@@ -3227,6 +3316,8 @@ export function Chat() {
               onContinueChatGpt={continueChatGpt}
 
               onSaveKey={(id, secret) => { void run("set_provider_secret", { id, secret }); }}
+
+              ollamaReady={ollamaReady}
 
             />
 
@@ -3396,7 +3487,7 @@ export function Chat() {
 
               onCover={(on) => setScreenMode(on ? "takeover" : "preview")}
 
-              onRunRoutine={thread && model ? () => void run("run_routine", { threadId: thread.id, providerId: model.providerId, model: model.upstreamModel, modelId: model.id, effort: effortFor(model.id) }) : undefined}
+              onRunRoutine={thread ? () => void run("run_routine", { threadId: thread.id }) : undefined}
 
               initialTab={screenDockTab}
 
@@ -3478,7 +3569,27 @@ export function Chat() {
 
                   setModels(next);
 
-                  if (id && next.some((item) => item.id === id)) setModelId(id);
+                  if (id && next.some((item) => item.id === id)) chooseModel(id);
+
+                }}
+
+                onRefresh={() => {
+
+                  const ids = keyedKey.length ? keyedKey.split("|") : [];
+
+                  void loadConnectedModels(ids).then((result) => {
+
+                    const next = catalog(ids, result.ollama);
+
+                    setOllamaReady(result.ollama);
+
+                    setModels(next);
+
+                    setMenuStatus(result.notes.join(" "));
+
+                    setModelId((current) => keepBotModel(accessBot?.id ?? "", current, next.map((item) => item.id)));
+
+                  });
 
                 }}
 
@@ -3503,6 +3614,8 @@ export function Chat() {
               <button type="button" role="tab" aria-selected={dock.apps === "desktop"} className={dock.apps === "desktop" ? "btn small" : "btn ghost small"} onClick={() => setAppsSide("desktop")}>Desktop</button>
 
             </div>
+
+            <DockMesh side={dock.apps} />
 
             {dock.apps === "web" ? (
 
@@ -3554,11 +3667,13 @@ export function Chat() {
 
                     {installed.includes(app.id) ? <i className="dock-badge" /> : null}
 
-                    <AppLogo id={app.id} name={app.name} mark={app.mark} url={app.custom ? app.url : undefined} />
+                    <AppLogo id={app.id} name={app.name} mark={app.mark} url={app.url || undefined} command={app.path} />
 
                     <span className="dock-label">{app.name}</span>
 
                   </button>
+
+                  {dockSpeaksMcp("web", app.id) ? <button type="button" className="dock-mcp" aria-label={`Connect ${app.name} through MCP`} onClick={() => connectTile(app.id, "web")}>MCP</button> : null}
 
                   <button type="button" className="dock-remove" aria-label={`Remove ${app.name}`} onClick={() => app.custom ? removeCustom(app.id) : hideBuiltinApp(app.id)}>×</button>
 
@@ -3620,11 +3735,13 @@ export function Chat() {
 
                       {ready ? <i className="dock-badge" /> : null}
 
-                      <AppLogo id={app.id} name={app.name} mark={app.mark} />
+                      <AppLogo id={app.id} name={app.name} mark={app.mark} url={app.url || undefined} command={app.path} />
 
                       <span className="dock-label">{deskBusy === app.id ? (deskMode === "install" ? "Installing…" : "Opening…") : app.name}</span>
 
                     </button>
+
+                    {dockSpeaksMcp("desktop", app.id) ? <button type="button" className="dock-mcp" aria-label={`Connect ${app.name} through MCP`} onClick={() => connectTile(app.id, "desktop")}>MCP</button> : null}
 
                     <button type="button" className="dock-remove" aria-label={`Remove ${app.name}`} onClick={() => app.custom ? removeCustom(app.id) : hideBuiltinApp(app.id)}>×</button>
 
@@ -3718,11 +3835,23 @@ export function Chat() {
 
         <ScheduledJobs open={jobsOpen} canRun={Boolean(model)} nudge={jobsNudge} onClose={() => setJobsOpen(false)} onRun={runJob} />
 
-        <aside className="edge-rail" data-edge-rail aria-label="Dock and scheduled jobs">
+        <ContextCapsule open={copyOpen} onToggle={() => setCopyOpen((value) => !value)} />
+
+        <PluginSide plugin={openScreen} onClose={() => setPluginOpen("")} />
+
+        <aside className="edge-rail" data-edge-rail aria-label="Dock, scheduled jobs, context copy, and plugin screens">
 
           {dock.open ? null : <button type="button" className="dock-reveal" onClick={() => setDockOpen(true)} onPointerDown={beginDockRevealDrag}>Dock</button>}
 
           {jobsOpen ? null : <button type="button" className="jobs-reveal" onClick={() => setJobsOpen(true)} onPointerDown={beginJobsRevealDrag}>Scheduled jobs</button>}
+
+          <button type="button" className="copy-reveal" aria-pressed={copyOpen} aria-label="Context copy" title="Context copy (Alt+C)" onClick={() => setCopyOpen((value) => !value)}><ClipboardCopy size={16} /></button>
+
+          {screens.map((plugin) => plugin.id === openScreen?.id ? null : (
+            <button key={plugin.id} type="button" className="plugin-reveal" title={plugin.desktop.find((bit) => bit.kind === "pane")?.label || plugin.name} aria-label={plugin.name} onClick={() => setPluginOpen(plugin.id)}>
+              {(plugin.desktop.find((bit) => bit.kind === "pane")?.label || plugin.name).trim().slice(0, 1).toUpperCase() || "P"}
+            </button>
+          ))}
 
         </aside>
 
@@ -3788,7 +3917,7 @@ function stageBounds(el: HTMLElement): WebAppBounds | null {
 
   }
 
-  for (const selector of ["[data-edge-rail]", "[data-jobs-panel]", ".chat-layout > .chat-side"]) {
+  for (const selector of ["[data-edge-rail]", "[data-jobs-panel]", "[data-copy-panel]", "[data-plugin-panel]", ".chat-layout > .chat-side"]) {
 
     const neighbor = document.querySelector(selector);
 
@@ -4018,7 +4147,7 @@ function WebStage({ app, known, focusNonce, onInstalled, onClose, onMinimize, on
 
     if (thread) observer.observe(thread);
 
-    for (const selector of ["[data-edge-rail]", "[data-jobs-panel]", ".chat-layout > .chat-side"]) {
+    for (const selector of ["[data-edge-rail]", "[data-jobs-panel]", "[data-copy-panel]", "[data-plugin-panel]", ".chat-layout > .chat-side"]) {
 
       const neighbor = document.querySelector(selector);
 
@@ -5074,7 +5203,7 @@ export function Profiles() {
     if (!query) return true;
     const q = query.toLowerCase();
     return p.handle.toLowerCase().includes(q) || p.displayName.toLowerCase().includes(q) || (p.role || "").toLowerCase().includes(q);
-  });
+  }).sort((a, b) => Number(b.id === snap.chiefBotId) - Number(a.id === snap.chiefBotId));
 
   return (
     <div className="flex-1 h-full bg-[#eceef2] p-3 sm:p-5 lg:p-6 overflow-y-auto select-none flex flex-col">
@@ -5193,6 +5322,7 @@ export function Profiles() {
                       <div className="min-w-0">
                         <div className="flex items-center gap-1.5">
                           <strong className="text-xs font-bold text-slate-900 truncate">{item.handle}</strong>
+                          {item.id === snap.chiefBotId ? <span className="chief-tag">Chief</span> : null}
                           {item.id === snap.activeProfileId && (
                             <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 shrink-0" title="Active bot" />
                           )}
@@ -5264,6 +5394,7 @@ export function Profiles() {
               {/* Provider & Model Routing */}
               <section className="bg-slate-50/60 border border-slate-200/70 rounded-2xl p-4 sm:p-5 space-y-4">
                 <h3 className="text-xs font-bold uppercase tracking-wider text-slate-500">Reasoning Accounts & Model Lanes</h3>
+                <BotModelPick botId={profile.id} />
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-3.5">
                   <Account
                     label="Primary Provider"
@@ -5350,7 +5481,8 @@ function Account({ label, value, providers, onChange }: { label: string; value: 
         value={value}
         onChange={(event) => onChange(event.target.value)}
       >
-        <option value="">Default / Unspecified</option>
+        <option value="">None</option>
+        {value && !providers.some((item) => item.id === value) ? <option value={value}>Saved provider</option> : null}
         {providers.map((item) => (
           <option key={item.id} value={item.id}>
             {item.name} ({item.providerType})

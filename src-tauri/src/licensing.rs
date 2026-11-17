@@ -21,7 +21,7 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use tauri::State;
 
 /// Fixed lease field order — byte-identical to the Edge Function signer.
@@ -346,6 +346,24 @@ pub async fn device_fingerprint() -> std::result::Result<serde_json::Value, Stri
 
 const KEYCHAIN_SERVICE: &str = "os.ronic.workstation";
 const KEYCHAIN_USER: &str = "supabase_refresh_token";
+
+static PENDING_AUTH_QUERY: Mutex<Option<String>> = Mutex::new(None);
+
+/// Holds the latest ronic://auth/callback query until the webview asks for it.
+/// The deep-link event can fire before JavaScript is listening.
+pub fn note_auth_callback(query: &str) {
+    if query.is_empty() {
+        return;
+    }
+    if let Ok(mut slot) = PENDING_AUTH_QUERY.lock() {
+        *slot = Some(query.to_string());
+    }
+}
+
+#[tauri::command]
+pub fn take_auth_callback() -> Option<String> {
+    PENDING_AUTH_QUERY.lock().ok().and_then(|mut slot| slot.take())
+}
 
 fn keychain_entry() -> std::result::Result<keyring::Entry, String> {
     keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_USER).map_err(|e| e.to_string())

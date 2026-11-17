@@ -449,6 +449,7 @@ export default function UniversalMcpAcpMeshStudio() {
                           type="button"
                           disabled={!desktop || busy}
                           onClick={() => {
+                            void invoke("mesh_arm_connector").catch(() => undefined);
                             void copyText(tunnel.publicMcpUrl).then((ok) => {
                               setCopied(ok);
                               if (ok) window.setTimeout(() => setCopied(false), 2500);
@@ -509,7 +510,7 @@ export default function UniversalMcpAcpMeshStudio() {
                       >
                         Start public tunnel
                       </button>
-                      <span className="text-[11px] text-slate-400">Creates a temporary trycloudflare.com URL in front of the local MCP alias (port 8765). Anyone with the URL still needs the token inside it.</span>
+                      <span className="text-[11px] text-slate-400">Opens a private hop to this computer. ChatGPT's server URL stays https://ronicos.vercel.app/mcp.</span>
                     </div>
                   ) : (
                     <p className="text-[11px] text-slate-400">Install cloudflared above to give ChatGPT and Claude a real MCP path to this computer.</p>
@@ -643,7 +644,7 @@ export default function UniversalMcpAcpMeshStudio() {
                   <Zap size={11} /> Run Code Mode
                 </button>
                 <pre className="max-h-48 overflow-auto rounded-xl border border-slate-200 bg-white p-3 font-mono text-[11px] text-slate-600">
-                  {runOut || "The worker returns the script's value. Remote MCP servers are named here and are not called."}
+                  {runOut || "The worker returns the script's value. A call to a trusted remote MCP server runs when the script invokes that server."}
                 </pre>
               </div>
             </div>

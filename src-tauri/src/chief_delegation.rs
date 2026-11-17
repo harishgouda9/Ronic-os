@@ -12,7 +12,7 @@ use crate::AppState;
 use rusqlite::{params, Connection};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use tauri::State;
+use tauri::{Manager, State};
 
 const CHIEF_KEY: &str = "chief_bot_id";
 const VERIFIER: &str = "The owner attests this sub-goal is done. It stays in progress until then.";
@@ -171,13 +171,48 @@ pub fn verify_delegation_authority(issuer_id: &str, is_chief: bool, assignee_id:
     Ok(())
 }
 
-pub fn route_account(score: i64, bot: &BotRef) -> (String, String) {
-    if score < 35 {
-        (nonempty(&bot.fallback_account_id, &bot.primary_account_id), "lightweight".into())
-    } else if score < 70 {
-        (nonempty(&bot.primary_account_id, &bot.fallback_account_id), "balanced".into())
+/// A thread this long prefers the long-context lane when that lane is set.
+pub const LONG_CONTEXT_CHARS: usize = 32_000;
+
+/// Empty, "none", and "unassigned" are the same unset lane.
+pub fn lane_id(value: &str) -> &str {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") || trimmed == "unassigned" {
+        ""
     } else {
-        (nonempty(&bot.long_context_account_id, &bot.primary_account_id), "heavy".into())
+        trimmed
+    }
+}
+
+pub fn first_lane(lanes: &[&str]) -> String {
+    for lane in lanes {
+        let id = lane_id(lane);
+        if !id.is_empty() {
+            return id.to_string();
+        }
+    }
+    String::new()
+}
+
+pub fn route_account(score: i64, bot: &BotRef) -> (String, String) {
+    let primary = bot.primary_account_id.as_str();
+    let long_context = bot.long_context_account_id.as_str();
+    let fallback = bot.fallback_account_id.as_str();
+    if score < 35 {
+        (first_lane(&[fallback, primary, long_context]), "lightweight".into())
+    } else if score < 70 {
+        (first_lane(&[primary, fallback, long_context]), "balanced".into())
+    } else {
+        (first_lane(&[long_context, primary, fallback]), "heavy".into())
+    }
+}
+
+/// Live turn: long context only after the thread grows. A single set lane is used for every turn.
+pub fn pick_turn_account(primary: &str, long_context: &str, fallback: &str, context_chars: usize) -> String {
+    if context_chars >= LONG_CONTEXT_CHARS {
+        first_lane(&[long_context, primary, fallback])
+    } else {
+        first_lane(&[primary, fallback, long_context])
     }
 }
 
@@ -290,8 +325,11 @@ pub fn delegation_toast(plans: &[PlannedContract]) -> String {
 }
 
 pub fn route_mobile(text: &str, chief_id: &str, groups: &[GroupRef], bots: &[BotRef]) -> std::result::Result<MobileRoute, String> {
-    let trimmed = text.trim();
-    let trimmed = trimmed.strip_prefix("/chief").map(str::trim).unwrap_or(trimmed);
+    let raw = text.trim();
+    let trimmed = match raw.strip_prefix("/chief") {
+        Some(rest) if rest.is_empty() || rest.starts_with(|ch: char| ch.is_whitespace()) => rest.trim(),
+        _ => raw,
+    };
     if trimmed.is_empty() {
         return Err("Write an objective first.".into());
     }
@@ -325,13 +363,49 @@ pub fn route_mobile(text: &str, chief_id: &str, groups: &[GroupRef], bots: &[Bot
 }
 
 pub fn authorize_mobile(connected: bool, channel_id: &str, stored_owner: &str, sender_id: &str) -> std::result::Result<(), String> {
+    authorize_mobile_with_display(connected, channel_id, stored_owner, sender_id, "")
+}
+
+/// Numeric ids match as written. An owner saved as @username also matches the
+/// platform display string, for example "Hari (@harish_g_9449)".
+pub fn owner_matches(stored_owner: &str, sender_id: &str, sender_display: &str) -> bool {
+    let stored = stored_owner.trim();
+    if stored.is_empty() {
+        return false;
+    }
+    let stored_key = stored.trim_start_matches('@').to_ascii_lowercase();
+    let sender = sender_id.trim();
+    if !sender.is_empty()
+        && (sender.eq_ignore_ascii_case(stored) || sender.trim_start_matches('@').eq_ignore_ascii_case(&stored_key))
+    {
+        return true;
+    }
+    username_in_display(sender_display).is_some_and(|user| user.eq_ignore_ascii_case(&stored_key))
+}
+
+fn username_in_display(display: &str) -> Option<&str> {
+    let at = display.rfind('@')?;
+    let mut name = &display[at + 1..];
+    if let Some(end) = name.find(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+        name = &name[..end];
+    }
+    if name.len() >= 4 { Some(name) } else { None }
+}
+
+pub fn authorize_mobile_with_display(
+    connected: bool,
+    channel_id: &str,
+    stored_owner: &str,
+    sender_id: &str,
+    sender_display: &str,
+) -> std::result::Result<(), String> {
     if !connected {
         return Err(format!("BLOCKED: Messaging channel '{channel_id}' is not connected. Connect it first."));
     }
     if stored_owner.trim().is_empty() {
         return Err("BLOCKED: This channel has no allowlisted owner. Connect it again and set an owner id.".into());
     }
-    if sender_id.trim() != stored_owner.trim() {
+    if !owner_matches(stored_owner, sender_id, sender_display) {
         return Err("UNAUTHORIZED: Sender ID does not match the allowlisted owner.".into());
     }
     Ok(())
@@ -394,7 +468,14 @@ pub fn executive_card(commander: &str, scope: &str, objective: &str, rows: &[Car
 }
 
 pub fn load_view(conn: &Connection) -> Result<(String, Vec<DelegationContract>, Vec<DelegationReport>)> {
-    let chief = kv_get(conn, CHIEF_KEY)?.unwrap_or_default();
+    let mut chief = kv_get(conn, CHIEF_KEY)?.unwrap_or_default();
+    if !chief.is_empty() {
+        let live: i64 = conn.query_row("SELECT COUNT(*) FROM bot_profiles WHERE id=?1", params![chief], |row| row.get(0))?;
+        if live == 0 {
+            kv_set(conn, CHIEF_KEY, "")?;
+            chief.clear();
+        }
+    }
     let contracts = load_contracts(conn)?;
     let reports = load_reports(conn)?;
     Ok((chief, contracts, reports))
@@ -501,6 +582,10 @@ pub fn attest_contract(conn: &Connection, contract_id: &str, note: &str) -> Resu
     }
     let now = now_ms();
     conn.execute("UPDATE delegation_contracts SET status='verified_complete', updated_at=?1 WHERE id=?2", params![now, contract_id])?;
+    let _ = conn.execute(
+        "UPDATE chat_threads SET task_status='done', task_next='', status='completed', updated_at=?1 WHERE bot_profile_id=?2 AND task_goal=?3",
+        params![now, current.assignee_bot_id, current.sub_goal],
+    );
     insert_report(conn, contract_id, &current.issuer_bot_id, &current.assignee_bot_id, "owner_attestation", note, &current.commitment, now)?;
     Ok("Attested. The contract is marked done by you.".into())
 }
@@ -534,11 +619,19 @@ pub async fn appoint_chief_officer(state: State<'_, AppState>, bot_id: String) -
 
 #[tauri::command]
 pub async fn dispatch_delegation(state: State<'_, AppState>, issuer_bot_id: String, group_id: String, objective: String) -> Result<CommandResult> {
-    let outcome = {
+    let (outcome, jobs) = {
         let conn = crate::commands::guard(&state);
-        dispatch(&conn, &issuer_bot_id, &group_id, &objective)?
+        let outcome = dispatch(&conn, &issuer_bot_id, &group_id, &objective)?;
+        let jobs = in_progress_jobs(&conn, &outcome.contract_ids);
+        (outcome, jobs)
     };
-    crate::commands::finish_payload(&state, Some(outcome.toast), Some(json!({ "card": outcome.card, "contractIds": outcome.contract_ids })))
+    let toast = if jobs.is_empty() {
+        outcome.toast
+    } else {
+        format!("{} The assignee chat has started.", outcome.toast)
+    };
+    spawn_assignment_chats(state.inner(), jobs);
+    crate::commands::finish_payload(&state, Some(toast), Some(json!({ "card": outcome.card, "contractIds": outcome.contract_ids })))
 }
 
 #[tauri::command]
@@ -565,16 +658,27 @@ pub async fn handle_mobile_chief_command(
     gateway: State<'_, std::sync::Arc<crate::gateway_connections::GatewayManager>>,
     channel_id: String,
     sender_id: String,
+    sender_display: Option<String>,
     chat_id: String,
     text: String,
     callback: String,
 ) -> Result<CommandResult> {
     let mgr = gateway.inner();
     let connected = mgr.is_connected(&channel_id);
-    let owner = mgr.stored_owner(&channel_id);
-    authorize_mobile(connected, &channel_id, &owner, &sender_id).map_err(err)?;
+    let mut owner = mgr.stored_owner(&channel_id);
+    // The first person to message a connected bot with no owner becomes the owner.
+    if connected && owner.trim().is_empty() {
+        let sender = sender_id.trim();
+        if !sender.is_empty() {
+            mgr.remember_owner(&channel_id, sender);
+            owner = sender.to_string();
+        }
+    }
+    let display = sender_display.unwrap_or_default();
+    authorize_mobile_with_display(connected, &channel_id, &owner, &sender_id, &display).map_err(err)?;
     let chat = if chat_id.trim().is_empty() { sender_id.trim().to_string() } else { chat_id.trim().to_string() };
 
+    let mut jobs = Vec::new();
     let (toast, card, ids) = if callback.trim().is_empty() {
         let outcome = {
             let conn = crate::commands::guard(&state);
@@ -582,9 +686,16 @@ pub async fn handle_mobile_chief_command(
             let groups = load_groups(&conn)?;
             let chief_id = kv_get(&conn, CHIEF_KEY)?.unwrap_or_default();
             let route = route_mobile(&text, &chief_id, &groups, &bots).map_err(err)?;
-            dispatch(&conn, &route.issuer_id, &route.group_id, &route.objective)?
+            let outcome = dispatch(&conn, &route.issuer_id, &route.group_id, &route.objective)?;
+            jobs = in_progress_jobs(&conn, &outcome.contract_ids);
+            outcome
         };
-        (outcome.toast, outcome.card, outcome.contract_ids)
+        let toast = if jobs.is_empty() {
+            outcome.toast
+        } else {
+            format!("{} The assignee chat has started.", outcome.toast)
+        };
+        (toast, outcome.card, outcome.contract_ids)
     } else {
         let parsed = parse_callback(&callback).map_err(err)?;
         let (toast, id) = {
@@ -606,6 +717,7 @@ pub async fn handle_mobile_chief_command(
         };
         (toast, card, vec![id])
     };
+    spawn_assignment_chats(state.inner(), jobs);
 
     let mut delivered = false;
     let mut delivery_error = String::new();
@@ -630,6 +742,67 @@ pub async fn handle_mobile_chief_command(
         "contractIds": ids,
     });
     crate::commands::finish_payload(&state, Some(toast), Some(payload))
+}
+
+fn in_progress_jobs(conn: &Connection, ids: &[String]) -> Vec<(String, String)> {
+    let mut jobs = Vec::new();
+    for id in ids {
+        let Ok((assignee, goal, status)) = conn.query_row(
+            "SELECT assignee_bot_id, sub_goal, status FROM delegation_contracts WHERE id=?1",
+            params![id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+        ) else {
+            continue;
+        };
+        if status == "in_progress" && !assignee.trim().is_empty() && !goal.trim().is_empty() {
+            jobs.push((assignee, goal));
+        }
+    }
+    jobs
+}
+
+/// One wave of assignee chats. The assignee's own reply does not start another wave.
+fn spawn_assignment_chats(state: &AppState, jobs: Vec<(String, String)>) {
+    if jobs.is_empty() {
+        return;
+    }
+    let Some(app) = state.app_handle.lock().ok().and_then(|slot| slot.clone()) else {
+        return;
+    };
+    std::thread::spawn(move || {
+        let Some(state) = app.try_state::<AppState>() else {
+            return;
+        };
+        for (assignee, goal) in jobs {
+            let model = {
+                let conn = state.conn.lock().unwrap_or_else(|poison| poison.into_inner());
+                if crate::bots::open_assignment(&conn, &assignee, &goal).is_err() {
+                    continue;
+                }
+                let claimed = crate::agent::claimed_model(&conn, &assignee);
+                if claimed.is_empty() { None } else { Some(claimed) }
+            };
+            let mut tries = 0;
+            loop {
+                if tries >= 30 {
+                    break;
+                }
+                if crate::agent::turn_busy() {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    continue;
+                }
+                let secrets = state.secrets.lock().unwrap_or_else(|poison| poison.into_inner()).clone();
+                match crate::agent::dispatch(&state, &goal, &secrets, None, model.as_deref(), None, &[]) {
+                    Err(error) if error.0.contains("Still answering") => {
+                        tries += 1;
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                    }
+                    _ => break,
+                }
+            }
+        }
+    });
 }
 
 fn telegram_attest_buttons(ids: &[String], state: &AppState) -> Vec<(String, String)> {
@@ -773,10 +946,6 @@ fn insert_report(conn: &Connection, contract_id: &str, from_bot: &str, to_bot: &
 
 fn handle_of(bots: &[BotRef], id: &str) -> String {
     bots.iter().find(|bot| bot.id == id).map(|bot| bot.handle.clone()).unwrap_or_else(|| id.to_string())
-}
-
-fn nonempty(preferred: &str, fallback: &str) -> String {
-    if !preferred.trim().is_empty() { preferred.trim().to_string() } else { fallback.trim().to_string() }
 }
 
 fn needs_human(text: &str) -> bool {
@@ -926,6 +1095,16 @@ mod tests {
         let heavy = route_account(70, &sample_bots()[1]);
         assert_eq!(heavy.1, "heavy");
         assert_eq!(heavy.0, "prov_long");
+        let mut bare = bot("bare", "@bare", "", "");
+        bare.primary_account_id.clear();
+        bare.long_context_account_id = "none".into();
+        bare.fallback_account_id.clear();
+        assert_eq!(route_account(70, &bare).0, "");
+        bare.fallback_account_id = "prov_fast".into();
+        assert_eq!(route_account(70, &bare).0, "prov_fast");
+        assert_eq!(pick_turn_account("", "prov_long", "prov_fast", 100), "prov_fast");
+        assert_eq!(pick_turn_account("prov_main", "prov_long", "prov_fast", LONG_CONTEXT_CHARS), "prov_long");
+        assert_eq!(pick_turn_account("none", "none", "none", 10), "");
     }
 
     #[test]
@@ -983,10 +1162,17 @@ mod tests {
         let global = route_mobile("/chief Audit the payroll ledger", "chief", &groups, &bots).unwrap();
         assert_eq!(global.issuer_id, "chief");
         assert!(global.group_id.is_empty());
+        assert_eq!(global.objective, "Audit the payroll ledger");
+        let literal = route_mobile("/chiefdom stays whole", "chief", &groups, &bots).unwrap();
+        assert_eq!(literal.objective, "/chiefdom stays whole");
         assert!(route_mobile("Audit the payroll ledger", "", &groups, &bots).is_err());
         assert!(authorize_mobile(false, "telegram", "owner", "owner").unwrap_err().contains("BLOCKED"));
         assert!(authorize_mobile(true, "telegram", "owner", "intruder").unwrap_err().contains("UNAUTHORIZED"));
         assert!(authorize_mobile(true, "telegram", " owner ", "owner").is_ok());
+        assert!(owner_matches("@harish_g_9449", "8512444167", "Hari (@harish_g_9449)"));
+        assert!(owner_matches("8512444167", "8512444167", ""));
+        assert!(!owner_matches("8512444167", "999", "Other (@someone)"));
+        assert!(!owner_matches("", "8512444167", "Hari (@harish_g_9449)"));
         assert!(matches!(parse_callback("attest:ctr_1").unwrap(), PhoneCallback::Attest(_)));
         assert!(parse_callback("approve_tx_901").unwrap_err().contains("not a delegation"));
         let card = executive_card(" @chief", "GLOBAL", "Patch the webhook bug", &[]);
@@ -1032,5 +1218,9 @@ mod tests {
         assert!(blocked.to_string().contains("in progress"));
         resolve_friction(&conn, &money.contract_ids[0], "Do not pay. Leave the invoice.").unwrap();
         attest_contract(&conn, &money.contract_ids[0], "Invoice left unpaid on purpose.").unwrap();
+        conn.execute("DELETE FROM bot_profiles WHERE id='chief'", []).unwrap();
+        let (gone, _, _) = load_view(&conn).unwrap();
+        assert_eq!(gone, "");
+        assert_eq!(kv_get(&conn, "chief_bot_id").unwrap().unwrap_or_default(), "");
     }
 }

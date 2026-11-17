@@ -77,6 +77,7 @@ export function Skills() {
   const [plugHook, setPlugHook] = useState<string>("session_start");
   const [plugHasAgent, setPlugHasAgent] = useState<boolean>(true);
   const [plugHasDesktop, setPlugHasDesktop] = useState<boolean>(false);
+  const [plugSide, setPlugSide] = useState<boolean>(false);
   const [plugLabel, setPlugLabel] = useState<string>("");
 
   const profile = snap.profiles.find((p) => p.id === profileId) ?? snap.profiles[0];
@@ -644,6 +645,7 @@ export function Skills() {
                           {plugin.hasDesktop ? (
                             <button
                               disabled={busy}
+                              aria-label={`${plugin.desktopEnabled ? "Turn off" : "Turn on"} desktop for ${plugin.name}`}
                               onClick={() =>
                                 void run("toggle_plugin_desktop", {
                                   id: plugin.id,
@@ -1057,7 +1059,30 @@ export function Skills() {
                 >
                   <span style={plugHasDesktop ? { color: "#ffffff" } : undefined}>Desktop Slot</span>
                 </button>
+                <button
+                  type="button"
+                  onClick={() => setPlugSide((v) => !v)}
+                  className={`px-3 py-1.5 text-xs font-semibold rounded-[5px] border transition ${
+                    plugSide ? "bg-slate-700 text-white border-slate-700" : "bg-white text-slate-600 border-[#E5E5E5]"
+                  }`}
+                  style={plugSide ? { color: "#ffffff" } : undefined}
+                >
+                  <span style={plugSide ? { color: "#ffffff" } : undefined}>Side screen</span>
+                </button>
               </div>
+
+              {plugHasDesktop || plugSide ? (
+                <div className="space-y-1">
+                  <label className="text-xs font-semibold text-slate-700">{plugSide ? "Side screen title" : "Desktop label"}</label>
+                  <input
+                    type="text"
+                    value={plugLabel}
+                    onChange={(e) => setPlugLabel(e.target.value)}
+                    placeholder={plugName.trim() || plugSlug.trim() || "Docs"}
+                    className="w-full px-3 py-2 text-xs bg-white border border-[#E5E5E5] rounded-[6px] outline-none focus:border-slate-400"
+                  />
+                </div>
+              ) : null}
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div className="space-y-1">
@@ -1090,6 +1115,11 @@ export function Skills() {
                 type="button"
                 disabled={busy || !plugSlug.trim()}
                 onClick={async () => {
+                  const screenTitle = (plugLabel || plugName || plugSlug).trim();
+                  const desktop = [
+                    ...(plugHasDesktop && screenTitle ? [{ kind: "status", label: screenTitle, target: "" }] : []),
+                    ...(plugSide && screenTitle ? [{ kind: "pane", label: screenTitle, target: "" }] : []),
+                  ];
                   const res = await run("save_plugin", {
                     draft: {
                       id: "",
@@ -1097,21 +1127,23 @@ export function Skills() {
                       slug: plugSlug.trim(),
                       name: plugName.trim() || plugSlug.trim(),
                       hasAgent: plugHasAgent,
-                      hasDesktop: plugHasDesktop,
+                      hasDesktop: plugHasDesktop || plugSide,
                       tools: plugTool.trim() ? [{ name: plugTool.trim(), description: plugTool.trim() }] : [],
                       hooks: plugHasAgent ? [plugHook] : [],
                       skills: [],
-                      desktop: plugHasDesktop && plugLabel.trim() ? [{ kind: "status", label: plugLabel.trim(), target: "" }] : [],
+                      desktop,
                     },
                   });
                   if (!res) {
                     setAuthorNotice("Could not save the plugin manifest. The toast has the reason.");
                     return;
                   }
-                  setAuthorNotice(`✓ Created plugin manifest for "${plugSlug}"`);
+                  setAuthorNotice(plugSide ? `✓ Created plugin manifest for "${plugSlug}". Turn Desktop on in the plugin table to show its side screen.` : `✓ Created plugin manifest for "${plugSlug}"`);
                   setPlugSlug("");
                   setPlugName("");
                   setPlugTool("");
+                  setPlugLabel("");
+                  setPlugSide(false);
                   setActiveTab("plugins");
                 }}
                 className="px-4 py-2 text-xs font-semibold bg-zinc-800 hover:bg-zinc-700 text-white border border-zinc-700/50 shadow-xs rounded-[6px] transition flex items-center gap-1.5 shadow-2xs"

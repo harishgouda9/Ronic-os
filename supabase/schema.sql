@@ -255,7 +255,8 @@ declare
   seats integer;
 begin
   -- SECURITY DEFINER ignores RLS, so the caller identity is checked here.
-  if p_user_id <> auth.uid() then
+  -- `<>` is unknown when auth.uid() is null, so a signed-out caller used to pass.
+  if auth.uid() is null or p_user_id is distinct from auth.uid() then
     raise exception 'FORBIDDEN: can only register your own devices';
   end if;
 
@@ -296,7 +297,7 @@ security definer
 set search_path = public
 as $$
 begin
-  if p_user_id <> auth.uid() then
+  if auth.uid() is null or p_user_id is distinct from auth.uid() then
     raise exception 'FORBIDDEN: can only revoke your own devices';
   end if;
   delete from public.device_activations
@@ -313,13 +314,37 @@ security definer
 set search_path = public
 as $$
 begin
-  if p_user_id <> auth.uid() then
+  if auth.uid() is null or p_user_id is distinct from auth.uid() then
     raise exception 'FORBIDDEN';
   end if;
+  insert into public.profiles (id, email, full_name, referral_code)
+  select u.id,
+         coalesce(u.email, ''),
+         coalesce(u.raw_user_meta_data->>'full_name', u.raw_user_meta_data->>'display_name', split_part(coalesce(u.email, ''), '@', 1), ''),
+         substr(replace(u.id::text, '-', ''), 1, 10)
+    from auth.users u
+   where u.id = p_user_id
+  on conflict (id) do nothing;
   insert into public.licenses (user_id, plan_tier, max_devices) values (p_user_id, 'free', 1)
   on conflict (user_id) do nothing;
   insert into public.compute_wallets (user_id, balance_micro_usd) values (p_user_id, 0)
   on conflict (user_id) do nothing;
+end;
+$$;
+
+-- The signed-in user deletes their own auth row. Profiles, licenses, devices
+-- and wallets cascade. Service-role billing calls have a null auth.uid().
+create or replace function public.delete_user()
+returns void
+language plpgsql
+security definer
+set search_path = public, auth
+as $$
+begin
+  if auth.uid() is null then
+    raise exception 'FORBIDDEN';
+  end if;
+  delete from auth.users where id = auth.uid();
 end;
 $$;
 
@@ -410,7 +435,31 @@ create policy "read own profile" on public.profiles
 drop policy if exists "update own profile" on public.profiles;
 create policy "update own profile" on public.profiles
   for update to authenticated using (id = auth.uid())
-  with check (id = auth.uid() and founder_badge_number = (select p.founder_badge_number from public.profiles p where p.id = auth.uid()));
+  with check (id = auth.uid());
+
+-- Badge and referral code are server-owned. A plain `=` check in RLS treats
+-- NULL as not equal, so every non-founder profile update was rejected.
+create or replace function public.protect_profile_owner_fields()
+returns trigger
+language plpgsql
+as $$
+begin
+  if auth.uid() is null then
+    return new;
+  end if;
+  if new.id is distinct from old.id
+     or new.founder_badge_number is distinct from old.founder_badge_number
+     or new.referral_code is distinct from old.referral_code then
+    raise exception 'FORBIDDEN';
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists protect_profile_owner_fields on public.profiles;
+create trigger protect_profile_owner_fields
+  before update on public.profiles
+  for each row execute function public.protect_profile_owner_fields();
 
 -- licenses: read-only mirror of what billing decided.
 drop policy if exists "read own license" on public.licenses;
@@ -465,6 +514,7 @@ as $$
     );
 $$;
 
+revoke all on function public.listing_body(uuid) from public, anon;
 grant execute on function public.listing_body(uuid) to authenticated;
 
 drop policy if exists "sellers insert reviews" on public.listings;
@@ -507,10 +557,16 @@ revoke execute on function public.credit_wallet(uuid, bigint) from anon, authent
 revoke execute on function public.debit_wallet(uuid, bigint, bigint) from anon, authenticated;
 revoke execute on function public.set_ghost_runner_status(uuid, text, text) from anon, authenticated;
 -- register_device/revoke_device/ensure_user_rows run with the caller's JWT;
--- each asserts p_user_id = auth.uid() inside the SECURITY DEFINER body:
+-- each asserts p_user_id = auth.uid() inside the SECURITY DEFINER body.
+-- Supabase default privileges grant anon directly, so revoke from public is not enough.
+revoke all on function public.register_device(uuid, text, text, text) from public, anon;
+revoke all on function public.revoke_device(uuid, uuid) from public, anon;
+revoke all on function public.ensure_user_rows(uuid) from public, anon;
 grant execute on function public.register_device(uuid, text, text, text) to authenticated;
 grant execute on function public.revoke_device(uuid, uuid) to authenticated;
 grant execute on function public.ensure_user_rows(uuid) to authenticated;
+revoke all on function public.delete_user() from public, anon;
+grant execute on function public.delete_user() to authenticated;
 
 -- One public MCP door. The desktop registers the current quick-tunnel origin.
 -- The hash is not readable. A later call must send the same token; a different token cannot replace it.

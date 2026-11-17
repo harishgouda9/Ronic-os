@@ -4,6 +4,7 @@ const CUSTOM = "ronic.customModels.v1";
 const EDITS = "ronic.modelEdits.v1";
 const STARS = "ronic.modelStars.v1";
 const EFFORTS = "ronic.modelEffort.v1";
+const BOT_MODELS = "ronic.botModels.v1";
 const LIVE = "ronic.liveModels.v1";
 
 export type ModelEdit = { label?: string; upstreamModel?: string; hidden?: boolean };
@@ -59,6 +60,39 @@ export function modelById(id: string) {
   return [...live, ...custom].find((item) => item.id === id) ?? null;
 }
 
+const SELECTED_MODEL_KEY = "ronic.selectedModel.v1";
+
+function shapedModel(id: string): { id: string; providerId: string; upstreamModel: string } | null {
+  id = id.trim();
+  if (!id) return null;
+  const found = modelById(id);
+  if (found?.providerId) {
+    const edited = read<Record<string, ModelEdit>>(EDITS, {})[found.id]?.upstreamModel?.trim();
+    const upstreamModel = edited || found.upstreamModel.trim();
+    if (upstreamModel && !upstreamModel.includes(" ")) {
+      return { id: found.id, providerId: found.providerId, upstreamModel };
+    }
+  }
+  const split = id.indexOf(":");
+  if (split > 0 && id.startsWith("prov_")) {
+    const upstreamModel = id.slice(split + 1).trim();
+    if (upstreamModel && !upstreamModel.includes(" ")) {
+      return { id, providerId: id.slice(0, split), upstreamModel };
+    }
+  }
+  return null;
+}
+
+export function selectedComposerModel(): { id: string; providerId: string; upstreamModel: string } | null {
+  let id = "";
+  try {
+    id = localStorage.getItem(SELECTED_MODEL_KEY) ?? "";
+  } catch {
+    return null;
+  }
+  return shapedModel(id);
+}
+
 export function groupsFor(models: ChatModel[], query: string) {
   const needle = query.trim().toLowerCase();
   const buckets = new Map<string, ChatModel[]>();
@@ -94,6 +128,76 @@ export function setEffort(id: string, effort: Effort) {
   const map = read<Record<string, Effort>>(EFFORTS, {});
   map[id] = effort;
   write(EFFORTS, map);
+}
+
+export const EFFORT_OPTIONS: { id: Effort; label: string }[] = [
+  { id: "default", label: "Default" },
+  { id: "high", label: "High" },
+  { id: "max", label: "Max" },
+  { id: "xhigh", label: "XHigh" },
+];
+
+export function readBotModels(): Record<string, string> {
+  const raw = read<Record<string, unknown>>(BOT_MODELS, {});
+  const out: Record<string, string> = {};
+  const seen = new Set<string>();
+  for (const [botId, modelId] of Object.entries(raw)) {
+    if (typeof modelId !== "string" || !modelId.trim() || seen.has(modelId)) continue;
+    seen.add(modelId);
+    out[botId] = modelId;
+  }
+  return out;
+}
+
+/** One model id belongs to one bot. Choosing it here takes it off the others. */
+export function claimModel(map: Record<string, string>, botId: string, modelId: string): Record<string, string> {
+  const next = { ...map };
+  const bot = botId.trim();
+  const model = modelId.trim();
+  if (!bot) return next;
+  if (!model) {
+    delete next[bot];
+    return next;
+  }
+  for (const key of Object.keys(next)) {
+    if (key !== bot && next[key] === model) delete next[key];
+  }
+  next[bot] = model;
+  return next;
+}
+
+export function modelClaimedBy(map: Record<string, string>, modelId: string, exceptBotId: string): string {
+  const model = modelId.trim();
+  if (!model) return "";
+  for (const [bot, id] of Object.entries(map)) {
+    if (bot !== exceptBotId && id === model) return bot;
+  }
+  return "";
+}
+
+export function modelForBot(botId: string): string {
+  return readBotModels()[botId] ?? "";
+}
+
+export function assignBotModel(botId: string, modelId: string) {
+  const prev = readBotModels();
+  const next = claimModel(prev, botId, modelId);
+  if (JSON.stringify(prev) === JSON.stringify(next)) return next;
+  write(BOT_MODELS, next);
+  if (typeof window !== "undefined") window.dispatchEvent(new Event("ronic-bot-model"));
+  return next;
+}
+
+export function keepBotModel(botId: string, current: string, ids: readonly string[]): string {
+  const allowed = new Set(ids);
+  const owned = modelForBot(botId);
+  if (owned && allowed.has(owned)) return owned;
+  if (current && allowed.has(current) && !modelClaimedBy(readBotModels(), current, botId)) return current;
+  return "";
+}
+
+export function composerModelFor(botId: string): { id: string; providerId: string; upstreamModel: string } | null {
+  return shapedModel(modelForBot(botId));
 }
 
 export function addCustom(draft: { label: string; upstreamModel: string; providerId: string }) {

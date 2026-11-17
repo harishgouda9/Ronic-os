@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { DelegationContract } from "../types";
 import { useRonic } from "../store";
 
@@ -19,6 +19,8 @@ export function ChiefDelegationPanel({ onClose }: { onClose: () => void }) {
   const contracts = snap.delegationContracts ?? [];
   const reports = snap.delegationReports ?? [];
   const [chiefId, setChiefId] = useState(snap.chiefBotId || "");
+  useEffect(() => { setChiefId(snap.chiefBotId || ""); }, [snap.chiefBotId]);
+  const chiefFirst = [...snap.profiles].sort((a, b) => Number(b.id === snap.chiefBotId) - Number(a.id === snap.chiefBotId));
   const [scope, setScope] = useState("");
   const [objective, setObjective] = useState("");
   const [note, setNote] = useState("");
@@ -67,8 +69,8 @@ export function ChiefDelegationPanel({ onClose }: { onClose: () => void }) {
             <span>Chief officer</span>
             <select className="select" value={chiefId} onChange={(event) => setChiefId(event.target.value)}>
               <option value="">No chief</option>
-              {snap.profiles.map((bot) => (
-                <option key={bot.id} value={bot.id}>{botLabel(bot.id, snap.profiles)}</option>
+              {chiefFirst.map((bot) => (
+                <option key={bot.id} value={bot.id}>{botLabel(bot.id, snap.profiles)}{bot.id === snap.chiefBotId ? " · Chief" : ""}</option>
               ))}
             </select>
           </label>
