@@ -14,12 +14,14 @@ import {
   Search,
   Sparkles,
   Square,
+  Zap,
 } from "lucide-react";
 import { pickPaths } from "../api";
 import type { LinkedApp, Provider, ProviderType } from "../types";
 import { useRonic } from "../store";
 import { Pill } from "../ui/bits";
 import { AppLogo } from "../ui/appLogos";
+import { ProviderConnectModal } from "../ui/ProviderConnectModal";
 
 const INSTALLS: Record<string, string> = {
   prov_claude: "https://docs.anthropic.com/en/docs/claude-code/setup",
@@ -150,9 +152,13 @@ export function Providers() {
   const snap = useRonic((s) => s.snap)!;
   const run = useRonic((s) => s.run);
   const busy = useRonic((s) => s.busy);
+  const go = useRonic((s) => s.go);
 
   const [modalOpen, setModalOpen] = useState(false);
   const [modalTab, setModalTab] = useState<"provider" | "app">("provider");
+  const [quickConnectOpen, setQuickConnectOpen] = useState(false);
+  const [quickConnectBusy, setQuickConnectBusy] = useState<string>("");
+  const [quickConnectStatus, setQuickConnectStatus] = useState<string>("");
   const [connectedFilter, setConnectedFilter] = useState<"all" | "providers" | "apps">("all");
   const [catalogFilter, setCatalogFilter] = useState<"all" | "api" | "cli" | "web" | "apps">("all");
   const [searchQuery, setSearchQuery] = useState("");
@@ -169,6 +175,69 @@ export function Providers() {
     setModalTab(tab);
     setModalOpen(true);
   }
+
+  // Quick-connect handlers: OAuth subscription sign-in + API key save
+  const connectedIds = useMemo(
+    () => new Set(snap.providers.filter(isProviderConnected).map((p) => p.id)),
+    [snap.providers]
+  );
+
+  const handleQuickOAuth = useCallback(
+    async (providerId: string) => {
+      setQuickConnectBusy(providerId);
+      setQuickConnectStatus("");
+      try {
+        if (providerId === "prov_chatgpt") {
+          const result = await run("sign_in_chatgpt");
+          const toast = (result as { toast?: string } | undefined)?.toast ?? "";
+          setQuickConnectStatus(toast || "Signed in with ChatGPT.");
+        } else {
+          setQuickConnectStatus("OAuth not yet available for this provider. Use an API key.");
+        }
+      } catch (e) {
+        setQuickConnectStatus(e instanceof Error ? e.message : "Sign-in failed.");
+      } finally {
+        setQuickConnectBusy("");
+      }
+    },
+    [run]
+  );
+
+  const handleQuickSaveKey = useCallback(
+    async (providerId: string, secret: string) => {
+      setQuickConnectBusy(providerId);
+      setQuickConnectStatus("");
+      try {
+        await run("set_provider_secret", { id: providerId, secret });
+        await run("test_provider", { id: providerId });
+        setQuickConnectStatus(`Connected ${providerId.replace(/^prov_/, "")}.`);
+      } finally {
+        setQuickConnectBusy("");
+      }
+    },
+    [run]
+  );
+
+  const handleQuickOpenSite = useCallback(
+    (providerId: string) => {
+      sessionStorage.setItem("ronic.focusHarness", providerId);
+      go("chat");
+    },
+    [go]
+  );
+
+  const handleQuickTestLocal = useCallback(
+    async (providerId: string) => {
+      setQuickConnectBusy(providerId);
+      try {
+        await run("test_provider", { id: providerId });
+        setQuickConnectStatus("Checked local provider status.");
+      } finally {
+        setQuickConnectBusy("");
+      }
+    },
+    [run]
+  );
 
   const browseForApp = useCallback(
     (appId: string) => {
@@ -260,10 +329,18 @@ export function Providers() {
               </button>
               <button
                 type="button"
+                onClick={() => setQuickConnectOpen(true)}
+                title="Sign in with your existing ChatGPT, Claude, Gemini, or other subscription"
+                className="text-xs font-semibold px-3.5 py-2 rounded-full bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-500 hover:to-indigo-500 text-white border border-violet-500/30 shadow-sm transition-all cursor-pointer active:scale-95 flex items-center gap-1.5"
+              >
+                <Zap size={12} /> Quick connect
+              </button>
+              <button
+                type="button"
                 onClick={() => openAdd("provider")}
                 className="text-xs font-semibold px-3.5 py-2 rounded-full bg-zinc-800 hover:bg-zinc-700 text-white border border-zinc-700/50 shadow-xs transition-all cursor-pointer active:scale-95 disabled:opacity-40 flex items-center gap-1.5"
               >
-                <Plus size={12} /> Connect new
+                <Plus size={12} /> Custom
               </button>
             </div>
           </div>
@@ -480,6 +557,21 @@ export function Providers() {
           onClose={() => setModalOpen(false)}
         />
       )}
+
+      <ProviderConnectModal
+        open={quickConnectOpen}
+        onClose={() => {
+          setQuickConnectOpen(false);
+          setQuickConnectStatus("");
+        }}
+        onOAuth={handleQuickOAuth}
+        onSaveKey={handleQuickSaveKey}
+        onOpenSite={handleQuickOpenSite}
+        onTestLocal={handleQuickTestLocal}
+        connectedIds={connectedIds}
+        busyId={quickConnectBusy}
+        status={quickConnectStatus}
+      />
     </div>
   );
 }

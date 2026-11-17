@@ -102,6 +102,7 @@ fn main() {
         "workspace_git",
         "install_git_package",
         "create_workflow",
+        "import_workflow",
         "update_workflow",
         "pause_workflow",
         "resume_workflow",

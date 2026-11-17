@@ -679,6 +679,10 @@ function boundsKey(bounds: WebAppBounds) {
   return `${Math.round(bounds.x)}|${Math.round(bounds.y)}|${Math.round(bounds.width)}|${Math.round(bounds.height)}`;
 }
 
+export function miniComputerBounds(el: HTMLElement): WebAppBounds | null {
+  return screenBounds(el);
+}
+
 export function ComputerDock({ inspectedId, onInspect, onClose, onCover, onRunRoutine, initialTab }: { inspectedId: string; onInspect: (id: string) => void; onClose?: () => void; onCover?: (on: boolean) => void; onRunRoutine?: () => void; initialTab?: "computer" | "browser" }) {
   const snap = useRonic((s) => s.snap)!;
   const run = useRonic((s) => s.run);
@@ -688,6 +692,14 @@ export function ComputerDock({ inspectedId, onInspect, onClose, onCover, onRunRo
   useEffect(() => {
     if (initialTab) setTab(initialTab);
   }, [initialTab]);
+  useEffect(() => {
+    const onOpen = (event: Event) => {
+      const detail = (event as CustomEvent<{ botId?: string }>).detail;
+      if (detail?.botId === botIdRef.current) setTab("computer");
+    };
+    window.addEventListener("ronic-mini-computer-open", onOpen);
+    return () => window.removeEventListener("ronic-mini-computer-open", onOpen);
+  }, []);
   const [teaching, setTeaching] = useState(false);
   const [notes, setNotes] = useState("");
   const [draft, setDraft] = useState(bot?.screenUrl ?? "");

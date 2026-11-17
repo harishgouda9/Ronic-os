@@ -313,6 +313,25 @@ export type RegistryTool = {
   reason: string;
 };
 
+export type CustomModelProvider = {
+  providerId: string;
+  endpoint: string;
+  apiKey: string;
+  customModel: string;
+};
+
+export type McpRecommendation = {
+  id: string;
+  name: string;
+  description: string;
+  reason: string;
+  catalogSlug: string;
+  authMethod: "oauth" | "api_key" | "multi_field" | "local_path" | "local_daemon" | "none";
+  keyUrl?: string;
+  connected: boolean;
+  connectedAt?: number;
+};
+
 export type WfNode = {
   id: string;
   name: string;
@@ -322,6 +341,12 @@ export type WfNode = {
   prompt: string;
   status: "done" | "paused" | "pending" | "running" | "error";
   latencyMs: number;
+  customModelProvider?: CustomModelProvider;
+  skillIds?: string[];
+  pluginIds?: string[];
+  mcpServerIds?: string[];
+  subscriptionPlan?: "free" | "pro" | "founder_lifetime" | "team" | string;
+  recommendedMcpServers?: McpRecommendation[];
 };
 
 export type Workflow = {
@@ -334,7 +359,23 @@ export type Workflow = {
   pausedAtNodeId: string | null;
   checkpoint: Record<string, string>;
   updatedAt: number;
+  scheduleEnabled: boolean;
+  lastFiredAt: number;
 };
+
+export type WorkflowRun = {
+  id: string;
+  workflowId: string;
+  triggerKind: string;
+  status: string;
+  currentNodeId: string;
+  error: string;
+  nodes: WfNode[];
+  checkpoint: Record<string, string>;
+  startedAt: number;
+  finishedAt: number | null;
+};
+
 
 export type Policy = {
   maxPerTxUsd: number;
@@ -593,6 +634,7 @@ export type Snapshot = {
   registry: RegistryTool[];
   skillIndexDelta: string;
   workflows: Workflow[];
+  workflowRuns: WorkflowRun[];
   policy: Policy;
   balances: Balance[];
   connectedWallets?: WatchedWallet[];

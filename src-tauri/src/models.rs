@@ -356,6 +356,29 @@ pub struct RegistryTool {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct CustomModelProvider {
+    pub provider_id: String,
+    pub endpoint: String,
+    pub api_key: String,
+    pub custom_model: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpRecommendation {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub reason: String,
+    pub catalog_slug: String,
+    pub auth_method: String,
+    pub key_url: Option<String>,
+    pub connected: bool,
+    pub connected_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct WfNode {
     pub id: String,
     pub name: String,
@@ -365,6 +388,12 @@ pub struct WfNode {
     pub prompt: String,
     pub status: String,
     pub latency_ms: i64,
+    pub custom_model_provider: Option<CustomModelProvider>,
+    pub skill_ids: Option<Vec<String>>,
+    pub plugin_ids: Option<Vec<String>>,
+    pub mcp_server_ids: Option<Vec<String>>,
+    pub subscription_plan: Option<String>,
+    pub recommended_mcp_servers: Option<Vec<McpRecommendation>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -379,6 +408,23 @@ pub struct Workflow {
     pub paused_at_node_id: Option<String>,
     pub checkpoint: serde_json::Map<String, Value>,
     pub updated_at: i64,
+    pub schedule_enabled: bool,
+    pub last_fired_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowRun {
+    pub id: String,
+    pub workflow_id: String,
+    pub trigger_kind: String,
+    pub status: String,
+    pub current_node_id: String,
+    pub error: String,
+    pub nodes: Vec<WfNode>,
+    pub checkpoint: serde_json::Map<String, Value>,
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -769,6 +815,8 @@ pub struct Snapshot {
     pub registry: Vec<RegistryTool>,
     pub skill_index_delta: String,
     pub workflows: Vec<Workflow>,
+    #[serde(default)]
+    pub workflow_runs: Vec<WorkflowRun>,
     pub policy: Policy,
     pub balances: Vec<Balance>,
     #[serde(default)]

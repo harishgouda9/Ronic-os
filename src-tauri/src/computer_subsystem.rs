@@ -18,6 +18,7 @@
 
 use crate::error::{err, Result};
 use crate::util::safe_id_component;
+use crate::workspace_apps::WebAppBounds;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,6 +35,7 @@ use tauri::{AppHandle, Emitter, Manager, Webview, WebviewBuilder, WebviewUrl, We
 static SOM_MARKS: OnceLock<Mutex<HashMap<u32, UIAControlNode>>> = OnceLock::new();
 static MINI_WINDOWS: OnceLock<Mutex<HashMap<String, BotMiniWindowInstance>>> = OnceLock::new();
 static SHELL_STATES: OnceLock<Mutex<HashMap<String, ShellState>>> = OnceLock::new();
+static EXPANDED_MINI_WINDOWS: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
 static LAST_UIA_FILTER: Mutex<String> = Mutex::new(String::new());
 static EMERGENCY_HALT: AtomicBool = AtomicBool::new(false);
 
@@ -49,6 +51,53 @@ fn shell_states() -> MutexGuard<'static, HashMap<String, ShellState>> {
     SHELL_STATES.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|poison| poison.into_inner())
 }
 
+pub fn mini_is_expanded(app: &AppHandle, bot_id: &str) -> bool {
+    app.get_window(&mini_label(bot_id).unwrap_or_default()).is_some()
+        && EXPANDED_MINI_WINDOWS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|poison| poison.into_inner()).get(bot_id.trim()).copied().unwrap_or(true)
+}
+
+fn mark_mini_expanded(bot_id: &str, expanded: bool) {
+    EXPANDED_MINI_WINDOWS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap_or_else(|poison| poison.into_inner()).insert(bot_id.trim().to_string(), expanded);
+}
+
+#[cfg(windows)]
+fn reparent_chrome(app: &AppHandle, bot_id: &str, expanded: bool) -> Result<()> {
+    let Some(chrome) = app.get_webview(&chrome_label(bot_id)?) else { return Ok(()) };
+    let parent_label = if expanded { mini_label(bot_id)? } else { "main".to_string() };
+    let app_clone = app.clone();
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    chrome.with_webview(move |view: tauri::webview::PlatformWebview| {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{SetParent, SetWindowPos, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER};
+        // Re-fetch the parent window inside the closure to avoid capturing HWND (not Send)
+        let parent = match app_clone.get_window(&parent_label) {
+            Some(p) => p,
+            None => { let _ = tx.send(Err(err("parent window not found"))); return; }
+        };
+        let parent_hwnd = match parent.hwnd() {
+            Ok(h) => h,
+            Err(e) => { let _ = tx.send(Err(err(e.to_string()))); return; }
+        };
+        let result = unsafe {
+            let mut container = HWND::default();
+            view.controller().ParentWindow(&mut container).map_err(|error| err(error.to_string())).and_then(|_| {
+                SetParent(container, Some(parent_hwnd)).map_err(|error| err(error.to_string()))?;
+                view.controller().SetParentWindow(parent_hwnd).map_err(|error| err(error.to_string()))?;
+                SetWindowPos(container, None, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOZORDER).map_err(|error| err(error.to_string()))
+            })
+        };
+        let _ = tx.send(result);
+    }).map_err(|error| err(error.to_string()))?;
+    rx.recv().map_err(|_| err("the browser could not change screens"))?.map_err(|e| err(e.0))?;
+    mark_mini_expanded(bot_id, expanded);
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn reparent_chrome(_app: &AppHandle, _bot_id: &str, _expanded: bool) -> Result<()> {
+    Err(err("moving a bot computer between screens is currently supported on Windows"))
+}
+
 fn last_uia_filter() -> MutexGuard<'static, String> {
     LAST_UIA_FILTER.lock().unwrap_or_else(|poison| poison.into_inner())
 }
@@ -62,6 +111,10 @@ fn fold_name(text: &str) -> String {
 }
 
 /// Exact name, or the clipped 80-character prefix the registry stored.
+fn uia_value_matches(actual: &str, requested: &str) -> bool {
+    actual.replace("\r\n", "\n") == requested.replace("\r\n", "\n")
+}
+
 fn names_match(stored: &str, live: &str) -> bool {
     let stored_folded = fold_name(stored);
     let live_folded = fold_name(live);
@@ -285,6 +338,8 @@ pub struct ShellState {
     /// The shell's real devicePixelRatio (window.scale_factor() can lie for
     /// freshly created windows on Windows — trust the page's own value).
     pub dpr: f64,
+    /// True only while the chat dock reports a visible Chrome content slot.
+    pub embedded_host_visible: bool,
     /// Recent page navigations (newest first, capped) — the Chrome app's
     /// history button reads this.
     pub history: Vec<String>,
@@ -299,6 +354,7 @@ impl Default for ShellState {
             chrome_visible: false,
             content: [0.0, 111.0, 980.0, 505.0],
             dpr: 1.0,
+            embedded_host_visible: false,
             history: Vec::new(),
         }
     }
@@ -316,6 +372,50 @@ pub fn update_shell_state<R>(bot_id: &str, f: impl FnOnce(&mut ShellState) -> R)
     let mut states = shell_states();
     let state = states.entry(bot_id.trim().to_string()).or_default();
     f(state)
+}
+
+/// Returns the bot's display handle from the mini window registry,
+/// falling back to "@bot" when no entry exists yet.
+pub fn bot_handle_of(_app: &AppHandle, bot_id: &str) -> String {
+    mini_windows()
+        .get(bot_id.trim())
+        .map(|entry| entry.bot_handle.clone())
+        .unwrap_or_else(|| "@bot".into())
+}
+
+/// Keeps the existing Browser tab as a second view of this same live Chrome,
+/// without creating the legacy botscreen browser or opening a floating window.
+pub fn show_embedded_chrome(app: &AppHandle, bot_id: &str, url: &str, bounds: WebAppBounds, focus: bool) -> Result<()> {
+    let id = safe_id_component(bot_id)?.to_string();
+    let parsed = agent_url_allowed(url)?;
+    let home = crate::util::product_home();
+    let handle = bot_handle_of(app, &id);
+    open_chrome_tab(app, &home, &id, &handle, parsed, true)?;
+    let scale = app.get_window("main").ok_or_else(|| err("main window is not open"))?.scale_factor().unwrap_or(1.0);
+    update_shell_state(&id, |s| {
+        s.content = [bounds.x, bounds.y, bounds.width, bounds.height];
+        s.embedded_host_visible = true;
+        s.dpr = scale;
+    });
+    apply_chrome_visibility(app, &id);
+    if focus {
+        if let Some(view) = app.get_webview(&chrome_label(&id)?) {
+            let _ = view.set_focus();
+        }
+    }
+    broadcast_shell(app, &id, "embedded_browser");
+    Ok(())
+}
+
+pub fn hide_embedded_chrome(app: &AppHandle, bot_id: &str) {
+    update_shell_state(bot_id, |state| state.embedded_host_visible = false);
+    if let Some(view) = app.get_webview(&chrome_label(bot_id).unwrap_or_default()) {
+        let _ = view.hide();
+        let _ = view.set_bounds(tauri::Rect {
+            position: tauri::Position::Physical(tauri::PhysicalPosition::new(-10000, -10000)),
+            size: tauri::Size::Physical(tauri::PhysicalSize::new(1, 1)),
+        });
+    }
 }
 
 /// Pushes the full shell + instance snapshot to every window listening on
@@ -381,6 +481,7 @@ pub const BOT_MINI_WINDOW_HUD_SCRIPT: &str = r#"(function(){
         overlay.textContent = '🛑 HALT REQUESTED — drivers paused from the studio';
         document.body && document.body.appendChild(overlay);
         try { window.stop(); } catch (_) {}
+        try { location.href = 'ronic-halt:engage'; } catch (_) {}
       } else {
         overlay.remove();
       }
@@ -498,6 +599,7 @@ fn spawn_mini_window(
     let label = mini_label(bot_id)?;
     let existing_count = mini_windows().len();
     if app.get_window(&label).is_none() {
+        let was_embedded = app.get_webview(&chrome_label(bot_id)?).is_some();
         let dir = mini_browser_dir(home, bot_id)?;
         let _ = std::fs::create_dir_all(&dir);
         let (x, y) = cascade_position(app, existing_count, 980.0, 660.0);
@@ -529,13 +631,25 @@ fn spawn_mini_window(
         if always_on_top {
             builder = builder.always_on_top(true);
         }
-        builder
+        let win = builder
             .build()
             .map_err(|e| err(format!("failed to spawn the mini computer window: {e}")))?;
-        if let Some(win) = app.get_window(&label) {
-            let _ = win.set_position(tauri::LogicalPosition::new(x, y));
+        let _ = win.set_position(tauri::LogicalPosition::new(x, y));
+        if !was_embedded {
+            update_shell_state(bot_id, |s| *s = ShellState::default());
         }
-        update_shell_state(bot_id, |s| *s = ShellState::default());
+        let close_app = app.clone();
+        let close_id = bot_id.to_string();
+        win.on_window_event(move |event| {
+            if matches!(event, tauri::WindowEvent::Destroyed) {
+                if close_app.get_webview(&chrome_label(&close_id).unwrap_or_default()).is_some() {
+                    let _ = reparent_chrome(&close_app, &close_id, false);
+                }
+                mini_windows().remove(&close_id);
+                mark_mini_expanded(&close_id, false);
+                broadcast_shell(&close_app, &close_id, "embedded");
+            }
+        });
         // Observed on this WebView2 build: a freshly created webview can sit
         // on about:blank even when the builder carried an App URL — navigate
         // it explicitly if it hasn't loaded the shell page.
@@ -548,6 +662,8 @@ fn spawn_mini_window(
         let _ = win.unminimize();
         let _ = win.show();
     }
+    mark_mini_expanded(bot_id, true);
+    reparent_chrome(app, bot_id, true)?;
 
     if let Some(target) = parsed {
         open_chrome_tab(app, home, bot_id, bot_handle, target, true)?;
@@ -614,10 +730,11 @@ fn shell_page_url(app: &AppHandle) -> Option<url::Url> {
 pub fn ensure_chrome(app: &AppHandle, home: &std::path::Path, bot_id: &str, url: Option<url::Url>) -> Result<String> {
     let label = chrome_label(bot_id)?;
     let win_label = mini_label(bot_id)?;
+    let expanded = mini_is_expanded(app, bot_id);
     if app.get_webview(&label).is_none() {
         let window = app
-            .get_window(&win_label)
-            .ok_or_else(|| err("that bot's mini computer window is not open"))?;
+            .get_window(if expanded { &win_label } else { "main" })
+            .ok_or_else(|| err("that bot's computer screen is not open"))?;
         let dir = mini_browser_dir(home, bot_id)?;
         let _ = std::fs::create_dir_all(&dir);
         let blank = url::Url::parse("about:blank").expect("static url");
@@ -630,6 +747,10 @@ pub fn ensure_chrome(app: &AppHandle, home: &std::path::Path, bot_id: &str, url:
             .initialization_script(crate::workspace_bridge::PAGE_SCRIPT)
             .data_directory(dir)
             .on_navigation(move |nav_url| {
+                if nav_url.scheme() == "ronic-halt" {
+                    EMERGENCY_HALT.store(true, Ordering::Relaxed);
+                    return false;
+                }
                 // The webview IS the active tab's surface — keep the tab strip,
                 // the title bar, and the agent's status in step with every
                 // navigation the page makes (link clicks, redirects).
@@ -699,7 +820,8 @@ pub fn apply_chrome_visibility(app: &AppHandle, bot_id: &str) {
     };
     let Some(webview) = app.get_webview(&label) else { return };
     let state = shell_state(bot_id);
-    if state.chrome_visible {
+    let visible = state.chrome_visible && (mini_is_expanded(app, bot_id) || state.embedded_host_visible);
+    if visible {
         let _ = webview.show();
         reposition_chrome(app, bot_id);
     } else {
@@ -714,7 +836,8 @@ pub fn apply_chrome_visibility(app: &AppHandle, bot_id: &str) {
 
 pub fn reposition_chrome(app: &AppHandle, bot_id: &str) {
     let state = shell_state(bot_id);
-    if !state.chrome_visible {
+    let expanded = mini_is_expanded(app, bot_id);
+    if !state.chrome_visible || (!expanded && !state.embedded_host_visible) {
         // Child webview HWND must stay parked off-screen when Chrome tab is not active,
         // so it never renders over or occludes the desktop view on Windows.
         let label = match chrome_label(bot_id) {
@@ -735,7 +858,8 @@ pub fn reposition_chrome(app: &AppHandle, bot_id: &str) {
         Err(_) => return,
     };
     let Some(webview) = app.get_webview(&label) else { return };
-    let Some(window) = app.get_window(&mini_label(bot_id).unwrap_or_default()) else { return };
+    let expanded = mini_is_expanded(app, bot_id);
+    let Some(window) = (if expanded { app.get_window(&mini_label(bot_id).unwrap_or_default()) } else { app.get_window("main") }) else { return };
     // The shell reports its content rect in CSS px; the page's real
     // devicePixelRatio (stored by mini_shell_layout — window.scale_factor()
     // can report 1.0 for freshly created windows) converts it to physical.
@@ -770,11 +894,9 @@ pub fn open_chrome_tab(
     target: url::Url,
     focus_matching: bool,
 ) -> Result<ShellTab> {
-    // Opening a tab from anywhere (chat dock, agent) brings the bot's own
-    // mini computer window up — one click from the chat, no studio detour.
-    if app.get_window(&mini_label(bot_id).unwrap_or_default()).is_none() {
-        spawn_mini_window(app, home, bot_id, bot_handle, None, true)?;
-    }
+    // Bot navigation stays in the chat's Computer panel; only the user's
+    // expand action creates a separate native window.
+    let expanded = mini_is_expanded(app, bot_id);
     ensure_chrome(app, home, bot_id, Some(target.clone()))?;
     let target_str = target.to_string();
     let tab = update_shell_state(bot_id, |state| {
@@ -799,9 +921,14 @@ pub fn open_chrome_tab(
         state.app = "chrome".into();
         state.chrome_visible = true;
     });
-    if let Some(window) = app.get_window(&mini_label(bot_id).unwrap_or_default()) {
-        let _ = window.show();
-        let _ = window.unminimize();
+    if expanded {
+        if let Some(window) = app.get_window(&mini_label(bot_id).unwrap_or_default()) {
+            let _ = window.show();
+            let _ = window.unminimize();
+        }
+    } else if let Some(main) = app.get_webview_window("main") {
+        let detail = serde_json::json!({ "botId": bot_id, "botHandle": bot_handle, "url": target.to_string() });
+        let _ = main.eval(format!("window.dispatchEvent(new CustomEvent('ronic-mini-computer-open', {{ detail: {detail} }}))"));
     }
     apply_chrome_visibility(app, bot_id);
     sync_window_title(app, bot_id);
@@ -858,10 +985,11 @@ pub fn list_bot_mini_computer_windows(app: AppHandle) -> Vec<BotMiniWindowInstan
 pub fn close_bot_mini_computer_window(app: AppHandle, bot_id: String) -> Result<String> {
     let label = mini_label(&bot_id)?;
     if let Some(win) = app.get_window(&label) {
+        let _ = reparent_chrome(&app, &bot_id, false);
         let _ = win.close();
     }
     mini_windows().remove(bot_id.trim());
-    shell_states().remove(bot_id.trim());
+    mark_mini_expanded(&bot_id, false);
     let _ = app.emit("ronic://mini-computer", serde_json::json!({ "action": "closed", "botId": bot_id }));
     Ok(format!("Closed {label}."))
 }
@@ -1002,10 +1130,11 @@ fn drive_labeled_window(
                     }
                 }
             }
-            // Last resort: hand back whatever usable page is live (a consent
-            // redirect, for example) so the agent sees the real url and can
-            // re-plan, instead of a naked timeout.
-            collect_once(&win, label, started, None).ok_or(last)
+            if expected_url.is_none() {
+                collect_once(&win, label, started, None, std::time::Instant::now() + Duration::from_secs(3)).ok_or(last)
+            } else {
+                Err(last)
+            }
         }
         "click" | "type" => {
             let script = match kind {
@@ -1054,7 +1183,16 @@ fn drive_labeled_window(
             let raw = eval_window_json(&win, &script, Duration::from_secs(3))?;
             hit_from_json(&raw, label, started)
         }
-        _ => Err(err("kind must be read, click, type, scroll, or find")),
+        "submit" => {
+            let id = control_index.ok_or_else(|| err("pick the input to submit; read the page again for a fresh id"))?;
+            let acted = act_eval(&win, &mini_submit_js(id))?;
+            let mut hit = poll_read_hit(&win, label, started, None, Duration::from_millis(1800))?;
+            if let Some(note) = acted.get("note").and_then(|value| value.as_str()).filter(|note| !note.is_empty()) {
+                hit.note = Some(note.to_string());
+            }
+            Ok(hit)
+        }
+        _ => Err(err("kind must be read, click, type, submit, scroll, or find")),
     }
 }
 
@@ -1596,8 +1734,9 @@ fn same_host_path(live: &str, expected: &str) -> bool {
 
 /// One collect eval turned into a hit, or None while the page is not usable
 /// yet (loading, blank, or still on the previous document).
-fn collect_once(win: &DriveSurface, label: &str, started: std::time::Instant, expected: Option<&str>) -> Option<MiniWindowHit> {
-    let raw = eval_window_json(win, &mini_collect_js(), std::time::Duration::from_secs(3)).ok()?;
+fn collect_once(win: &DriveSurface, label: &str, started: std::time::Instant, expected: Option<&str>, deadline: std::time::Instant) -> Option<MiniWindowHit> {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now()).min(std::time::Duration::from_secs(3));
+    let raw = eval_window_json(win, &mini_collect_js(), remaining).ok()?;
     let mut value: serde_json::Value = serde_json::from_str(&raw).ok()?;
     if value.get("ok").and_then(|v| v.as_bool()) == Some(false) {
         return None;
@@ -1618,10 +1757,32 @@ fn collect_once(win: &DriveSurface, label: &str, started: std::time::Instant, ex
 
 /// Polls sync collect evals (each a fast round trip) until the page is usable
 /// and — when an expected url is given — that page has committed.
+fn mini_submit_js(id: i64) -> String {
+    let index = id.saturating_sub(1).max(0);
+    format!(r#"(function(){{
+  {MINI_COLLECT_FN}
+  try {{
+    var list = __ronicControls();
+    var chosen = __ronicTypeTarget(list, {index});
+    if (!chosen || !chosen.el) return {{ ok: false, error: "that control is not an available editor — read the page again" }};
+    chosen.el.focus();
+    var root = chosen.el.getRootNode ? chosen.el.getRootNode() : document;
+    var active = root.activeElement || document.activeElement;
+    if (active && active !== chosen.el && __ronicIsEditor(active)) chosen.el = active;
+    chosen.el.dispatchEvent(new KeyboardEvent("keydown", {{ key: "Enter", code: "Enter", bubbles: true, cancelable: true }}));
+    if (chosen.el.form) chosen.el.form.requestSubmit();
+    return {{ ok: true, note: "Submitted from the same editor that received the prompt." }};
+  }} catch (error) {{ return {{ ok: false, error: String(error) }}; }}
+}})()"#)
+}
+
 fn poll_read_hit(win: &DriveSurface, label: &str, started: std::time::Instant, expected: Option<&str>, cap: std::time::Duration) -> Result<MiniWindowHit> {
     let deadline = std::time::Instant::now() + cap;
     loop {
-        if let Some(hit) = collect_once(win, label, started, expected) {
+        if EMERGENCY_HALT.load(Ordering::Relaxed) {
+            return Err(err("emergency halt is engaged — the human paused all bot computers"));
+        }
+        if let Some(hit) = collect_once(win, label, started, expected, deadline) {
             return Ok(hit);
         }
         if std::time::Instant::now() >= deadline {
@@ -1683,8 +1844,10 @@ pub fn agent_ensure_mini_window(
         Some(target) => Some(agent_url_allowed(target)?),
         None => None,
     };
-    let instance = spawn_mini_window(app, home, &bot_id, bot_handle, parsed, true)?;
-    Ok(instance.window_label)
+    if let Some(target) = parsed {
+        open_chrome_tab(app, home, &bot_id, bot_handle, target, true)?;
+    }
+    Ok(mini_label(&bot_id)?)
 }
 
 /// Last control snapshot per bot — the raw material for Tier-2 stale-control
@@ -1938,9 +2101,6 @@ fn agent_chrome_surface(app: &AppHandle, bot_id: &str) -> Result<String> {
             return Ok(web_label);
         }
     }
-    if app.get_window(&mini_label(bot_id)?).is_none() {
-        return Err(err("neither a mini computer window nor a workspace webapp is currently open — open one first"));
-    }
     let home = crate::util::product_home();
     ensure_chrome(app, &home, bot_id, None)?;
     Ok(label)
@@ -2078,9 +2238,10 @@ pub fn agent_drive_wait(app: &AppHandle, bot_id: &str, query: Option<&str>, medi
         return Err(err("wait_for needs a query like \"add to cart\", or media: \"playing\"."));
     }
     loop {
+        agent_gate(bot_id)?;
         if let Some(win) = app.get_webview(&label) {
             let win = DriveSurface::Chrome(win);
-            if let Some(hit) = collect_once(&win, &label, started, None) {
+            if let Some(hit) = collect_once(&win, &label, started, None, deadline) {
                 let ad = hit.media.as_ref().map(|item| item.ad.clone()).unwrap_or_default();
                 let playing = hit.media.as_ref().is_some_and(|item| item.playing);
                 if want_playing && playing && ad.is_empty() {
@@ -2104,7 +2265,7 @@ pub fn agent_drive_wait(app: &AppHandle, bot_id: &str, query: Option<&str>, medi
         if std::time::Instant::now() >= deadline {
             let seen = app.get_webview(&label).and_then(|win| {
                 let win = DriveSurface::Chrome(win);
-                collect_once(&win, &label, started, None)
+                collect_once(&win, &label, started, None, deadline)
             });
             let where_now = match &seen {
                 Some(hit) => format!(" — the page is \"{}\" at {}", hit.title, hit.url),
@@ -2177,10 +2338,7 @@ pub fn shell_control(app: &AppHandle, state: &crate::AppState, bot_id: &str, arg
     let action = action.as_str();
     let app_for_open = target_arg.as_str();
     let ensure_open = |app: &AppHandle| -> Result<()> {
-        if app.get_window(&mini_label(bot_id).unwrap_or_default()).is_none() {
-            spawn_mini_window(app, &state.home, bot_id.trim(), "@bot", None, true).map(|_| ())?;
-        }
-        Ok(())
+        ensure_chrome(app, &state.home, bot_id, None).map(|_| ())
     };
     let summary = || shell_summary(app, bot_id);
     let result: Result<String> = (|| {
@@ -2613,6 +2771,9 @@ fn try_uia_patterns(
                     let pattern = element.get_pattern::<UIValuePattern>().ok()?;
                     let text = text_payload.unwrap_or_default();
                     pattern.set_value(text).ok()?;
+                    if !pattern.get_value().ok().is_some_and(|actual| uia_value_matches(&actual, text)) {
+                        return None;
+                    }
                     Some(format!(
                         "✓ [OS UIAutomation ValuePattern] set \"{text}\" on #{} {} ({}) in {ms}ms — physical OS mouse untouched.",
                         node.mark_id, node.name, node.automation_id
@@ -3067,6 +3228,15 @@ fn capture_window_buffer(title_filter: &str) -> Option<(image::RgbaImage, window
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_text_must_be_retained_and_halt_is_real() {
+        assert!(uia_value_matches("line 1\r\nline 2", "line 1\nline 2"));
+        assert!(!uia_value_matches("truncated", "the full prompt"));
+        assert!(BOT_MINI_WINDOW_HUD_SCRIPT.contains("ronic-halt:engage"));
+        assert!(mini_submit_js(2).contains("__ronicTypeTarget(list, 1)"));
+        assert!(!mini_submit_js(2).contains("var list = document.querySelectorAll"));
+    }
 
     #[test]
     fn fallback_registry_roundtrips_through_marks() {

@@ -82,17 +82,6 @@ pub struct ScreenHit {
     pub ms: i64,
 }
 
-impl ScreenHit {
-    pub fn empty(url: &str) -> Self {
-        Self {
-            url: url.to_string(),
-            text: String::new(),
-            nodes: Vec::new(),
-            ms: 0,
-        }
-    }
-}
-
 #[derive(Deserialize)]
 struct RawRead {
     #[serde(default)]
@@ -389,7 +378,17 @@ fn wait_read(view: &tauri::Webview, expected: Option<&str>) -> Result<RawRead> {
         }
         thread::sleep(Duration::from_millis(120));
     }
-    last.ok_or_else(|| err("the page did not answer"))
+    match last {
+        Some(page) if page_is_ready(&page, expected) => Ok(page),
+        Some(page) => Err(err(format!("the page did not become ready at {} (state: {})", if page.url.is_empty() { "the requested address" } else { &page.url }, page.ready))),
+        None => Err(err("the page did not answer within 8 seconds")),
+    }
+}
+
+fn page_is_ready(page: &RawRead, expected: Option<&str>) -> bool {
+    page.ready != "error"
+        && expected.map(|url| same_page(&page.url, url)).unwrap_or(true)
+        && (page.ready == "complete" || page.ready == "interactive" || !page.text.is_empty() || !page.nodes.is_empty())
 }
 
 fn same_page(live: &str, expected: &str) -> bool {
@@ -437,6 +436,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn browser_reads_never_accept_a_stale_or_loading_page() {
+        let ready = RawRead { url: "https://example.com/next".into(), text: "loaded".into(), nodes: vec![], ready: "complete".into() };
+        assert!(page_is_ready(&ready, Some("https://example.com/next")));
+        assert!(!page_is_ready(&ready, Some("https://example.com/previous")));
+        let loading = RawRead { url: "https://example.com/next".into(), text: String::new(), nodes: vec![], ready: "loading".into() };
+        assert!(!page_is_ready(&loading, Some("https://example.com/next")));
     }
 
     #[test]

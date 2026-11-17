@@ -807,7 +807,7 @@ fn clip_line(raw: &str, max_chars: usize) -> String {
 pub fn save_workflow(conn: &Connection, home: &Path, name: &str, steps_text: &str, schedule: &str) -> Result<String, String> {
     let planned = plan_workflow(name, steps_text, schedule)?;
     let id = crate::util::nid("wf");
-    let yaml = crate::yaml_flow::emit(&id, &planned.name, "idle", None, &planned.triggers, &planned.nodes);
+    let yaml = crate::yaml_flow::emit(&id, &planned.name, "idle", None, &planned.triggers, &planned.nodes, &serde_json::Map::new());
     let dir = home.join("workflows");
     std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
     let safe = crate::util::safe_id_component(&id).map_err(|error| error.0)?;
@@ -1153,7 +1153,7 @@ mod tests {
         assert_eq!(planned.nodes.len(), 2);
         assert_eq!(planned.nodes[1].kind, "approval_gate");
         assert_eq!(planned.nodes[0].status, "pending");
-        let yaml = crate::yaml_flow::emit("wf_test", &planned.name, "idle", None, &planned.triggers, &planned.nodes);
+        let yaml = crate::yaml_flow::emit("wf_test", &planned.name, "idle", None, &planned.triggers, &planned.nodes, &serde_json::Map::new());
         let parsed = crate::yaml_flow::parse(&yaml).unwrap();
         assert_eq!(parsed.2, "idle");
         assert_eq!(parsed.4, vec!["daily 08:00".to_string()]);

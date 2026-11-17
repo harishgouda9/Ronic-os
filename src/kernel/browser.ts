@@ -11,6 +11,7 @@ import type {
   Step,
   WalletTx,
   WfNode,
+  Workflow,
 } from "../types";
 import { completeChat, hasStoredSecret, openSite, pingProvider, probeModel, rememberSecret, type ChatMessage, type Effort } from "./liveChat";
 import { composerModelFor, modelById } from "./modelPrefs";
@@ -127,6 +128,9 @@ function repair(snap: Snapshot): Snapshot {
   if (!Array.isArray(snap.botAllowances)) snap.botAllowances = [];
   if (!Array.isArray(snap.fleetLogs)) snap.fleetLogs = [];
   if (!Array.isArray(snap.quantOrders)) snap.quantOrders = [];
+  if (!Array.isArray(snap.workflows)) snap.workflows = [];
+  if (!Array.isArray(snap.workflowRuns)) snap.workflowRuns = [];
+  snap.workflows = snap.workflows.map((workflow) => ({ ...workflow, scheduleEnabled: workflow.scheduleEnabled !== false, lastFiredAt: workflow.lastFiredAt ?? 0 }));
   if (!Array.isArray(snap.connectedWallets)) snap.connectedWallets = [];
   if (!Array.isArray(snap.sentinels)) snap.sentinels = [];
   if (!Array.isArray(snap.sentinelEvents)) snap.sentinelEvents = [];
@@ -228,6 +232,90 @@ function previewSecurityScan(prompt: string) {
 
 function nid(prefix: string) {
   return `${prefix}_${Date.now().toString(16)}${Math.floor(Math.random() * 9999).toString(16)}`;
+}
+
+function workflowYaml(workflow: Workflow): string {
+  const quote = (value: string) => JSON.stringify(value ?? "");
+  const lines = [`id: ${quote(workflow.id)}`, `name: ${quote(workflow.name)}`, `status: ${quote(workflow.currentStatus)}`];
+  if (workflow.pausedAtNodeId) lines.push(`paused_at: ${quote(workflow.pausedAtNodeId)}`);
+  lines.push("triggers:", ...workflow.triggers.map((trigger) => `  - ${quote(trigger)}`), "nodes:");
+  for (const node of workflow.nodes) {
+    lines.push(
+      `  - id: ${quote(node.id)}`,
+      `    name: ${quote(node.name)}`,
+      `    kind: ${quote(node.kind)}`,
+      `    bot: ${quote(node.botProfile)}`,
+      `    model: ${quote(node.model)}`,
+      `    status: ${quote(node.status)}`,
+      `    latency_ms: ${node.latencyMs}`,
+      `    prompt: ${quote(node.prompt)}`,
+    );
+  }
+  const checkpoint = Object.entries(workflow.checkpoint ?? {});
+  if (checkpoint.length) {
+    lines.push("checkpoint:", ...checkpoint.map(([id, output]) => `  ${quote(id)}: ${quote(String(output))}`));
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+function touchWorkflow(workflow: Workflow) {
+  workflow.yamlSource = workflowYaml(workflow);
+  workflow.updatedAt = Date.now();
+}
+
+function parseWorkflowYaml(source: string): Pick<Workflow, "name" | "nodes" | "triggers" | "currentStatus" | "pausedAtNodeId"> {
+  if (source.length > 1_000_000) throw new Error("Workflow YAML is too large (1 MB limit).");
+  const scalar = (raw: string) => {
+    const text = raw.trim();
+    if (!text.startsWith('"')) return text;
+    try { return JSON.parse(text) as string; } catch { throw new Error("Invalid quoted YAML value."); }
+  };
+  let name = "Imported workflow";
+  let currentStatus = "idle";
+  let pausedAtNodeId: string | null = null;
+  let section = "";
+  const triggers: string[] = [];
+  const nodes: WfNode[] = [];
+  let current: WfNode | null = null;
+  for (const line of source.split(/\r?\n/)) {
+    if (!line.trim() || line.trim().startsWith("#")) continue;
+    const item = line.match(/^\s*- id:\s*(.*)$/);
+    if (item) {
+      section = "nodes";
+      current = { id: scalar(item[1]), name: "", kind: "bot_action", botProfile: "", model: "", prompt: "", status: "pending", latencyMs: 0 };
+      nodes.push(current);
+      continue;
+    }
+    if (section === "triggers" && /^\s+- /.test(line)) {
+      triggers.push(scalar(line.trim().slice(2)));
+      continue;
+    }
+    const pair = line.trim().match(/^([^:]+):\s*(.*)$/);
+    if (!pair) continue;
+    const [, key, raw] = pair;
+    if (line.startsWith(" ") || line.startsWith("\t")) {
+      if (section !== "nodes" || !current) continue;
+      const value = scalar(raw);
+      if (key === "name") current.name = value;
+      else if (key === "kind") current.kind = value;
+      else if (key === "bot") current.botProfile = value;
+      else if (key === "model") current.model = value;
+      else if (key === "status" && (value === "pending" || value === "running" || value === "paused" || value === "error" || value === "done")) current.status = value;
+      else if (key === "prompt") current.prompt = value;
+      else if (key === "latency_ms") current.latencyMs = Number(value) || 0;
+      continue;
+    }
+    if (key === "name") name = scalar(raw);
+    else if (key === "status") currentStatus = scalar(raw);
+    else if (key === "paused_at") pausedAtNodeId = scalar(raw);
+    else if (key === "triggers" || key === "nodes" || key === "checkpoint") section = key;
+  }
+  if (!nodes.length || nodes.length > 200 || nodes.some((node) => !node.id) || new Set(nodes.map((node) => node.id)).size !== nodes.length) {
+    throw new Error("Workflow needs 1–200 steps with unique IDs.");
+  }
+  for (const node of nodes) if (!node.name) node.name = node.id;
+  if (pausedAtNodeId && !nodes.some((node) => node.id === pausedAtNodeId)) throw new Error("paused_at must refer to a workflow step.");
+  return { name, nodes, triggers, currentStatus, pausedAtNodeId };
 }
 
 const STUCK_MS = 120_000;
@@ -2207,28 +2295,56 @@ export async function browserCall(cmd: string, args: Record<string, unknown>): P
         pausedAtNodeId: null,
         checkpoint: {},
         updatedAt: Date.now(),
+        scheduleEnabled: true,
+        lastFiredAt: 0,
       });
       return ok("Workflow created.");
     }
     case "update_workflow": {
       const wf = state.workflows.find((w) => w.id === a.patch.id);
       if (!wf) return ok("Missing workflow.");
+      if (a.patch.yamlSource) {
+        const parsed = parseWorkflowYaml(String(a.patch.yamlSource));
+        wf.name = parsed.name;
+        wf.nodes = parsed.nodes;
+        wf.triggers = parsed.triggers;
+        wf.currentStatus = parsed.currentStatus;
+        wf.pausedAtNodeId = parsed.pausedAtNodeId;
+      }
       if (a.patch.name) wf.name = a.patch.name;
       if (a.patch.nodes) wf.nodes = a.patch.nodes;
       if (a.patch.checkpoint) wf.checkpoint = a.patch.checkpoint;
       if (a.patch.currentStatus) wf.currentStatus = a.patch.currentStatus;
-      if (a.patch.yamlSource) wf.yamlSource = a.patch.yamlSource;
+      if (a.patch.schedule !== undefined) {
+        const schedule = String(a.patch.schedule ?? "").trim();
+        wf.triggers = wf.triggers.filter((trigger) => !/^(daily |every |cron:|schedule:)/i.test(trigger));
+        if (schedule) wf.triggers.unshift(schedule);
+        wf.lastFiredAt = 0;
+      }
+      if (a.patch.scheduleEnabled !== undefined) wf.scheduleEnabled = Boolean(a.patch.scheduleEnabled);
       const node = wf.nodes.find((n: WfNode) => n.id === a.patch.nodeId);
       if (node) {
         if (a.patch.model) node.model = a.patch.model;
         if (a.patch.prompt) node.prompt = a.patch.prompt;
       }
+      touchWorkflow(wf);
       return ok("Workflow updated.");
+    }
+    case "import_workflow": {
+      const source = String(a.yamlSource ?? a.yaml_source ?? "");
+      const parsed = parseWorkflowYaml(source);
+      const id = nid("wf");
+      const nodes: WfNode[] = parsed.nodes.map((node) => ({ ...node, status: "pending", latencyMs: 0 }));
+      const workflow: Workflow = { id, name: parsed.name, yamlSource: "", nodes, triggers: parsed.triggers, currentStatus: "idle", pausedAtNodeId: null, checkpoint: {}, updatedAt: Date.now(), scheduleEnabled: false, lastFiredAt: 0 };
+      touchWorkflow(workflow);
+      state.workflows.unshift(workflow);
+      return ok("Workflow imported with automation disabled.", { id });
     }
     case "delete_workflow": {
       const idx = state.workflows.findIndex((w) => w.id === a.id);
       if (idx !== -1) {
         state.workflows.splice(idx, 1);
+        state.workflowRuns = state.workflowRuns.filter((run) => run.workflowId !== a.id);
         return ok("Workflow deleted.");
       }
       return ok("Workflow not found.");
@@ -2239,7 +2355,7 @@ export async function browserCall(cmd: string, args: Record<string, unknown>): P
       const only = String(a.nodeId ?? a.node_id ?? "");
       const targets = only ? wf.nodes.filter((n) => n.id === only) : wf.nodes;
       if (only && targets.length === 0) return ok("Missing step.");
-      if (!only && wf.nodes.length > 0 && wf.nodes.every((n) => n.status === "done")) {
+      if (!only && wf.nodes.length > 0) {
         wf.checkpoint = {};
         wf.nodes.forEach((n) => {
           n.status = "pending";
@@ -2253,6 +2369,9 @@ export async function browserCall(cmd: string, args: Record<string, unknown>): P
       });
       wf.currentStatus = wf.nodes.every((n) => n.status === "done") ? "completed" : "idle";
       wf.pausedAtNodeId = null;
+      touchWorkflow(wf);
+      state.workflowRuns.unshift({ id: nid("wfr"), workflowId: wf.id, triggerKind: only ? "single_step" : "manual", status: wf.currentStatus, currentNodeId: only, error: "", nodes: structuredClone(wf.nodes), checkpoint: { ...wf.checkpoint }, startedAt: Date.now(), finishedAt: Date.now() });
+      state.workflowRuns = state.workflowRuns.slice(0, 100);
       return ok(only ? "Step finished." : "Workflow run completed.");
     }
     case "pause_workflow": {
@@ -2265,6 +2384,7 @@ export async function browserCall(cmd: string, args: Record<string, unknown>): P
           wf.pausedAtNodeId = node.id;
         }
         wf.currentStatus = "paused_editable";
+        touchWorkflow(wf);
         return ok("Paused.");
       }
       const thread = state.threads.find((t) => t.id === a.id);
@@ -2282,6 +2402,9 @@ export async function browserCall(cmd: string, args: Record<string, unknown>): P
         });
         wf.currentStatus = "completed";
         wf.pausedAtNodeId = null;
+        touchWorkflow(wf);
+        state.workflowRuns.unshift({ id: nid("wfr"), workflowId: wf.id, triggerKind: "resume", status: wf.currentStatus, currentNodeId: "", error: "", nodes: structuredClone(wf.nodes), checkpoint: { ...wf.checkpoint }, startedAt: Date.now(), finishedAt: Date.now() });
+        state.workflowRuns = state.workflowRuns.slice(0, 100);
         return ok("Resumed in the preview. The desktop shell also runs the wallet node through policy.");
       }
       const thread = state.threads.find((t) => t.id === a.id);
@@ -2788,6 +2911,7 @@ function seed(): Snapshot {
     registry: rebuildRegistry([], []),
     skillIndexDelta: "",
     workflows: [],
+    workflowRuns: [],
     policy,
     balances: [
       { rail: "crypto_x402", label: "Crypto & x402", amountUsd: 0, nativeAmount: "0.00 USDC", nativeValue: 0, detail: "Sandbox ledger. No exchange is connected." },

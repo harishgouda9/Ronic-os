@@ -142,8 +142,68 @@ enum AfterPrep {
 }
 
 enum BotTurn {
-    Spoke(String),
+    Spoke { label: String, reply: String, failed: bool },
     Paused(String),
+}
+
+use crate::models::CustomModelProvider;
+
+/// Run one workflow step and return the model's actual output, not the chat
+/// latency label used by the interactive composer.
+pub fn dispatch_workflow_step(
+    state: &AppState,
+    prompt: &str,
+    secrets: &HashMap<String, String>,
+    provider_override: Option<&str>,
+    model: Option<&str>,
+    custom_model_provider: Option<&CustomModelProvider>,
+    skill_ids: Option<&[String]>,
+    plugin_ids: Option<&[String]>,
+    mcp_server_ids: Option<&[String]>,
+) -> Result<String> {
+    let clean = strip_directives(prompt);
+    let prompt = clean.trim();
+    if prompt.is_empty() {
+        return Err(err("workflow step needs a prompt"));
+    }
+    let mut ticket = NEXT_TICKET.fetch_add(1, Ordering::SeqCst);
+    if ticket == 0 {
+        ticket = NEXT_TICKET.fetch_add(1, Ordering::SeqCst);
+    }
+    if TURN_OWNER.compare_exchange(0, ticket, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        return Err(err("Still answering the previous message."));
+    }
+    let _turn = TurnGuard { ticket };
+    let prepared = with_db(state, |conn| prepare_turn(conn, prompt, prompt, provider_override, None, &[]))?;
+    match prepared {
+        AfterPrep::Done(note) => {
+            let lower = note.to_ascii_lowercase();
+            if lower.contains("held for") || lower.contains("denied") || lower.contains("paused") {
+                Err(err(note))
+            } else {
+                Ok(note)
+            }
+        }
+        AfterPrep::Audit { thread_id, turn_id, root } => {
+            let started = Instant::now();
+            let report = audit(Path::new(&root));
+            let ms = started.elapsed().as_millis() as i64;
+            with_db(state, |conn| {
+                insert_step_in(conn, &thread_id, &turn_id, "tool", "local-operator", "Scanned the project root for secrets and private keys.", "pty_terminal", &json!({"command": "security-audit", "exitCode": 0, "output": report}), ms)?;
+                finish(conn, &thread_id)
+            })?;
+            Ok(report)
+        }
+        AfterPrep::Talk { thread_id, turn_id, bot_id, composed, settings, effort, pinned, .. } => {
+            let outcome = answer_bot(state, &thread_id, &turn_id, &bot_id, secrets, model, &effort, &composed, &settings, true, pinned, &[], custom_model_provider, skill_ids, plugin_ids, mcp_server_ids)?;
+            with_db(state, |conn| finish(conn, &thread_id))?;
+            match outcome {
+                BotTurn::Spoke { reply, failed, .. } if !failed => Ok(reply),
+                BotTurn::Spoke { reply, .. } => Err(err(reply)),
+                BotTurn::Paused(note) => Err(err(note)),
+            }
+        }
+    }
 }
 
 fn with_db<T>(state: &AppState, f: impl FnOnce(&Connection) -> T) -> T {
@@ -170,7 +230,19 @@ pub fn strip_directives(text: &str) -> String {
     s.trim().to_string()
 }
 
-pub fn dispatch(state: &AppState, prompt: &str, secrets: &HashMap<String, String>, provider_override: Option<&str>, model: Option<&str>, effort: Option<&str>, attachments: &[String]) -> Result<String> {
+pub fn dispatch(
+    state: &AppState,
+    prompt: &str,
+    secrets: &HashMap<String, String>,
+    provider_override: Option<&str>,
+    model: Option<&str>,
+    effort: Option<&str>,
+    attachments: &[String],
+    custom_model_provider: Option<&CustomModelProvider>,
+    skill_ids: Option<&[String]>,
+    plugin_ids: Option<&[String]>,
+    mcp_server_ids: Option<&[String]>,
+) -> Result<String> {
     let clean = strip_directives(prompt);
     let prompt = clean.trim();
     if prompt.is_empty() && attachments.is_empty() {
@@ -202,12 +274,18 @@ pub fn dispatch(state: &AppState, prompt: &str, secrets: &HashMap<String, String
             let home = state.home.clone();
             let proposal = with_db(state, |conn| crate::harness2_engine::arm_chat(conn, &home, &thread_id, &turn_id, &bot_id, prompt, attachments));
             let composed = crate::harness2_engine::compose_with_plan(composed, proposal.as_deref());
-            let name = match answer_bot(state, &thread_id, &turn_id, &bot_id, secrets, model, &effort, &composed, &settings, true, pinned, attachments)? {
+            let name = match answer_bot(state, &thread_id, &turn_id, &bot_id, secrets, model, &effort, &composed, &settings, true, pinned, attachments, custom_model_provider, skill_ids, plugin_ids, mcp_server_ids)? {
                 BotTurn::Paused(note) => {
                     with_db(state, |conn| finish(conn, &thread_id))?;
                     return Ok(note);
                 }
-                BotTurn::Spoke(name) => name,
+                BotTurn::Spoke { label, reply, failed } => {
+                    if failed {
+                        with_db(state, |conn| finish(conn, &thread_id))?;
+                        return Err(err(reply));
+                    }
+                    label
+                }
             };
             let mut current = bot_id;
             let mut already = vec![current.clone()];
@@ -231,8 +309,12 @@ pub fn dispatch(state: &AppState, prompt: &str, secrets: &HashMap<String, String
                     Ok(())
                 })?;
                 already.push(id.clone());
-                match answer_bot(state, &thread_id, &turn_id, &id, secrets, None, &effort, &composed, &settings, false, false, attachments) {
-                    Ok(BotTurn::Spoke(_)) => current = id,
+                match answer_bot(state, &thread_id, &turn_id, &id, secrets, None, &effort, &composed, &settings, false, false, attachments, None, None, None, None) {
+                    Ok(BotTurn::Spoke { failed: false, .. }) => current = id,
+                    Ok(BotTurn::Spoke { reply, failed: true, .. }) => {
+                        with_db(state, |conn| finish(conn, &thread_id))?;
+                        return Err(err(reply));
+                    }
                     Ok(BotTurn::Paused(note)) => {
                         with_db(state, |conn| finish(conn, &thread_id))?;
                         return Ok(note);
@@ -368,7 +450,24 @@ fn prepare_turn(conn: &Connection, title_source: &str, prompt: &str, provider_ov
     })
 }
 
-fn answer_bot(state: &AppState, thread_id: &str, turn_id: &str, bot_id: &str, secrets: &HashMap<String, String>, model: Option<&str>, effort: &str, composed: &str, settings: &crate::models::Settings, use_composer: bool, pinned: bool, attachments: &[String]) -> Result<BotTurn> {
+fn answer_bot(
+    state: &AppState,
+    thread_id: &str,
+    turn_id: &str,
+    bot_id: &str,
+    secrets: &HashMap<String, String>,
+    model: Option<&str>,
+    effort: &str,
+    composed: &str,
+    settings: &crate::models::Settings,
+    use_composer: bool,
+    pinned: bool,
+    attachments: &[String],
+    custom_model_provider: Option<&CustomModelProvider>,
+    skill_ids: Option<&[String]>,
+    plugin_ids: Option<&[String]>,
+    mcp_server_ids: Option<&[String]>,
+) -> Result<BotTurn> {
     let ready = with_db(state, |conn| -> Result<std::result::Result<(crate::bots::BotFlags, String, String, Vec<Value>, String), String>> {
         let speaker = crate::bots::flags(conn, bot_id)?;
         if speaker.takeover {
@@ -401,6 +500,25 @@ fn answer_bot(state: &AppState, thread_id: &str, turn_id: &str, bot_id: &str, se
         } else {
             crate::chief_delegation::pick_turn_account(&speaker.primary, &speaker.long_context, &speaker.fallback, context_chars)
         };
+
+        // Handle custom model provider for workflow steps
+        let custom_provider_id = if let Some(custom) = custom_model_provider {
+            let custom_id = format!("wf_custom_{}", thread_id);
+            // Insert temporary provider account
+            let _ = conn.execute(
+                "INSERT OR REPLACE INTO provider_accounts (id, name, provider_type, binary_or_endpoint, has_secret, quota_window_hours, quota_used_percent, quota_resets_at, fallback_account_id, is_active, allow_cli_dispatch, health_detail, created_at) VALUES (?1, ?2, 'byok_api', ?3, 1, 5, 0, '', '', 1, 0, 'Workflow custom provider', ?4)",
+                params![&custom_id, &custom.provider_id, &custom.endpoint, now_ms()],
+            );
+            // Store API key in secrets
+            // Note: We can't modify the secrets HashMap here since it's a reference
+            // The API key will be passed through the secrets HashMap with the custom provider ID
+            // This is handled by the caller putting the key in secrets with the custom_id
+            provider_id = custom_id;
+            Some(custom_id)
+        } else {
+            None
+        };
+
         if provider_id.trim().is_empty() {
             let note = format!("{} has no model selected. Choose a model in the chat, or set Primary on the bot profile.", speaker.handle);
             insert_step_in(conn, thread_id, turn_id, "assistant", &speaker.handle, &note, "message", &json!({}), 0)?;
@@ -505,7 +623,53 @@ fn answer_bot(state: &AppState, thread_id: &str, turn_id: &str, bot_id: &str, se
             .iter()
             .filter(|skill| crate::capabilities::in_index(skill, bot_id, crate::capabilities::plugin_agent_on(&view.plugins, &skill.plugin_id, bot_id)))
             .collect();
-        crate::capabilities::required_tools(composed, &visible, &view.plugins, bot_id)
+
+        // Get tools from prompt-matched skills
+        let mut tools = crate::capabilities::required_tools(composed, &visible, &view.plugins, bot_id);
+
+        // Add tools from explicitly selected skills (for workflow steps)
+        if let Some(selected_skill_ids) = skill_ids {
+            for skill_id in selected_skill_ids {
+                if let Some(skill) = view.skills.iter().find(|s| &s.id == skill_id) {
+                    for tool in &skill.requires_tools {
+                        let tool = tool.trim();
+                        if !tool.is_empty() && !tools.iter().any(|t| t == tool) {
+                            tools.push(tool.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Add tools from explicitly selected plugins (for workflow steps)
+        if let Some(selected_plugin_ids) = plugin_ids {
+            for plugin_id in selected_plugin_ids {
+                if let Some(plugin) = view.plugins.iter().find(|p| &p.id == plugin_id) {
+                    for tool in &plugin.tools {
+                        let tool = tool.name.trim();
+                        if !tool.is_empty() && !tools.iter().any(|t| t == tool) {
+                            tools.push(tool.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Add MCP server tools for explicitly selected servers (for workflow steps)
+        if let Some(selected_mcp_ids) = mcp_server_ids {
+            for mcp_id in selected_mcp_ids {
+                if let Some(mcp) = view.mcp_servers.iter().find(|m| &m.id == mcp_id) {
+                    for tool in &mcp.declared_tools {
+                        let tool = tool.name.trim();
+                        if !tool.is_empty() && !tools.iter().any(|t| t == tool) {
+                            tools.push(tool.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        tools
     });
     contract.tools.extend(extra);
     let (reply, failed) = match run_turn(state, thread_id, turn_id, bot_id, &provider_id, &system, secrets, model.as_deref(), effort, &tools, speaker.allow_code, speaker.allow_computer, speaker.allow_browser, speaker.allow_file, &contract, composed, attachments) {
@@ -546,15 +710,14 @@ fn answer_bot(state: &AppState, thread_id: &str, turn_id: &str, bot_id: &str, se
                 // The retry keeps the bot's own tool permissions. Overriding
                 // them here would let a fenced tool call run on failover even
                 // when the bot was configured with every tool disabled.
-                let text = match run_turn(state, thread_id, turn_id, bot_id, &provider_id, &system, secrets, model.as_deref(), effort, &tools, speaker.allow_code, speaker.allow_computer, speaker.allow_browser, speaker.allow_file, &contract, &retry_prompt, attachments) {
+                match run_turn(state, thread_id, turn_id, bot_id, &provider_id, &system, secrets, model.as_deref(), effort, &tools, speaker.allow_code, speaker.allow_computer, speaker.allow_browser, speaker.allow_file, &contract, &retry_prompt, attachments) {
                     Err(error) if reply_was_cleared(&error) => {
                         let _ = with_db(state, |conn| finish(conn, thread_id));
                         return Ok(BotTurn::Paused(error));
                     }
-                    Ok(text) => text,
-                    Err(error) => format!("{first}\n\n{error}"),
-                };
-                (text, true)
+                    Ok(text) => (text, false),
+                    Err(error) => (format!("{first}\n\n{error}"), true),
+                }
             } else {
                 (first, true)
             }
@@ -575,7 +738,7 @@ fn answer_bot(state: &AppState, thread_id: &str, turn_id: &str, bot_id: &str, se
         crate::bots::touch_status(conn, bot_id, &reply)?;
         Ok(format!("{label} replied in {ms}ms"))
     })?;
-    Ok(BotTurn::Spoke(label))
+    Ok(BotTurn::Spoke { label, reply, failed })
 }
 
 fn normalize_effort(effort: Option<&str>) -> String {
@@ -992,7 +1155,7 @@ fn run_turn(state: &AppState, thread_id: &str, turn_id: &str, bot_id: &str, prov
     if tools_executed_total > 0 {
         messages.push(ChatMsg::new(
             "user",
-            "Please provide your complete, final response to the user based on the tool results above. Explain clearly what you did, what was found, and any next steps.",
+            "Please provide your complete, final response to the user based on the tool results above. For research, do not repeat the evidence dump: independently synthesize, deduplicate, and rank the findings; explain their significance; and cite dates and direct Markdown source links. Finish the exact request rather than narrating tools or deferring work to the user.",
         ));
         if let Ok(synthesis) = answer(state, provider_id, &messages, secrets, model, effort, &[]) {
             let syn_text = synthesis.text.trim().to_string();
@@ -1378,6 +1541,36 @@ fn tool_specs(allow_code: bool, allow_computer: bool, allow_browser: bool, allow
                         "job": { "type": "string" }
                     },
                     "required": ["schedule"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "Autonomously research the live web: discover sources across two search engines, deduplicate them, and directly read multiple full articles in parallel. No API key, external answer engine, browser, or site login is needed. Use FIRST for research, news, trending, current facts, prices, and comparisons. It returns evidence and sources, NOT the final answer: YOU must independently analyze, rank, deduplicate, and write the concise final answer with dates and Markdown source links. query is the research goal; count is the requested number of findings (default 10, max 20). For a missing detail, follow up with web_fetch.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string" },
+                        "count": { "type": "integer", "description": "How many distinct items (1-20, default 10)." }
+                    },
+                    "required": ["query"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "web_fetch",
+                "description": "Directly fetch a single http/https URL and return readable text, without a browser or login. Use for follow-up evidence after web_search. web_search already reads multiple sources automatically; do not refetch every result. max_chars defaults to 10000 (max 20000). If the page needs JavaScript or interaction, use inspect_page.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": { "type": "string" },
+                        "max_chars": { "type": "integer", "description": "Cap on returned text (500-20000, default 6000)." }
+                    },
+                    "required": ["url"]
                 }
             }
         }),
@@ -1881,56 +2074,26 @@ fn execute_tool_raw(state: &AppState, thread_id: &str, bot_id: &str, name: &str,
                 }
                 "type" => {
                     let text = args.get("text").or_else(|| args.get("value")).and_then(|v| v.as_str()).unwrap_or("");
-                    let id = control_id(args).unwrap_or(1);
+                    let id = match control_id(args) {
+                        Ok(id) => id,
+                        Err(error) => return ("message".into(), json!({}), format!("Type needs the control id from a fresh read: {error}")),
+                    };
                     let submit = args.get("submit").or_else(|| args.get("press_enter")).and_then(|v| v.as_bool()).unwrap_or(false);
                     match crate::computer_subsystem::agent_drive_workspace_webapp(&app, bot_id, target_app, "type", Some(id), Some(text), None) {
-                        Ok(hit) => {
-                            if submit {
-                                let active_id = target_app.map(str::to_string).or_else(crate::workspace_apps::active_webapp).unwrap_or_else(|| "chatgpt".into());
-                                let label = format!("webapp_{active_id}");
-                                if let Some(view) = app.get_webview(&label) {
-                                    let script = format!(
-                                        r#"(function(){{
-                                            var list = document.querySelectorAll("a,button,input,select,textarea,[role=button],[role=textbox],[role=searchbox],[role=combobox],[role=tab],[contenteditable=true]");
-                                            var el = list[{index}];
-                                            if (el) {{
-                                                el.dispatchEvent(new KeyboardEvent("keydown", {{ bubbles: true, cancelable: true, key: "Enter", code: "Enter", keyCode: 13, which: 13 }}));
-                                                el.dispatchEvent(new KeyboardEvent("keypress", {{ bubbles: true, cancelable: true, key: "Enter", code: "Enter", keyCode: 13, which: 13 }}));
-                                                el.dispatchEvent(new KeyboardEvent("keyup", {{ bubbles: true, cancelable: true, key: "Enter", code: "Enter", keyCode: 13, which: 13 }}));
-                                                try {{ if (el.closest("form")) el.closest("form").requestSubmit(); }} catch(_) {{}}
-                                            }}
-                                        }})()"#,
-                                        index = id.saturating_sub(1).max(0)
-                                    );
-                                    let _ = view.eval(&script);
-                                }
-                            }
-                            remember_mini_window(state, bot_id, hit)
-                        }
+                        Ok(_) if submit => match crate::computer_subsystem::agent_drive_workspace_webapp(&app, bot_id, target_app, "submit", Some(id), None, None) {
+                            Ok(hit) => remember_mini_window(state, bot_id, hit),
+                            Err(e) => ("message".into(), json!({}), e.0),
+                        },
+                        Ok(hit) => remember_mini_window(state, bot_id, hit),
                         Err(e) => ("message".into(), json!({}), e.0),
                     }
                 }
                 "submit" | "enter" => {
-                    let id = control_id(args).unwrap_or(1);
-                    let active_id = target_app.map(str::to_string).or_else(crate::workspace_apps::active_webapp).unwrap_or_else(|| "chatgpt".into());
-                    let label = format!("webapp_{active_id}");
-                    if let Some(view) = app.get_webview(&label) {
-                        let script = format!(
-                            r#"(function(){{
-                                var list = document.querySelectorAll("a,button,input,select,textarea,[role=button],[role=textbox],[role=searchbox],[role=combobox],[role=tab],[contenteditable=true]");
-                                var el = list[{index}];
-                                if (el) {{
-                                    el.dispatchEvent(new KeyboardEvent("keydown", {{ bubbles: true, cancelable: true, key: "Enter", code: "Enter", keyCode: 13, which: 13 }}));
-                                    el.dispatchEvent(new KeyboardEvent("keypress", {{ bubbles: true, cancelable: true, key: "Enter", code: "Enter", keyCode: 13, which: 13 }}));
-                                    el.dispatchEvent(new KeyboardEvent("keyup", {{ bubbles: true, cancelable: true, key: "Enter", code: "Enter", keyCode: 13, which: 13 }}));
-                                    try {{ if (el.closest("form")) el.closest("form").requestSubmit(); }} catch(_) {{}}
-                                }}
-                            }})()"#,
-                            index = id.saturating_sub(1).max(0)
-                        );
-                        let _ = view.eval(&script);
-                    }
-                    match crate::computer_subsystem::agent_drive_workspace_webapp(&app, bot_id, target_app, "read", None, None, None) {
+                    let id = match control_id(args) {
+                        Ok(id) => id,
+                        Err(error) => return ("message".into(), json!({}), format!("Submit needs the editor id from a fresh read: {error}")),
+                    };
+                    match crate::computer_subsystem::agent_drive_workspace_webapp(&app, bot_id, target_app, "submit", Some(id), None, None) {
                         Ok(hit) => remember_mini_window(state, bot_id, hit),
                         Err(e) => ("message".into(), json!({}), e.0),
                     }
@@ -2134,6 +2297,8 @@ fn execute_tool_raw(state: &AppState, thread_id: &str, bot_id: &str, name: &str,
                 None => ("message".into(), json!({}), "That schedule is not one this app can store. Use daily HH:MM, every 15m, every 1h, or a daily cron like 0 8 * * *.".into()),
             }
         }
+        "web_search" => crate::research::search(state, args),
+        "web_fetch" => crate::research::fetch(state, args),
         _ => refused,
     }
 }

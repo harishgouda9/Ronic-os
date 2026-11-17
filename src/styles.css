@@ -3974,3 +3974,290 @@ body {
   color: #059669;
   font-weight: 600;
 }
+
+/* -------------------------------------------------------------
+   Provider Connect Modal (pcm-*)
+   Unified sign-in / API-key / local provider connection UI
+   ------------------------------------------------------------- */
+
+.provider-logo {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  font-weight: 700;
+  color: #fff;
+  user-select: none;
+  box-shadow: inset 0 0 0 1px rgba(255,255,255,0.08), 0 1px 2px rgba(0,0,0,0.08);
+}
+.provider-logo-fallback { font-family: inherit; line-height: 1; }
+
+.pcm-backdrop {
+  position: fixed; inset: 0; z-index: 100;
+  background: rgba(15, 23, 42, 0.45);
+  backdrop-filter: blur(6px);
+  display: flex; align-items: center; justify-content: center;
+  padding: 20px;
+  animation: pop-in 160ms var(--ease-out) backwards;
+}
+
+.pcm {
+  width: 100%;
+  max-width: 880px;
+  max-height: min(640px, 90vh);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  box-shadow: var(--shadow-3);
+  display: flex; flex-direction: column;
+  overflow: hidden;
+  color: var(--ink);
+}
+
+.pcm-head {
+  display: flex; align-items: flex-start; justify-content: space-between; gap: 16px;
+  padding: 18px 20px 14px;
+  border-bottom: 1px solid var(--border);
+}
+.pcm-head-text h2 { margin: 0; font-size: 16px; font-weight: 700; letter-spacing: -0.01em; }
+.pcm-head-text p { margin: 4px 0 0; font-size: 12.5px; color: var(--muted); }
+.pcm-close {
+  flex: none;
+  width: 30px; height: 30px;
+  border-radius: 8px;
+  background: transparent; border: 1px solid transparent;
+  color: var(--muted);
+  cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  transition: all 120ms;
+}
+.pcm-close:hover { background: var(--hover); color: var(--ink); }
+
+.pcm-body {
+  display: grid;
+  grid-template-columns: 280px 1fr;
+  flex: 1;
+  min-height: 0;
+}
+
+/* Left: provider list */
+.pcm-list {
+  border-right: 1px solid var(--border);
+  display: flex; flex-direction: column;
+  min-height: 0;
+  background: color-mix(in oklab, var(--surface) 60%, var(--bg));
+}
+.pcm-search { padding: 12px 12px 8px; }
+.pcm-search input {
+  width: 100%;
+  padding: 7px 11px;
+  font-size: 12.5px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--ink);
+  outline: none;
+  transition: border-color 120ms;
+}
+.pcm-search input:focus { border-color: var(--accent); }
+
+.pcm-grid {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 8px 12px;
+  display: flex; flex-direction: column;
+  gap: 2px;
+}
+
+.pcm-tile {
+  position: relative;
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 10px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  cursor: pointer;
+  text-align: left;
+  transition: all 100ms;
+  color: var(--ink);
+}
+.pcm-tile:hover { background: var(--hover); }
+.pcm-tile.active {
+  background: var(--surface);
+  border-color: var(--accent);
+  box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+}
+.pcm-tile-name { flex: 1; font-size: 13px; font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pcm-tile-badge {
+  flex: none;
+  width: 18px; height: 18px;
+  border-radius: 50%;
+  background: var(--emerald);
+  color: #fff;
+  display: flex; align-items: center; justify-content: center;
+}
+.pcm-tile-tag {
+  position: absolute;
+  top: 4px; right: 4px;
+  display: inline-flex; align-items: center; gap: 3px;
+  font-size: 8.5px; font-weight: 700;
+  padding: 2px 5px;
+  background: linear-gradient(135deg, #fef3c7, #fde68a);
+  color: #92400e;
+  border-radius: 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* Right: detail pane */
+.pcm-detail {
+  display: flex; flex-direction: column;
+  padding: 20px 22px;
+  overflow-y: auto;
+  gap: 14px;
+}
+.pcm-detail-head {
+  display: flex; align-items: center; gap: 14px;
+}
+.pcm-detail-head h3 { margin: 0; font-size: 17px; font-weight: 700; letter-spacing: -0.01em; }
+.pcm-detail-head p { margin: 3px 0 0; font-size: 12.5px; color: var(--muted); }
+.pcm-detail-head > div { flex: 1; min-width: 0; }
+
+.pcm-connected-pill {
+  flex: none;
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 11px; font-weight: 600;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: color-mix(in oklab, var(--emerald) 15%, transparent);
+  color: var(--emerald);
+}
+
+.pcm-tabs {
+  display: flex; gap: 4px;
+  background: var(--bg);
+  padding: 4px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+}
+.pcm-tab {
+  flex: 1;
+  display: inline-flex; align-items: center; justify-content: center; gap: 5px;
+  padding: 7px 12px;
+  font-size: 12px; font-weight: 600;
+  background: transparent;
+  border: 0;
+  border-radius: 7px;
+  color: var(--ink-2);
+  cursor: pointer;
+  transition: all 120ms;
+}
+.pcm-tab:hover { color: var(--ink); }
+.pcm-tab.active {
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: 0 1px 2px rgba(0,0,0,0.06);
+}
+
+.pcm-pane { display: flex; flex-direction: column; gap: 12px; }
+
+.pcm-label {
+  display: flex; flex-direction: column; gap: 6px;
+  font-size: 12px; font-weight: 600;
+  color: var(--ink-2);
+}
+.pcm-input {
+  width: 100%;
+  padding: 10px 13px;
+  font-size: 13px;
+  font-family: var(--mono, ui-monospace, monospace);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  color: var(--ink);
+  outline: none;
+  transition: border-color 120ms, box-shadow 120ms;
+}
+.pcm-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--accent) 18%, transparent);
+}
+
+.pcm-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+
+.pcm-primary {
+  display: inline-flex; align-items: center; justify-content: center; gap: 7px;
+  padding: 9px 16px;
+  font-size: 13px; font-weight: 600;
+  background: var(--ink);
+  color: var(--surface);
+  border: 1px solid var(--ink);
+  border-radius: 9px;
+  cursor: pointer;
+  transition: all 120ms;
+  text-decoration: none;
+}
+.pcm-primary:hover:not(:disabled) { opacity: 0.88; transform: translateY(-1px); }
+.pcm-primary:disabled { opacity: 0.45; cursor: not-allowed; }
+
+.pcm-secondary {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  padding: 9px 14px;
+  font-size: 12.5px; font-weight: 600;
+  background: var(--surface);
+  color: var(--ink);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  cursor: pointer;
+  transition: all 120ms;
+  text-decoration: none;
+}
+.pcm-secondary:hover { background: var(--hover); border-color: var(--ink-2); }
+
+.pcm-hint { margin: 0; font-size: 12px; line-height: 1.5; color: var(--ink-2); }
+.pcm-hint-dim { color: var(--muted); font-size: 11.5px; }
+
+.pcm-note {
+  display: flex; gap: 10px;
+  padding: 11px 13px;
+  border-radius: 10px;
+  font-size: 12.5px; line-height: 1.5;
+}
+.pcm-note-good {
+  background: color-mix(in oklab, var(--emerald) 8%, transparent);
+  color: var(--ink);
+  border: 1px solid color-mix(in oklab, var(--emerald) 25%, transparent);
+}
+.pcm-note svg { flex: none; margin-top: 2px; color: var(--emerald); }
+.pcm-note strong { font-weight: 700; }
+
+.pcm-oauth, .pcm-keypane, .pcm-webpane, .pcm-localpane {
+  display: flex; flex-direction: column; gap: 12px;
+}
+
+.pcm-error {
+  display: flex; align-items: center; gap: 6px;
+  margin: 0;
+  padding: 8px 12px;
+  font-size: 12px;
+  background: color-mix(in oklab, #ef4444 10%, transparent);
+  color: #dc2626;
+  border: 1px solid color-mix(in oklab, #ef4444 25%, transparent);
+  border-radius: 8px;
+}
+
+.pcm-foot {
+  padding: 10px 20px;
+  background: var(--bg);
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.spin { animation: spin 1s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+@media (max-width: 720px) {
+  .pcm-body { grid-template-columns: 1fr; }
+  .pcm-list { border-right: 0; border-bottom: 1px solid var(--border); max-height: 200px; }
+}

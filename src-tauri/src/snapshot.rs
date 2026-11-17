@@ -87,6 +87,7 @@ pub fn load(conn: &Connection, meta: &Meta) -> Result<Snapshot> {
         registry: caps.registry,
         skill_index_delta: caps.skill_index_delta,
         workflows: workflows(conn)?,
+        workflow_runs: workflow_runs(conn)?,
         policy: db::load_policy(conn)?,
         balances: balances(conn)?,
         connected_wallets: crate::wallet_live::list(conn)?,
@@ -385,7 +386,7 @@ fn memory_route(conn: &Connection) -> Result<MemoryRoute> {
 }
 
 fn workflows(conn: &Connection) -> Result<Vec<Workflow>> {
-    let mut stmt = conn.prepare("SELECT id, name, yaml_source, nodes_json, triggers_json, current_status, paused_at_node_id, checkpoint_json, updated_at FROM workflows ORDER BY updated_at DESC")?;
+    let mut stmt = conn.prepare("SELECT id, name, yaml_source, nodes_json, triggers_json, current_status, paused_at_node_id, checkpoint_json, updated_at, schedule_enabled, last_fired_at FROM workflows ORDER BY updated_at DESC")?;
     let rows = stmt.query_map([], |r| {
         let nodes_raw: String = r.get(3)?;
         let triggers_raw: String = r.get(4)?;
@@ -401,6 +402,28 @@ fn workflows(conn: &Connection) -> Result<Vec<Workflow>> {
             paused_at_node_id: r.get(6)?,
             checkpoint,
             updated_at: r.get(8)?,
+            schedule_enabled: r.get::<_, i64>(9)? != 0,
+            last_fired_at: r.get(10)?,
+        })
+    })?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+fn workflow_runs(conn: &Connection) -> Result<Vec<WorkflowRun>> {
+    let mut stmt = conn.prepare("SELECT id, workflow_id, trigger_kind, status, current_node_id, error, nodes_json, checkpoint_json, started_at, finished_at FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY workflow_id ORDER BY started_at DESC) AS recent_rank FROM workflow_runs) WHERE recent_rank <= 20 ORDER BY started_at DESC LIMIT 1000")?;
+    let rows = stmt.query_map([], |r| {
+        let checkpoint_raw: String = r.get(7)?;
+        Ok(WorkflowRun {
+            id: r.get(0)?,
+            workflow_id: r.get(1)?,
+            trigger_kind: r.get(2)?,
+            status: r.get(3)?,
+            current_node_id: r.get(4)?,
+            error: r.get(5)?,
+            nodes: serde_json::from_str(&r.get::<_, String>(6)?).unwrap_or_default(),
+            checkpoint: serde_json::from_str::<Value>(&checkpoint_raw).ok().and_then(|v| v.as_object().cloned()).unwrap_or_default(),
+            started_at: r.get(8)?,
+            finished_at: r.get(9)?,
         })
     })?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)

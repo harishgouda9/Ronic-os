@@ -52,6 +52,7 @@
     "allow-create-profile",
     "allow-create-thread",
     "allow-create-workflow",
+    "allow-import-workflow",
     "allow-delete-memory",
     "allow-device-fingerprint",
     "allow-duplicate-profile",

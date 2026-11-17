@@ -53,6 +53,8 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     ensure_column(conn, "chat_threads", "task_next", "ALTER TABLE chat_threads ADD COLUMN task_next TEXT NOT NULL DEFAULT ''")?;
     ensure_column(conn, "workflows", "armed_at", "ALTER TABLE workflows ADD COLUMN armed_at INTEGER NOT NULL DEFAULT 0")?;
     ensure_column(conn, "workflows", "last_fired_at", "ALTER TABLE workflows ADD COLUMN last_fired_at INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(conn, "workflows", "schedule_enabled", "ALTER TABLE workflows ADD COLUMN schedule_enabled INTEGER NOT NULL DEFAULT 1")?;
+    ensure_column(conn, "workflows", "gate_pending_node_id", "ALTER TABLE workflows ADD COLUMN gate_pending_node_id TEXT NOT NULL DEFAULT ''")?;
     ensure_column(conn, "memory_items", "engine_origin", "ALTER TABLE memory_items ADD COLUMN engine_origin TEXT NOT NULL DEFAULT 'mem0_builtin'")?;
     ensure_column(conn, "memory_items", "valid_from", "ALTER TABLE memory_items ADD COLUMN valid_from INTEGER")?;
     ensure_column(conn, "memory_items", "invalid_at", "ALTER TABLE memory_items ADD COLUMN invalid_at INTEGER")?;
@@ -399,6 +401,20 @@ CREATE TABLE IF NOT EXISTS workflows (
   checkpoint_json TEXT NOT NULL DEFAULT '{}',
   updated_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS workflow_runs (
+  id TEXT PRIMARY KEY,
+  workflow_id TEXT NOT NULL,
+  trigger_kind TEXT NOT NULL DEFAULT 'manual',
+  status TEXT NOT NULL DEFAULT 'running',
+  current_node_id TEXT NOT NULL DEFAULT '',
+  error TEXT NOT NULL DEFAULT '',
+  nodes_json TEXT NOT NULL DEFAULT '[]',
+  checkpoint_json TEXT NOT NULL DEFAULT '{}',
+  started_at INTEGER NOT NULL,
+  finished_at INTEGER,
+  FOREIGN KEY (workflow_id) REFERENCES workflows(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS workflow_runs_recent ON workflow_runs(workflow_id, started_at DESC);
 CREATE TABLE IF NOT EXISTS wallet_policies (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   max_per_tx_usd REAL NOT NULL DEFAULT 5,
@@ -739,7 +755,7 @@ fn reference_market_yaml() -> String {
         WfNode { id: "node_4".into(), name: "Wallet execute".into(), kind: "wallet_execution".into(), bot_profile: "@Quant-Trader".into(), model: "policy-gate".into(), prompt: "Settle the intent on the sandbox x402 rail if policy allows. Amount 0.04 USD.".into(), status: "pending".into(), latency_ms: 0 },
     ];
     let triggers = vec!["cron: 0 8 * * *".to_string(), "telegram: /run_alpha".to_string()];
-    crate::yaml_flow::emit("wf_market", "Morning Market Signal", "paused_editable", Some("node_3"), &triggers, &nodes)
+    crate::yaml_flow::emit("wf_market", "Morning Market Signal", "paused_editable", Some("node_3"), &triggers, &nodes, &serde_json::Map::new())
 }
 
 fn clear_workspace_rows(conn: &Connection) -> Result<()> {
@@ -759,6 +775,7 @@ fn clear_workspace_rows(conn: &Connection) -> Result<()> {
          DELETE FROM mcp_servers;
          DELETE FROM bot_groups;
          DELETE FROM bot_gateway_audit_logs;
+         DELETE FROM workflow_runs;
          DELETE FROM workflows;
          DELETE FROM wallet_transactions;
          DELETE FROM remediation_logs;

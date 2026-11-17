@@ -35,6 +35,7 @@ test("generated mini-computer drive scripts parse as plain sync JavaScript", () 
     collect: build("mini_collect_js", {}),
     click: build("mini_click_js", { index: "2" }),
     type: build("mini_type_js", { index: "4", encoded: '"ronic-release"' }),
+    submit: build("mini_submit_js", { index: "3" }),
     smartClick: build("mini_smart_click_js", { encoded: '"add to cart"' }),
     scroll: build("mini_scroll_js", { sign: "1" }),
     find: build("mini_find_js", { encoded: '"add to cart"' }),
@@ -47,6 +48,8 @@ test("generated mini-computer drive scripts parse as plain sync JavaScript", () 
   assert.match(scripts.smartClick, /__ronicScore/, "smart click scores matches");
   assert.match(scripts.smartClick, /__ronicPress/, "smart click uses the shared press");
   assert.match(scripts.click, /__ronicControls\(\)/, "click uses the visibility-filtered control list");
+  assert.match(scripts.submit, /__ronicTypeTarget\(list, 3\)/, "submit reuses the typed editor rather than a different raw selector");
+  assert.doesNotMatch(scripts.submit, /var list = document\.querySelectorAll/, "submit does not use the old divergent selector");
   assert.match(scripts.scroll, /__ronicScroll/, "scroll moves the panel under the pointer, not only the window");
   assert.match(scripts.find, /hits\.length < 15/, "find caps its hits");
   assert.doesNotMatch(scripts.click, /block: "center"/, "a click must not park the target in the middle of the view");

@@ -42,7 +42,7 @@ async fn dispatch_blocking(
     let app = app.clone();
     match tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        crate::agent::dispatch(&state, &prompt, &secrets, provider_id.as_deref(), model.as_deref(), effort.as_deref(), &files)
+        crate::agent::dispatch(&state, &prompt, &secrets, provider_id.as_deref(), model.as_deref(), effort.as_deref(), &files, None, None, None, None)
     })
     .await
     {
@@ -2631,6 +2631,8 @@ pub struct WorkflowPatch {
     pub model: Option<String>,
     pub prompt: Option<String>,
     pub yaml_source: Option<String>,
+    pub schedule: Option<String>,
+    pub schedule_enabled: Option<bool>,
 }
 
 #[tauri::command]
@@ -2651,7 +2653,7 @@ pub async fn create_workflow(state: State<'_, AppState>, name: String) -> Result
             latency_ms: 0,
         }];
         let triggers: Vec<String> = Vec::new();
-        let yaml = crate::yaml_flow::emit(&id, &name, "idle", None, &triggers, &nodes);
+        let yaml = crate::yaml_flow::emit(&id, &name, "idle", None, &triggers, &nodes, &serde_json::Map::new());
         write_workflow(&state.home, &id, &yaml)?;
         conn.execute(
             "INSERT INTO workflows (id, name, yaml_source, nodes_json, triggers_json, current_status, paused_at_node_id, checkpoint_json, updated_at) VALUES (?1,?2,?3,?4,'[]','idle',NULL,'{}',?5)",
@@ -2659,6 +2661,33 @@ pub async fn create_workflow(state: State<'_, AppState>, name: String) -> Result
         )?;
     }
     finish(&state, Some("Workflow created.".into()))
+}
+
+#[tauri::command]
+pub async fn import_workflow(state: State<'_, AppState>, yaml_source: String) -> Result<CommandResult> {
+    let id = nid("wf");
+    let parsed = crate::yaml_flow::parse(&yaml_source).map_err(err)?;
+    let name = parsed.1;
+    let triggers: Vec<String> = parsed.4.into_iter().filter_map(|trigger| crate::coworker::normalize_schedule(&trigger)).collect();
+    let mut nodes = parsed.5;
+    for node in &mut nodes {
+        node.status = "pending".into();
+        node.latency_ms = 0;
+    }
+    let checkpoint = serde_json::Map::new();
+    let yaml = crate::yaml_flow::emit(&id, &name, "idle", None, &triggers, &nodes, &checkpoint);
+    {
+        let conn = guard(&state);
+        write_workflow(&state.home, &id, &yaml)?;
+        if let Err(error) = conn.execute(
+            "INSERT INTO workflows (id, name, yaml_source, nodes_json, triggers_json, current_status, paused_at_node_id, checkpoint_json, updated_at, schedule_enabled) VALUES (?1,?2,?3,?4,?5,'idle',NULL,'{}',?6,0)",
+            params![id, name, yaml, serde_json::to_string(&nodes)?, serde_json::to_string(&triggers)?, now_ms()],
+        ) {
+            remove_workflow_file(&state.home, &id);
+            return Err(error.into());
+        }
+    }
+    finish_payload(&state, Some("Workflow imported with automation disabled. Enable its schedule when ready.".into()), Some(json!({"id": id})))
 }
 
 #[tauri::command]
@@ -2685,14 +2714,22 @@ pub async fn pause_workflow(state: State<'_, AppState>, id: String, node_id: Opt
 
         if wf_exists {
             drop(conn);
-            request_pause(&id);
-            let runner_busy = WORKFLOW_RUN.try_lock().is_err();
-            if runner_busy {
+            let active = WORKFLOW_ACTIVE.lock().ok().and_then(|slot| slot.clone());
+            if active.as_deref() == Some(id.as_str()) {
+                request_pause(&id);
                 return finish(&state, Some("Pause requested. The workflow stops before the next step.".into()));
             }
-            clear_pause(&id);
+            if active.is_some() {
+                return Err(err("another workflow is running; this workflow is not active"));
+            }
+            let run_guard = WORKFLOW_RUN.try_lock().map_err(|_| err("a workflow is starting; try Pause again"))?;
+            if WORKFLOW_ACTIVE.lock().ok().and_then(|slot| slot.clone()).as_deref() == Some(id.as_str()) {
+                drop(run_guard);
+                request_pause(&id);
+                return finish(&state, Some("Pause requested. The workflow stops before the next step.".into()));
+            }
             let conn = guard(&state);
-            let patch = WorkflowPatch { id, node_id, model: None, prompt: None, yaml_source: None };
+            let patch = WorkflowPatch { id, node_id, model: None, prompt: None, yaml_source: None, schedule: None, schedule_enabled: None };
             pause_node(&conn, &state.home, &patch)?;
         } else {
             let thread_exists: bool = conn
@@ -2719,21 +2756,30 @@ pub async fn pause_workflow(state: State<'_, AppState>, id: String, node_id: Opt
 
 #[tauri::command]
 pub async fn resume_workflow(app: AppHandle, id: String) -> Result<CommandResult> {
-    let is_workflow = {
-        // The state lock is only held for the lookup; the run itself takes it
-        // per step.
+    let workflow_state = {
         let state = app.state::<AppState>();
         let conn = guard(&state);
-        conn.query_row("SELECT count(1) FROM workflows WHERE id=?1", params![id], |r| r.get::<_, i64>(0))
-            .map(|c| c > 0)
-            .unwrap_or(false)
+        conn.query_row("SELECT current_status, gate_pending_node_id, paused_at_node_id, nodes_json FROM workflows WHERE id=?1", params![id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, String>(3)?))).ok()
     };
-    if is_workflow {
+    if let Some((status, _, paused, nodes_raw)) = &workflow_state {
+        if status == "interrupted" {
+            return Err(err("this run was interrupted. Use Test workflow to start a new run instead of replaying side effects"));
+        }
+        if status == "error" {
+            let nodes: Vec<WfNode> = serde_json::from_str(nodes_raw).unwrap_or_default();
+            if paused.as_ref().is_some_and(|node_id| nodes.iter().any(|node| &node.id == node_id && node.kind == "wallet_execution")) {
+                return Err(err("a failed wallet step cannot be resumed safely. Use Test workflow to start a new run and verify the ledger first"));
+            }
+        }
+    }
+    if let Some((_status, gate_pending, _, _)) = workflow_state {
+        let approve_gate = !gate_pending.is_empty();
         let handle = app.clone();
         let note = match tauri::async_runtime::spawn_blocking(move || {
             let state = handle.state::<AppState>();
-            // Resume approves a paused gate (if any) and continues the run.
-            execute_workflow(&state, &id, true, None)
+            // Only a gate-generated pause is approved by Resume. A manual
+            // pause before a gate must stop there again for explicit approval.
+            execute_workflow(&state, &id, approve_gate, None)
         })
         .await
         {
@@ -2762,7 +2808,16 @@ pub async fn resume_workflow(app: AppHandle, id: String) -> Result<CommandResult
 }
 
 fn apply_workflow(conn: &Connection, home: &std::path::Path, patch: &WorkflowPatch, _resume: bool) -> Result<()> {
-    let (name, status, paused, triggers, mut nodes): (String, String, Option<String>, Vec<String>, Vec<WfNode>) = if let Some(yaml) = patch.yaml_source.as_ref().filter(|s| !s.trim().is_empty()) {
+    let (old_triggers_raw, status, checkpoint_raw): (String, String, String) = conn.query_row(
+        "SELECT triggers_json, current_status, checkpoint_json FROM workflows WHERE id=?1",
+        params![patch.id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    ).map_err(|_| err("workflow not found"))?;
+    if status == "running" {
+        return Err(err("pause the workflow before editing it"));
+    }
+    let checkpoint = serde_json::from_str::<Value>(&checkpoint_raw).ok().and_then(|value| value.as_object().cloned()).unwrap_or_default();
+    let (name, status, paused, mut triggers, mut nodes) = if let Some(yaml) = patch.yaml_source.as_ref().filter(|s| !s.trim().is_empty()) {
         let parsed = crate::yaml_flow::parse(yaml).map_err(err)?;
         (parsed.1, parsed.2, parsed.3, parsed.4, parsed.5)
     } else {
@@ -2777,36 +2832,52 @@ fn apply_workflow(conn: &Connection, home: &std::path::Path, patch: &WorkflowPat
         ).map_err(|_| err("workflow not found"))?
     };
     if let Some(node_id) = &patch.node_id {
-        if let Some(node) = nodes.iter_mut().find(|n| &n.id == node_id) {
-            if let Some(model) = &patch.model {
-                node.model = model.clone();
-            }
-            if let Some(prompt) = &patch.prompt {
-                node.prompt = prompt.clone();
-            }
+        let node = nodes.iter_mut().find(|n| &n.id == node_id).ok_or_else(|| err("that step is not in this workflow"))?;
+        if let Some(model) = &patch.model {
+            node.model = model.clone();
+        }
+        if let Some(prompt) = &patch.prompt {
+            node.prompt = prompt.clone();
         }
     }
-    let yaml = crate::yaml_flow::emit(&patch.id, &name, &status, paused.as_deref(), &triggers, &nodes);
+    if let Some(schedule) = &patch.schedule {
+        let trimmed = schedule.trim();
+        let normalized = if trimmed.is_empty() {
+            None
+        } else {
+            Some(crate::coworker::normalize_schedule(trimmed).ok_or_else(|| err("use 'every 15m', 'every 1h', 'daily 09:00', or a daily cron"))?)
+        };
+        triggers.retain(|trigger| crate::coworker::normalize_schedule(trigger).is_none());
+        if let Some(schedule) = normalized {
+            triggers.insert(0, schedule);
+        }
+    }
+    let triggers_raw = serde_json::to_string(&triggers)?;
+    let schedule_changed = triggers_raw != old_triggers_raw;
+    let schedule_enabled = patch.schedule_enabled.map(|enabled| if enabled { 1 } else { 0 });
+    let yaml = crate::yaml_flow::emit(&patch.id, &name, &status, paused.as_deref(), &triggers, &nodes, &checkpoint);
     write_workflow(home, &patch.id, &yaml)?;
-    conn.execute(
-        "UPDATE workflows SET name=?1, yaml_source=?2, nodes_json=?3, triggers_json=?4, current_status=?5, paused_at_node_id=?6, updated_at=?7 WHERE id=?8",
-        params![name, yaml, serde_json::to_string(&nodes)?, serde_json::to_string(&triggers)?, status, paused, now_ms(), patch.id],
+    let changed = conn.execute(
+        "UPDATE workflows SET name=?1, yaml_source=?2, nodes_json=?3, triggers_json=?4, current_status=?5, paused_at_node_id=?6, checkpoint_json=?7, gate_pending_node_id='', armed_at=CASE WHEN ?8 THEN ?9 ELSE armed_at END, last_fired_at=CASE WHEN ?8 THEN 0 ELSE last_fired_at END, schedule_enabled=COALESCE(?10, schedule_enabled), updated_at=?9 WHERE id=?11",
+        params![name, yaml, serde_json::to_string(&nodes)?, triggers_raw, status, paused, Value::Object(checkpoint).to_string(), schedule_changed, now_ms(), schedule_enabled, patch.id],
     )?;
-    let _ = triggers;
+    if changed == 0 {
+        return Err(err("workflow not found"));
+    }
     Ok(())
 }
 
 fn pause_node(conn: &Connection, home: &std::path::Path, patch: &WorkflowPatch) -> Result<()> {
     let requested = patch.node_id.clone().unwrap_or_default();
-    let (name, triggers, mut nodes): (String, Vec<String>, Vec<WfNode>) = conn.query_row(
-        "SELECT name, triggers_json, nodes_json FROM workflows WHERE id=?1",
+    let (name, triggers, mut nodes, checkpoint_raw): (String, Vec<String>, Vec<WfNode>, String) = conn.query_row(
+        "SELECT name, triggers_json, nodes_json, checkpoint_json FROM workflows WHERE id=?1",
         params![patch.id],
-        |r| Ok((r.get::<_, String>(0)?, serde_json::from_str(&r.get::<_, String>(1)?).unwrap_or_default(), serde_json::from_str(&r.get::<_, String>(2)?).unwrap_or_default())),
+        |r| Ok((r.get::<_, String>(0)?, serde_json::from_str(&r.get::<_, String>(1)?).unwrap_or_default(), serde_json::from_str(&r.get::<_, String>(2)?).unwrap_or_default(), r.get::<_, String>(3)?)),
     ).map_err(|_| err("workflow not found"))?;
+    let checkpoint = serde_json::from_str::<Value>(&checkpoint_raw).ok().and_then(|value| value.as_object().cloned()).unwrap_or_default();
     let paused_id = if !requested.is_empty() {
-        if let Some(node) = nodes.iter_mut().find(|node| node.id == requested) {
-            node.status = "paused".into();
-        }
+        let node = nodes.iter_mut().find(|node| node.id == requested).ok_or_else(|| err("that step is not in this workflow"))?;
+        node.status = "paused".into();
         Some(requested)
     } else if let Some(node) = nodes.iter_mut().find(|node| node.status != "done") {
         let id = node.id.clone();
@@ -2815,13 +2886,7 @@ fn pause_node(conn: &Connection, home: &std::path::Path, patch: &WorkflowPatch) 
     } else {
         None
     };
-    let yaml = crate::yaml_flow::emit(&patch.id, &name, "paused_editable", paused_id.as_deref(), &triggers, &nodes);
-    write_workflow(home, &patch.id, &yaml)?;
-    conn.execute(
-        "UPDATE workflows SET yaml_source=?1, nodes_json=?2, current_status='paused_editable', paused_at_node_id=?3, updated_at=?4 WHERE id=?5",
-        params![yaml, serde_json::to_string(&nodes)?, paused_id, now_ms(), patch.id],
-    )?;
-    Ok(())
+    persist_workflow(conn, home, &patch.id, &name, "paused_editable", paused_id.as_deref(), &triggers, &nodes, &checkpoint)
 }
 
 // ---------------------------------------------------------------------------
@@ -2842,13 +2907,13 @@ fn persist_workflow(
     nodes: &[WfNode],
     checkpoint: &serde_json::Map<String, Value>,
 ) -> Result<()> {
-    let yaml = crate::yaml_flow::emit(id, name, status, paused, triggers, nodes);
+    let yaml = crate::yaml_flow::emit(id, name, status, paused, triggers, nodes, checkpoint);
     write_workflow(home, id, &yaml)?;
-    conn.execute(
-        "UPDATE workflows SET yaml_source=?1, nodes_json=?2, triggers_json=?3, current_status=?4, paused_at_node_id=?5, checkpoint_json=?6, updated_at=?7 WHERE id=?8",
-        params![yaml, serde_json::to_string(nodes)?, serde_json::to_string(triggers)?, status, paused, Value::Object(checkpoint.clone()).to_string(), now_ms(), id],
-    )?;
-    Ok(())
+        conn.execute(
+            "UPDATE workflows SET yaml_source=?1, nodes_json=?2, triggers_json=?3, current_status=?4, paused_at_node_id=?5, checkpoint_json=?6, gate_pending_node_id='', updated_at=?7 WHERE id=?8",
+            params![yaml, serde_json::to_string(nodes)?, serde_json::to_string(triggers)?, status, paused, Value::Object(checkpoint.clone()).to_string(), now_ms(), id],
+        )?;
+        Ok(())
 }
 
 fn resolve_bot_profile(conn: &Connection, reference: &str) -> Option<String> {
@@ -2874,6 +2939,18 @@ fn resolve_bot_profile(conn: &Connection, reference: &str) -> Option<String> {
 // One workflow run at a time: runs rewrite the global active_profile KV and
 // node statuses, so two interleaved runs corrupt each other's state.
 static WORKFLOW_RUN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static WORKFLOW_ACTIVE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+struct WorkflowActiveGuard<'a>(&'a str);
+impl Drop for WorkflowActiveGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut active) = WORKFLOW_ACTIVE.lock() {
+            if active.as_deref() == Some(self.0) {
+                *active = None;
+            }
+        }
+    }
+}
 
 // The desktop command queue cannot deliver pause_workflow until run_workflow
 // returns, so Pause invokes this flag directly and the runner observes it
@@ -2900,7 +2977,14 @@ fn pause_requested(id: &str) -> bool {
 
 fn workflow_retry(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
-    !(lower.contains("approval") || lower.contains("wallet") || lower.contains("killswitch") || lower.contains("held for"))
+    if lower.contains("approval") || lower.contains("wallet") || lower.contains("killswitch") || lower.contains("held for") || lower.contains("still answering") {
+        return false;
+    }
+    lower.contains("timed out") || lower.contains("timeout") || lower.contains("did not answer in time")
+        || lower.contains("connection") || lower.contains("network") || lower.contains("temporarily unavailable")
+        || lower.contains("http 408") || lower.contains("http 429") || lower.contains("status 408") || lower.contains("status 429")
+        || lower.contains("http 500") || lower.contains("http 502") || lower.contains("http 503") || lower.contains("http 504")
+        || lower.contains("status 500") || lower.contains("status 502") || lower.contains("status 503") || lower.contains("status 504")
 }
 
 fn step_model_choice(model: &str) -> (Option<String>, Option<String>) {
@@ -2970,7 +3054,7 @@ fn prepare_workflow_nodes(
         checkpoint.remove(target);
         return Ok(());
     }
-    if !approve_paused_gate && !nodes.is_empty() && nodes.iter().all(|node| node.status == "done") {
+    if !approve_paused_gate && !nodes.is_empty() {
         for node in nodes.iter_mut() {
             node.status = "pending".into();
             node.latency_ms = 0;
@@ -3094,12 +3178,96 @@ fn advance_after_step(
 }
 
 pub(crate) fn run_saved_workflow(state: &AppState, id: &str) -> Result<String> {
-    execute_workflow(state, id, false, None)
+    execute_workflow_mode(state, id, false, None, "scheduled")
 }
 
 fn execute_workflow(state: &AppState, id: &str, approve_paused_gate: bool, only_node: Option<&str>) -> Result<String> {
+    let trigger = if only_node.is_some() { "single_step" } else if approve_paused_gate { "resume" } else { "manual" };
+    execute_workflow_mode(state, id, approve_paused_gate, only_node, trigger)
+}
+
+struct WorkflowRunGuard<'a> {
+    state: &'a AppState,
+    workflow_id: String,
+    run_id: String,
+}
+
+impl Drop for WorkflowRunGuard<'_> {
+    fn drop(&mut self) {
+        let conn = guard(self.state);
+        let current = conn.query_row(
+            "SELECT name, triggers_json, nodes_json, current_status, paused_at_node_id, checkpoint_json FROM workflows WHERE id=?1",
+            params![self.workflow_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, Option<String>>(4)?, row.get::<_, String>(5)?)),
+        );
+        let Ok((name, triggers_raw, nodes_raw, mut status, paused, checkpoint_raw)) = current else { return };
+        let triggers: Vec<String> = serde_json::from_str(&triggers_raw).unwrap_or_default();
+        let mut nodes: Vec<WfNode> = serde_json::from_str(&nodes_raw).unwrap_or_default();
+        let checkpoint = serde_json::from_str::<Value>(&checkpoint_raw).ok().and_then(|value| value.as_object().cloned()).unwrap_or_default();
+        let mut error = String::new();
+        if status == "running" {
+            status = "interrupted".into();
+            error = "The app stopped before this run finished. Start a new run; interrupted steps are not replayed automatically.".into();
+            if let Some(node) = nodes.iter_mut().find(|node| node.status == "running") {
+                node.status = "error".into();
+            }
+            let paused = nodes.iter().find(|node| node.status == "error").map(|node| node.id.clone());
+            let _ = persist_workflow(&conn, &self.state.home, &self.workflow_id, &name, &status, paused.as_deref(), &triggers, &nodes, &checkpoint);
+        }
+        let current_node = paused.or_else(|| nodes.iter().find(|node| node.status == "error" || node.status == "paused").map(|node| node.id.clone())).unwrap_or_default();
+        if error.is_empty() && status == "error" {
+            error = checkpoint.get(&current_node).and_then(|value| value.as_str()).filter(|text| text.starts_with("error:")).unwrap_or("The workflow stopped on a failed step.").to_string();
+        }
+        let _ = conn.execute(
+            "UPDATE workflow_runs SET status=?1, current_node_id=?2, error=?3, nodes_json=?4, checkpoint_json=?5, finished_at=?6 WHERE id=?7",
+            params![status, current_node, error, nodes_raw_for(&nodes), Value::Object(checkpoint).to_string(), now_ms(), self.run_id],
+        );
+        let _ = conn.execute(
+            "DELETE FROM workflow_runs WHERE workflow_id=?1 AND id NOT IN (SELECT id FROM workflow_runs WHERE workflow_id=?1 ORDER BY started_at DESC LIMIT 20)",
+            params![self.workflow_id],
+        );
+    }
+}
+
+fn nodes_raw_for(nodes: &[WfNode]) -> String {
+    serde_json::to_string(nodes).unwrap_or_else(|_| "[]".into())
+}
+
+pub fn recover_interrupted_workflows(conn: &Connection, home: &std::path::Path) -> Result<usize> {
+    let mut stmt = conn.prepare("SELECT id, name, triggers_json, nodes_json, paused_at_node_id, checkpoint_json FROM workflows WHERE current_status='running'")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, Option<String>>(4)?, row.get::<_, String>(5)?))
+    })?.collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(stmt);
+    let mut recovered = 0;
+    for (id, name, triggers_raw, nodes_raw, paused, checkpoint_raw) in rows {
+        let triggers: Vec<String> = serde_json::from_str(&triggers_raw).unwrap_or_default();
+        let mut nodes: Vec<WfNode> = serde_json::from_str(&nodes_raw).unwrap_or_default();
+        let checkpoint = serde_json::from_str::<Value>(&checkpoint_raw).ok().and_then(|value| value.as_object().cloned()).unwrap_or_default();
+        let active_index = nodes.iter().position(|node| node.status == "running").or_else(|| paused.as_ref().and_then(|node_id| nodes.iter().position(|node| &node.id == node_id)));
+        let active = active_index.map(|index| &mut nodes[index]);
+        let paused = active.as_ref().map(|node| node.id.clone()).or(paused);
+        if let Some(node) = active {
+            node.status = "error".into();
+        }
+        persist_workflow(conn, home, &id, &name, "interrupted", paused.as_deref(), &triggers, &nodes, &checkpoint)?;
+        conn.execute("UPDATE workflows SET last_fired_at=?1 WHERE id=?2", params![now_ms(), id])?;
+        conn.execute(
+            "UPDATE workflow_runs SET status='interrupted', error='The app stopped before this run finished.', nodes_json=?1, checkpoint_json=?2, finished_at=?3 WHERE workflow_id=?4 AND status='running'",
+            params![nodes_raw_for(&nodes), Value::Object(checkpoint).to_string(), now_ms(), id],
+        )?;
+        recovered += 1;
+    }
+    Ok(recovered)
+}
+
+fn execute_workflow_mode(state: &AppState, id: &str, approve_paused_gate: bool, only_node: Option<&str>, trigger_kind: &str) -> Result<String> {
     use tauri::Emitter;
     let _run_guard = WORKFLOW_RUN.try_lock().map_err(|_| err("another workflow run is already in progress; wait for it to finish or pause it first"))?;
+    if let Ok(mut active) = WORKFLOW_ACTIVE.lock() {
+        *active = Some(id.to_string());
+    }
+    let _active = WorkflowActiveGuard(id);
     clear_pause(id);
     let (name, triggers, mut nodes, mut paused_at, mut checkpoint): (String, Vec<String>, Vec<WfNode>, Option<String>, serde_json::Map<String, Value>) = {
         let conn = guard(state);
@@ -3130,7 +3298,31 @@ fn execute_workflow(state: &AppState, id: &str, approve_paused_gate: bool, only_
         let conn = guard(state);
         kv_get(&conn, "active_profile").ok().flatten().filter(|value| !value.trim().is_empty())
     };
-    let _restore_profile = RestoreProfile { state, original: original_profile };
+    let _restore_profile = RestoreProfile { state, original: original_profile.clone() };
+    let workflow_thread = {
+        let conn = guard(state);
+        let bot = if original_profile.as_deref().is_some_and(|bot| !bot.is_empty()) {
+            original_profile.clone().unwrap()
+        } else {
+            conn.query_row("SELECT id FROM bot_profiles ORDER BY created_at LIMIT 1", [], |row| row.get(0)).map_err(|_| err("create a bot before running a workflow"))?
+        };
+        let thread_id = format!("workflow_run_{id}");
+        conn.execute(
+            "INSERT INTO chat_threads (id,bot_profile_id,title,status,compacted_context_capsule,is_pinned,updated_at) VALUES (?1,?2,?3,'idle','',1,?4) ON CONFLICT(id) DO NOTHING",
+            params![thread_id, bot, format!("Workflow · {name}"), now_ms()],
+        )?;
+        thread_id
+    };
+    let _pin = crate::agent::pin_thread(&workflow_thread);
+    let _run_history = {
+        let conn = guard(state);
+        let run_id = nid("wfr");
+        conn.execute(
+            "INSERT INTO workflow_runs (id, workflow_id, trigger_kind, status, nodes_json, checkpoint_json, started_at) VALUES (?1,?2,?3,'running',?4,?5,?6)",
+            params![run_id, id, trigger_kind, serde_json::to_string(&nodes)?, Value::Object(checkpoint.clone()).to_string(), now_ms()],
+        )?;
+        WorkflowRunGuard { state, workflow_id: id.to_string(), run_id }
+    };
 
     let mut index = 0;
     let mut ran_only = false;
@@ -3165,6 +3357,7 @@ fn execute_workflow(state: &AppState, id: &str, approve_paused_gate: bool, only_
                 {
                     let conn = guard(state);
                     persist_workflow(&conn, &state.home, id, &name, "paused_editable", Some(&node_id), &triggers, &nodes, &checkpoint)?;
+                    conn.execute("UPDATE workflows SET gate_pending_node_id=?1 WHERE id=?2", params![node_id, id])?;
                 }
                 if let Some(app) = &app {
                     let _ = app.emit("ronic://wf-progress", json!({ "id": id, "status": "paused_editable", "nodes": nodes }));
@@ -3176,9 +3369,48 @@ fn execute_workflow(state: &AppState, id: &str, approve_paused_gate: bool, only_
                 });
             }
             if node_kind == "wallet_execution" {
+                let pending_tx = checkpoint_text(&checkpoint, &node_id);
+                if let Some(tx_id) = pending_tx.strip_prefix("pending_approval:").and_then(|rest| rest.split(':').next()) {
+                    let status: String = {
+                        let conn = guard(state);
+                        conn.query_row("SELECT policy_decision FROM wallet_transactions WHERE id=?1", params![tx_id], |row| row.get(0)).unwrap_or_else(|_| "missing".into())
+                    };
+                    match status.as_str() {
+                        "approved_by_user" => {
+                            nodes[index].status = "done".into();
+                            checkpoint.insert(node_id.clone(), json!(format!("approved_by_user · {tx_id}")));
+                        }
+                        "pending_approval" => {
+                            return Ok(format!("Wallet step {node_id} is still waiting for transaction {tx_id} in the approval queue. Resume after it is reviewed; no new transaction was created."));
+                        }
+                        _ => {
+                            nodes[index].status = "error".into();
+                            checkpoint.insert(node_id.clone(), json!(format!("error: wallet transaction {tx_id} was {status}")));
+                            let conn = guard(state);
+                            persist_workflow(&conn, &state.home, id, &name, "error", Some(&node_id), &triggers, &nodes, &checkpoint)?;
+                            return Err(err(format!("Wallet transaction {tx_id} was {status}. Start a new workflow run only after checking the ledger.")));
+                        }
+                    }
+                    if status == "approved_by_user" {
+                        let conn = guard(state);
+                        persist_workflow(&conn, &state.home, id, &name, "running", None, &triggers, &nodes, &checkpoint)?;
+                    }
+                    let next_id = if index + 1 < nodes.len() { Some(nodes[index + 1].id.clone()) } else { None };
+                    match advance_after_step(state, &app, id, &name, &triggers, &mut nodes, &checkpoint, &node_id, next_id.as_deref(), only.as_deref())? {
+                        WfAdvance::Paused(note) => return Ok(note),
+                        WfAdvance::OnlyDone => { ran_name = node_name.clone(); ran_only = true; break; }
+                        WfAdvance::Continue => index += 1,
+                    }
+                    continue;
+                }
                 let amount = usd_amount_from_prompt(&node_prompt);
                 let rail = rail_from_prompt(&node_prompt);
                 let bot = node_bot.trim().to_string();
+                {
+                    let conn = guard(state);
+                    nodes[index].status = "running".into();
+                    persist_workflow(&conn, &state.home, id, &name, "running", Some(&node_id), &triggers, &nodes, &checkpoint)?;
+                }
                 let outcome = {
                     let conn = guard(state);
                     if amount <= 0.0 {
@@ -3193,7 +3425,8 @@ fn execute_workflow(state: &AppState, id: &str, approve_paused_gate: bool, only_
                         checkpoint.insert(node_id.clone(), json!(note.clone()));
                         {
                             let conn = guard(state);
-                            persist_workflow(&conn, &state.home, id, &name, "paused_editable", Some(&node_id), &triggers, &nodes, &checkpoint)?;
+                    persist_workflow(&conn, &state.home, id, &name, "paused_editable", Some(&node_id), &triggers, &nodes, &checkpoint)?;
+                    conn.execute("UPDATE workflows SET gate_pending_node_id=?1 WHERE id=?2", params![node_id, id])?;
                         }
                         if let Some(app) = &app {
                             let _ = app.emit("ronic://wf-progress", json!({ "id": id, "status": "paused_editable", "nodes": nodes }));
@@ -3298,6 +3531,24 @@ fn execute_workflow(state: &AppState, id: &str, approve_paused_gate: bool, only_
         };
         let prompt = fill_step_prompt(&node_prompt, &node_name, &node_kind, &previous, &handle, &workspace);
         let (provider_override, mut model_override) = step_model_choice(&node_model);
+        
+        // Handle custom model provider for workflow steps
+        let custom_model_provider = nodes[index].custom_model_provider.clone();
+        let mut secrets = state.secrets.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(ref custom) = custom_model_provider {
+            if !custom.api_key.is_empty() {
+                let custom_provider_id = format!("wf_custom_{}", nodes[index].id);
+                secrets.insert(custom_provider_id, custom.api_key.clone());
+            }
+            // Override provider and model with custom values
+            if !custom.provider_id.is_empty() {
+                provider_override = Some(format!("wf_custom_{}", nodes[index].id));
+            }
+            if !custom.custom_model.is_empty() {
+                model_override = Some(custom.custom_model.clone());
+            }
+        }
+        
         if provider_override.is_none() && model_override.is_none() {
             let conn = guard(state);
             let bot = if step_bot.is_empty() {
@@ -3312,11 +3563,34 @@ fn execute_workflow(state: &AppState, id: &str, approve_paused_gate: bool, only_
         }
         let secrets = state.secrets.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let started = std::time::Instant::now();
-        let first = crate::agent::dispatch(state, &prompt, &secrets, provider_override.as_deref(), model_override.as_deref(), None, &[]);
+        let first = crate::agent::dispatch_workflow_step(
+            state,
+            &prompt,
+            &secrets,
+            provider_override.as_deref(),
+            model_override.as_deref(),
+            custom_model_provider.as_ref(),
+            nodes[index].skill_ids.as_deref(),
+            nodes[index].plugin_ids.as_deref(),
+            nodes[index].mcp_server_ids.as_deref(),
+        );
         let outcome = match first {
             Err(error) if workflow_retry(&error.0) => {
+                std::thread::sleep(Duration::from_millis(500));
                 let retry = format!("{prompt}\n\nThe previous attempt failed: {error}\nTry this step once more.");
-                crate::agent::dispatch(state, &retry, &secrets, provider_override.as_deref(), model_override.as_deref(), None, &[])
+                crate::agent::dispatch(
+                    state,
+                    &retry,
+                    &secrets,
+                    provider_override.as_deref(),
+                    model_override.as_deref(),
+                    None,
+                    &[],
+                    custom_model_provider.as_ref(),
+                    nodes[index].skill_ids.as_deref(),
+                    nodes[index].plugin_ids.as_deref(),
+                    nodes[index].mcp_server_ids.as_deref(),
+                )
             }
             other => other,
         };
@@ -3767,7 +4041,8 @@ pub async fn show_bot_screen(
     let expected = status.url.clone();
     let hit = match tauri::async_runtime::spawn_blocking(move || crate::bot_screen::read_bot(&app_for_read, &id_for_read, Some(&expected))).await {
         Ok(Ok(hit)) => hit,
-        _ => crate::bot_screen::ScreenHit::empty(&status.url),
+        Ok(Err(error)) => return Err(error),
+        Err(error) => return Err(err(format!("browser read could not finish: {error}"))),
     };
     {
         let conn = guard(&state);
@@ -4123,11 +4398,78 @@ mod tests {
         assert!(checkpoint.is_empty());
         assert!(paused.is_none());
 
+        let mut nodes = vec![sample_node("node_1", "done"), sample_node("node_2", "error"), sample_node("node_3", "pending")];
+        let mut checkpoint = serde_json::Map::new();
+        checkpoint.insert("node_1".into(), json!("old"));
+        let mut paused = Some("node_2".into());
+        prepare_workflow_nodes(&mut nodes, &mut checkpoint, &mut paused, false, None).unwrap();
+        assert!(nodes.iter().all(|node| node.status == "pending"));
+        assert!(checkpoint.is_empty());
+        assert!(paused.is_none());
+
         let mut nodes = vec![sample_node("node_1", "done")];
         let mut checkpoint = serde_json::Map::new();
         let mut paused = None;
         prepare_workflow_nodes(&mut nodes, &mut checkpoint, &mut paused, true, None).unwrap();
         assert_eq!(nodes[0].status, "done");
+    }
+
+    #[test]
+    fn retries_are_limited_to_transient_failures() {
+        for message in ["HTTP 429 too many requests", "network connection reset", "HTTP 503 unavailable", "request timed out"] {
+            assert!(workflow_retry(message), "{message}");
+        }
+        for message in ["missing API key", "invalid model", "held for approval", "Still answering the previous message", "wallet policy denied"] {
+            assert!(!workflow_retry(message), "{message}");
+        }
+    }
+
+    #[test]
+    fn interrupted_workflows_are_quarantined_without_replaying_steps() {
+        let conn = Connection::open_in_memory().unwrap();
+        db::migrate(&conn).unwrap();
+        let home = std::env::temp_dir().join(format!("ronic-wf-recovery-{}", nid("test")));
+        std::fs::create_dir_all(&home).unwrap();
+        let nodes = vec![sample_node("node_1", "done"), sample_node("node_2", "running"), sample_node("node_3", "pending")];
+        let yaml = crate::yaml_flow::emit("wf_1", "Recovery", "running", Some("node_2"), &["every 5m".into()], &nodes, &serde_json::Map::new());
+        conn.execute(
+            "INSERT INTO workflows (id,name,yaml_source,nodes_json,triggers_json,current_status,paused_at_node_id,checkpoint_json,updated_at) VALUES ('wf_1','Recovery',?1,?2,'[\"every 5m\"]','running','node_2','{}',1)",
+            params![yaml, serde_json::to_string(&nodes).unwrap()],
+        ).unwrap();
+        conn.execute("INSERT INTO workflow_runs (id,workflow_id,status,started_at) VALUES ('wfr_1','wf_1','running',1)", []).unwrap();
+        assert_eq!(recover_interrupted_workflows(&conn, &home).unwrap(), 1);
+        let (status, nodes_raw): (String, String) = conn.query_row("SELECT current_status,nodes_json FROM workflows WHERE id='wf_1'", [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+        assert_eq!(status, "interrupted");
+        let recovered: Vec<WfNode> = serde_json::from_str(&nodes_raw).unwrap();
+        assert_eq!(recovered[0].status, "done");
+        assert_eq!(recovered[1].status, "error");
+        assert_eq!(recovered[2].status, "pending");
+        let history: String = conn.query_row("SELECT status FROM workflow_runs WHERE id='wfr_1'", [], |row| row.get(0)).unwrap();
+        assert_eq!(history, "interrupted");
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn pending_wallet_settlement_returns_its_transaction_id() {
+        let conn = Connection::open_in_memory().unwrap();
+        db::migrate(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO bot_profiles (id,handle,display_name,avatar,soul_markdown,primary_account_id,long_context_account_id,fallback_account_id,daily_wallet_limit_usd,created_at) VALUES ('bot_1','@bot','Bot','','','prov_ollama','','',100,1)",
+            [],
+        ).unwrap();
+        conn.execute("INSERT INTO wallet_policies (id,max_per_tx_usd,daily_cap_usd,require_human_approval_above_usd,max_slippage_bps,whitelisted_json,killswitch_engaged) VALUES (1,25,100,10,35,'[]',0)", []).unwrap();
+        assert_eq!(crate::db::load_policy(&conn).unwrap().daily_cap_usd, 100.0);
+        assert!(crate::wallet_engine::ledger_mode(&conn) == "sandbox");
+        assert!(!crate::wallet_engine::is_bot_frozen(&conn, "bot_1").unwrap());
+        assert_eq!(crate::db::spent_today(&conn).unwrap(), 0.0);
+        conn.execute("INSERT INTO wallet_balances (rail,label,amount_usd,native_amount,native_value,detail) VALUES ('crypto_x402','Sandbox USDC',100,'100 USDC',100,'test')", []).unwrap();
+        let note = crate::wallet::settle(&conn, "bot_1", "crypto_x402", 50.0, "50 USD", "workflow", "test", "agent", "payment", None, "spend").unwrap_or_else(|error| panic!("settle failed: {error}"));
+        let tx_id = note.strip_prefix("pending_approval:").and_then(|rest| rest.split(':').next()).expect("pending transaction id");
+        let stored: String = conn.query_row("SELECT policy_decision FROM wallet_transactions WHERE id=?1", params![tx_id], |row| row.get(0)).unwrap_or_else(|_| panic!("missing {tx_id} from {note}"));
+        assert_eq!(stored, "pending_approval");
+        crate::wallet::review(&conn, tx_id, true).unwrap();
+        let approved: String = conn.query_row("SELECT policy_decision FROM wallet_transactions WHERE id=?1", params![tx_id], |row| row.get(0)).unwrap();
+        assert_eq!(approved, "approved_by_user");
     }
 
     #[test]

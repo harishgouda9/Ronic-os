@@ -85,7 +85,7 @@ fn clip(s: &str) -> String {
     t
 }
 
-fn inspect_target_blocked(url: &url::Url) -> bool {
+pub(crate) fn inspect_target_blocked(url: &url::Url) -> bool {
     let host = url.host_str().unwrap_or("");
     if host.is_empty() || metadata_name(host) {
         return true;

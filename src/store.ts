@@ -41,6 +41,7 @@ type State = {
   boot: () => Promise<void>;
   go: (screen: ScreenId) => void;
   run: (cmd: string, args?: Record<string, unknown>) => Promise<CommandResult | null>;
+  pauseWorkflow: (id: string) => Promise<void>;
   recover: () => Promise<void>;
   setToast: (toast: string | null) => void;
   setPalette: (open: boolean) => void;
@@ -160,6 +161,21 @@ export const useRonic = create<State>((set, get) => ({
       // Every in-flight run must release its slot even when a boot or recover
       // bumped the generation under it, or busy sticks true and every button
       // gated on it (Create bot, Save profile) stays disabled forever.
+      depth = Math.max(0, depth - 1);
+      if (depth === 0) set({ busy: false, pending: null });
+    }
+  },
+  pauseWorkflow: async (id) => {
+    // Deliberately bypass the command queue: this must reach the runner while
+    // run_workflow still owns its queue slot.
+    set({ busy: true, error: null });
+    depth += 1;
+    try {
+      const res = await call("pause_workflow", { id });
+      set({ snap: res.snapshot, toast: res.toast });
+    } catch (error) {
+      set({ toast: error instanceof Error ? error.message : String(error) });
+    } finally {
       depth = Math.max(0, depth - 1);
       if (depth === 0) set({ busy: false, pending: null });
     }

@@ -53,10 +53,10 @@ export const ipc = {
     return getBrowserBoot(botId);
   },
 
-  layout: async (x: number, y: number, w: number, h: number): Promise<void> => {
+  layout: async (x: number, y: number, w: number, h: number, botId?: string, hostVisible = true): Promise<void> => {
     if (isTauri()) {
       const { invoke } = await import("@tauri-apps/api/core");
-      return invoke<void>("mini_shell_layout", { x, y, w, h, dpr: window.devicePixelRatio });
+      return invoke<void>("mini_shell_layout", { x, y, w, h, dpr: window.devicePixelRatio, botId: botId ?? null, hostVisible });
     }
   },
 

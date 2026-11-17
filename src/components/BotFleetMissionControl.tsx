@@ -155,8 +155,8 @@ export default function BotFleetMissionControl() {
       title: wf.name || "Unattended Routine",
       botHandle: "workflow",
       schedule: wf.triggers?.[0] || "Manual",
-      lastRun: wf.updatedAt ? new Date(wf.updatedAt).toLocaleTimeString() : "Never",
-      enabled: wf.currentStatus !== "paused",
+      lastRun: wf.lastFiredAt ? new Date(wf.lastFiredAt).toLocaleTimeString() : "Never",
+      enabled: wf.scheduleEnabled,
     }));
   }, [snap?.workflows]);
 
@@ -223,11 +223,7 @@ export default function BotFleetMissionControl() {
   };
 
   const handleToggleRoutinePause = async (rt: FleetRoutine) => {
-    if (rt.enabled) {
-      await run("pause_workflow", { id: rt.id });
-    } else {
-      await run("resume_workflow", { id: rt.id });
-    }
+    await run("update_workflow", { patch: { id: rt.id, scheduleEnabled: !rt.enabled } });
   };
 
   const handleClearLogs = async () => {

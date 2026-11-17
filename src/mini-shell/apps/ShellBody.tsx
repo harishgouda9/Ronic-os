@@ -7,6 +7,7 @@ import { FilesApp } from "./FilesApp";
 import { ChromeApp } from "./ChromeApp";
 import { TerminalApp } from "./TerminalApp";
 import { MiniShellErrorBoundary } from "../ErrorBoundary";
+import { miniComputerBounds } from "../../ui/BotCoworkers";
 
 const APPS: { id: ShellState["app"]; label: string; icon: typeof Globe }[] = [
   { id: "desktop", label: "Desktop", icon: Monitor },
@@ -63,28 +64,46 @@ export function ShellBody({
   const pageAreaRef = useRef<HTMLDivElement | null>(null);
 
   const reportLayout = useCallback(() => {
-    // The embedded chat panel is rendered in the main webview. Its Chrome
-    // page belongs to the bot's standalone window, so those coordinates must
-    // never be sent to the native child webview.
-    if (compact) return;
     const el = pageAreaRef.current;
     if (!el) return;
     const rect = el.getBoundingClientRect();
-    if (rect.width > 1 && rect.height > 1) {
-      void ipc.layout(rect.left, rect.top, rect.width, rect.height).catch(() => {});
-    }
-  }, [compact]);
+    const bounds = compact
+      ? miniComputerBounds(el)
+      : rect.width > 1 && rect.height > 1
+        ? { x: rect.left, y: rect.top, width: rect.width, height: rect.height }
+        : null;
+    void ipc.layout(bounds?.x ?? 0, bounds?.y ?? 0, bounds?.width ?? 0, bounds?.height ?? 0, compact ? boot.botId : undefined, Boolean(bounds)).catch(() => {});
+  }, [boot.botId, compact]);
 
   useEffect(() => {
-    if (compact) return;
+    if (!compact) return;
+    return () => {
+      void ipc.layout(0, 0, 0, 0, boot.botId, false).catch(() => {});
+    };
+  }, [boot.botId, compact]);
+
+  useEffect(() => {
     const el = pageAreaRef.current;
     const frame = requestAnimationFrame(reportLayout);
     window.addEventListener("resize", reportLayout);
     const observer = el && typeof ResizeObserver !== "undefined" ? new ResizeObserver(() => reportLayout()) : null;
     if (el && observer) observer.observe(el);
+    const parent = el?.closest(".chat-layout, .chat-grid");
+    if (parent && observer) observer.observe(parent);
+    const scroller = el?.closest(".computer-dock")?.querySelector(".computer-dock-scroll");
+    scroller?.addEventListener("scroll", reportLayout, { passive: true });
+    document.addEventListener("scroll", reportLayout, true);
+    window.addEventListener("blur", reportLayout);
+    window.addEventListener("focus", reportLayout);
+    document.addEventListener("visibilitychange", reportLayout);
     return () => {
       cancelAnimationFrame(frame);
       window.removeEventListener("resize", reportLayout);
+      scroller?.removeEventListener("scroll", reportLayout);
+      document.removeEventListener("scroll", reportLayout, true);
+      window.removeEventListener("blur", reportLayout);
+      window.removeEventListener("focus", reportLayout);
+      document.removeEventListener("visibilitychange", reportLayout);
       observer?.disconnect();
     };
   }, [boot.botId, compact, shell?.app, shell?.tabs.length, reportLayout]);

@@ -449,6 +449,8 @@ export function Chat() {
 
   const [screenDockTab, setScreenDockTab] = useState<"computer" | "browser">("computer");
 
+  const accessBotIdRef = useRef("");
+
   const [plusOpen, setPlusOpen] = useState(false);
 
   const [chatsOpen, setChatsOpen] = useState(false);
@@ -474,6 +476,20 @@ export function Chat() {
   const threadPane = usePane("ronic.pane.thread", 640);
 
   const stagePane = usePane("ronic.pane.stage", 560);
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    const onComputer = (event: { detail?: { botId?: string; action?: string } }) => {
+      const detail = event.detail;
+      if (detail?.action !== "reveal" || detail.botId !== accessBotIdRef.current) return;
+      setScreenDockTab("computer");
+      previewPane.restore();
+      setScreenMode("preview");
+    };
+    let unlisten: (() => void) | undefined;
+    void import("@tauri-apps/api/event").then(({ listen }) => listen("ronic://mini-computer", onComputer as any)).then((stop) => { unlisten = stop; }).catch(() => {});
+    return () => unlisten?.();
+  }, []);
 
   const [installed, setInstalled] = useState<string[]>(readWebapps);
 
@@ -731,6 +747,8 @@ export function Chat() {
   const inspected = snap.profiles.find((item) => item.id === inspectedId) ?? profile;
 
   const accessBot = inspected && (!activeGroup || activeGroup.memberBotIds.includes(inspected.id)) ? inspected : profile;
+
+  accessBotIdRef.current = accessBot?.id ?? "";
 
   const userTint = accessBot ? lightUserHighlight(accessBot.avatarColor, accessBot.id) : null;
 
@@ -4483,6 +4501,56 @@ function botHeaderLabel(modelUsed?: string) {
 
 }
 
+
+
+import { MARKETPLACE_CATALOG, getMcpAuthVault, getAuthenticatedMcpIds } from "../kernel/marketplaceCatalog";
+import type { McpRecommendation } from "../types";
+
+// ==========================================
+// MCP Recommendations Component
+// ==========================================
+function McpRecommendationCard({ recommendation, onConnect }: {
+  recommendation: McpRecommendation;
+  onConnect: (id: string) => void;
+}) {
+  const catalogItem = MARKETPLACE_CATALOG.find((item) => item.slug === recommendation.catalogSlug);
+  const isConnected = recommendation.connected;
+  
+  return (
+    <div className={`mt-2 p-2 rounded-lg border text-xs ${
+      isConnected 
+        ? "bg-emerald-50 dark:bg-emerald-950/20 border-emerald-200 dark:border-emerald-800"
+        : "bg-amber-50 dark:bg-amber-950/20 border-amber-200 dark:border-amber-800"
+    }`}>
+      <div className="flex items-start justify-between gap-2">
+        <div className="flex-1 min-w-0">
+          <div className="font-medium flex items-center gap-1.5">
+            {recommendation.name}
+            {isConnected && <Check size={11} className="text-emerald-500" />}
+          </div>
+          <div className="text-slate-500 dark:text-slate-400 mt-0.5 line-clamp-2">
+            {recommendation.description}
+          </div>
+          <div className="text-amber-600 dark:text-amber-400 mt-1 font-medium">
+            Reason: {recommendation.reason}
+          </div>
+        </div>
+        <button
+          type="button"
+          disabled={isConnected}
+          onClick={() => onConnect(recommendation.id)}
+          className={`shrink-0 px-2 py-1 text-[10px] font-semibold rounded-md transition ${
+            isConnected
+              ? "bg-emerald-100 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300 cursor-default"
+              : "bg-amber-600 hover:bg-amber-500 text-white cursor-pointer"
+          }`}
+        >
+          {isConnected ? "Connected" : "Connect"}
+        </button>
+      </div>
+    </div>
+  );
+}
 
 
 const StepView = memo(function StepView({

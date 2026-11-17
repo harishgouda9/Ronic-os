@@ -38,9 +38,9 @@ pub fn settle_ext(
     effect: &str,
     order_id: Option<&str>,
 ) -> Result<String> {
-    let tx = conn.unchecked_transaction()?;
-    let policy_row = db::load_policy(&tx)?;
-    let spent = db::spent_today(&tx)?;
+    let tx = conn.unchecked_transaction().map_err(|error| err(format!("wallet transaction could not start: {error}")))?;
+    let policy_row = db::load_policy(&tx).map_err(|error| err(format!("wallet policy could not load: {error}")))?;
+    let spent = db::spent_today(&tx).map_err(|error| err(format!("wallet spending history could not load: {error}")))?;
     let mut decision = policy::evaluate(
         &PolicyInput {
             max_per_tx_usd: policy_row.max_per_tx_usd,
@@ -77,7 +77,7 @@ pub fn settle_ext(
         match bot_daily_limit(&tx, bot_id) {
             Ok(None) => {}
             Ok(Some(limit)) => {
-                let bot_spent = db::spent_today_for_bot(&tx, bot_id)?;
+                let bot_spent = db::spent_today_for_bot(&tx, bot_id).map_err(|error| err(format!("bot spending history could not load: {error}")))?;
                 if bot_spent + amount_usd > limit + 1e-9 {
                     decision = Decision::Rejected;
                 }
@@ -110,7 +110,7 @@ pub fn settle_ext(
             tx.execute("UPDATE quant_orders SET wallet_tx_id = ?1, status = 'WORKING' WHERE id = ?2", params![tx_id, order_id])?;
         }
         tx.commit()?;
-        return Ok("pending_approval: waiting for one-click review".into());
+        return Ok(format!("pending_approval:{tx_id}: waiting for one-click review"));
     }
     apply_effect(&tx, rail, amount_usd, effect)?;
     let reference = nid("sandbox");

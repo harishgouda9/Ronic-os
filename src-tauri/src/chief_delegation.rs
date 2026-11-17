@@ -793,7 +793,7 @@ fn spawn_assignment_chats(state: &AppState, jobs: Vec<(String, String)>) {
                     continue;
                 }
                 let secrets = state.secrets.lock().unwrap_or_else(|poison| poison.into_inner()).clone();
-                match crate::agent::dispatch(&state, &goal, &secrets, None, model.as_deref(), None, &[]) {
+                match crate::agent::dispatch(&state, &goal, &secrets, None, model.as_deref(), None, &[], None, None, None, None) {
                     Err(error) if error.0.contains("Still answering") => {
                         tries += 1;
                         std::thread::sleep(std::time::Duration::from_secs(2));

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { ExternalLink, Power, RefreshCw } from "lucide-react";
+import { ExternalLink, RefreshCw } from "lucide-react";
 import { ipc, errorMessage, isTauri } from "../mini-shell/ipc";
 import type { ShellBoot, ShellState } from "../mini-shell/types";
 import { ShellBody, useMiniTheme, useShellEvents } from "../mini-shell/apps/ShellBody";
@@ -8,11 +8,8 @@ import { MiniShellErrorBoundary } from "./ErrorBoundary";
 /**
  * The bot's mini computer, embedded in the chat dock. Runs inside the MAIN
  * webview and addresses the inspected bot explicitly (botId), so it controls
- * exactly that bot's isolated computer — Files, Terminal, and the Chrome
- * toolbar/tab strip. The live web page itself still renders only in the bot's
- * own mini computer window (a native webview cannot be embedded here), so the
- * panel's Chrome view shows the tab strip + toolbar and a launcher card for
- * the page; "Open window" brings the bot's window to the front.
+ * exactly that bot's isolated computer. Its live Chrome webview is positioned
+ * over this panel until the user explicitly expands it into a floating window.
  */
 export function MiniComputerPanel({ botId, botHandle }: { botId: string; botHandle: string }) {
   const [boot, setBoot] = useState<ShellBoot | null>(null);
@@ -93,8 +90,6 @@ export function MiniComputerPanel({ botId, botHandle }: { botId: string; botHand
     );
   }
 
-  const windowOpen = shell.windowOpen !== false;
-
   return (
     <div className={`msh-root ${theme === "dark" ? "msh-dark" : ""} msh-compact`} style={{ minHeight: 0 }}>
       <div className="msh-panel-head">
@@ -104,27 +99,15 @@ export function MiniComputerPanel({ botId, botHandle }: { botId: string; botHand
         <button type="button" className="msh-tool" title="Refresh" aria-label="Refresh" onClick={refresh}>
           <RefreshCw size={12} aria-hidden className={busy ? "msh-spin" : ""} />
         </button>
-        {windowOpen ? (
-          <button
-            type="button"
-            className="msh-tool"
-            title="Bring the bot's mini computer window to the front (the live page renders there)"
-            aria-label="Open window"
-            onClick={() => void spawnWindow()}
-          >
-            <ExternalLink size={12} aria-hidden />
-          </button>
-        ) : (
-          <button
-            type="button"
-            className="msh-tool"
-            title="Start this bot's mini computer window"
-            aria-label="Start window"
-            onClick={() => void spawnWindow()}
-          >
-            <Power size={12} aria-hidden />
-          </button>
-        )}
+        <button
+          type="button"
+          className="msh-tool"
+          title="Expand mini computer into a separate window"
+          aria-label="Expand mini computer"
+          onClick={() => void spawnWindow()}
+        >
+          <ExternalLink size={12} aria-hidden />
+        </button>
       </div>
       <MiniShellErrorBoundary fallbackTitle={`${botHandle}’s desktop view could not render`}>
         <ShellBody

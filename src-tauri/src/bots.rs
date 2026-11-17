@@ -785,7 +785,7 @@ pub fn decide(state: &crate::AppState, step_id: &str, approve: bool, secrets: &s
     match next {
         DecideNext::Done(note) => Ok(note),
         DecideNext::Run { prompt, thread_id } => {
-            let result = crate::agent::dispatch(state, &prompt, secrets, provider, model, effort, &[]);
+            let result = crate::agent::dispatch(state, &prompt, secrets, provider, model, effort, &[], None, None, None, None);
             if result.is_err() {
                 let conn = state.conn.lock().unwrap_or_else(|poison| poison.into_inner());
                 let _ = crate::db::kv_set(&conn, &format!("skip_gate:{thread_id}"), "");

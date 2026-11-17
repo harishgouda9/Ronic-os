@@ -15,6 +15,7 @@ mod policy;
 mod proxy;
 mod redact;
 mod repair;
+mod research;
 mod remediation_core;
 mod scan;
 mod site_session;
@@ -86,6 +87,7 @@ pub fn run() {
     db::drop_reference_fixture(&conn, &home).expect("clear reference fixture");
     db::seed_if_empty(&conn, &home).expect("seed");
     db::ensure_default_profile(&conn).expect("default profile");
+    commands::recover_interrupted_workflows(&conn, &home).expect("recover interrupted workflows");
     let has_pass = db::kv_get(&conn, "vault_verifier").ok().flatten().is_some();
     let secrets = if has_pass { HashMap::new() } else { vault::load_plaintext(&home) };
     let heartbeat = Arc::new(AtomicU64::new(now_ms() as u64));
@@ -225,6 +227,7 @@ pub fn run() {
             commands::workspace_git,
             commands::install_git_package,
             commands::create_workflow,
+            commands::import_workflow,
             commands::update_workflow,
             commands::pause_workflow,
             commands::resume_workflow,

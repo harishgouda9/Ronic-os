@@ -54,12 +54,17 @@ import {
   Moon,
   Hand,
   Compass,
+  Download,
+  Upload,
+  CalendarClock,
+  History,
 } from "lucide-react";
 
 import { listen } from "@tauri-apps/api/event";
-import { call, isTauri } from "../api";
+import { isTauri, saveExportedFile } from "../api";
 import { useRonic } from "../store";
-import type { WfNode, Workflow, BotProfile } from "../types";
+import type { WfNode, Workflow, WorkflowRun, BotProfile, Skill, PluginPackage, McpServer, CustomModelProvider, McpRecommendation } from "../types";
+import { MARKETPLACE_CATALOG, getMcpAuthVault, getAuthenticatedMcpIds } from "../kernel/marketplaceCatalog";
 
 // ==========================================
 // 1. Step Kind Registry & Definitions
@@ -256,6 +261,7 @@ const MODEL_PRESETS = [
   { id: "prov_deepseek", label: "DeepSeek R1 (Deep Math & Logic)" },
   { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro (Large Context)" },
   { id: "claude-3-5-haiku", label: "Claude 3.5 Haiku (High Throughput)" },
+  { id: "custom", label: "Custom Model Provider (BYOK)" },
 ];
 
 const EXPRESSION_VARIABLES = [
@@ -284,7 +290,7 @@ const TEMPLATES: WorkflowTemplate[] = [
     name: "Ronic OS Sales & Marketing Funnel",
     category: "Growth & Revenue",
     description: "Inbound capture, lead qualification, CRM enrichment, and automated outreach with approval check.",
-    triggers: ["webhook:landing_page_lead", "schedule:daily_9am"],
+    triggers: ["daily 09:00"],
     nodes: [
       {
         id: "node_1",
@@ -343,7 +349,7 @@ const TEMPLATES: WorkflowTemplate[] = [
     name: "Autonomous Bug Triager & Code Patcher",
     category: "Engineering & QA",
     description: "Inspects stack traces, reproduces errors, generates surgical unified diffs, runs regression tests, and pauses for review.",
-    triggers: ["git:on_pr_opened", "sentry:on_issue"],
+    triggers: [],
     nodes: [
       {
         id: "node_1",
@@ -402,7 +408,7 @@ const TEMPLATES: WorkflowTemplate[] = [
     name: "Crypto & Quant Trading Sentinel",
     category: "Financial & Web3",
     description: "Sweeps orderbook liquidity, calculates multi-indicator alpha, enforces risk limits, and routes signed transactions.",
-    triggers: ["websocket:orderbook_ticker", "schedule:every_5m"],
+    triggers: ["every 5m"],
     nodes: [
       {
         id: "node_1",
@@ -461,7 +467,7 @@ const TEMPLATES: WorkflowTemplate[] = [
     name: "Multi-Agent Deep Research Factory",
     category: "Research & Content",
     description: "Decomposes inquiries, crawls academic & web resources, validates citations, synthesizes long-form briefing.",
-    triggers: ["manual:user_inquiry"],
+    triggers: [],
     nodes: [
       {
         id: "node_1",
@@ -784,9 +790,14 @@ export default function WorkflowsStudio() {
   const snap = useRonic((s) => s.snap);
   const go = useRonic((s) => s.go);
   const busy = useRonic((s) => s.busy);
+  const pauseWorkflow = useRonic((s) => s.pauseWorkflow);
 
   const workflows = snap?.workflows ?? [];
+  const workflowRuns = snap?.workflowRuns ?? [];
   const profiles = snap?.profiles ?? [];
+  const skills = snap?.skills ?? [];
+  const plugins = snap?.plugins ?? [];
+  const mcpServers = snap?.mcpServers ?? [];
 
   // Theme State: Default to "light" (White theme) as requested, with localStorage persistence
   const [theme, setTheme] = useState<"light" | "dark">(() => {
@@ -820,6 +831,10 @@ export default function WorkflowsStudio() {
   const [addNodeSearch, setAddNodeSearch] = useState("");
   const [showTemplatesModal, setShowTemplatesModal] = useState(false);
   const [showYamlModal, setShowYamlModal] = useState(false);
+  const [showScheduleModal, setShowScheduleModal] = useState(false);
+  const [showHistoryModal, setShowHistoryModal] = useState(false);
+  const [selectedRun, setSelectedRun] = useState<WorkflowRun | null>(null);
+  const [scheduleDraft, setScheduleDraft] = useState("");
   const [yamlEditorDraft, setYamlEditorDraft] = useState("");
   const [copiedYaml, setCopiedYaml] = useState(false);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
@@ -870,7 +885,14 @@ export default function WorkflowsStudio() {
     }
   }, [activeWf?.id, activeWf?.name]);
 
-  const yaml = useMemo(() => (activeWf ? activeWf.yamlSource || emitYaml(activeWf, activeWf.nodes) : ""), [activeWf]);
+  const yaml = useMemo(() => (activeWf ? emitYaml(activeWf, activeWf.nodes) : ""), [activeWf]);
+
+  const activeRuns = useMemo(() => workflowRuns.filter((run) => run.workflowId === activeWf?.id).slice(0, 20), [workflowRuns, activeWf?.id]);
+
+  const savedSchedule = snapshotWf?.triggers.find((trigger) => /^(daily |every |cron:)/i.test(trigger)) ?? "";
+  useEffect(() => {
+    setScheduleDraft(savedSchedule);
+  }, [snapshotWf?.id, savedSchedule]);
 
   // Synchronize React Flow nodes & edges whenever activeWf or theme changes
   useEffect(() => {
@@ -1201,6 +1223,7 @@ export default function WorkflowsStudio() {
           name: tmpl.name,
           nodes: updatedNodes,
           yamlSource: generatedYaml,
+          scheduleEnabled: false,
         },
       });
       setActiveWfId(created.id);
@@ -1216,6 +1239,61 @@ export default function WorkflowsStudio() {
         setActiveWfId(remaining[0].id);
       }
     });
+  };
+
+  const handleSaveYaml = async () => {
+    if (!snapshotWf) return;
+    const result = await run("update_workflow", { patch: { id: snapshotWf.id, yamlSource: yamlEditorDraft } });
+    if (result) setShowYamlModal(false);
+  };
+
+  const handleSaveSchedule = async (enabled = snapshotWf?.scheduleEnabled ?? true) => {
+    if (!snapshotWf) return;
+    const result = await run("update_workflow", { patch: { id: snapshotWf.id, schedule: scheduleDraft, scheduleEnabled: enabled } });
+    if (result) setShowScheduleModal(false);
+  };
+
+  const handleExport = async () => {
+    if (!snapshotWf) return;
+    const portable: Workflow = {
+      ...snapshotWf,
+      currentStatus: "idle",
+      pausedAtNodeId: null,
+      checkpoint: {},
+      nodes: snapshotWf.nodes.map((node) => ({ ...node, status: "pending", latencyMs: 0 })),
+    };
+    const blob = new Blob([emitYaml(portable, portable.nodes)], { type: "application/yaml" });
+    const data = await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result));
+      reader.onerror = () => reject(reader.error);
+      reader.readAsDataURL(blob);
+    }).catch((error) => {
+      setToast(error instanceof Error ? error.message : String(error));
+      return null;
+    });
+    if (!data) return;
+    try {
+      await saveExportedFile(`${snapshotWf.name.replace(/[^a-z0-9_-]+/gi, "-")}-${snapshotWf.id}.yaml`, data);
+      setToast("Portable workflow exported without checkpoints or approval state.");
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const handleImportFile = async (file: File | undefined) => {
+    if (!file) return;
+    if (file.size > 1_000_000) {
+      setToast("Workflow YAML is too large (1 MB limit).");
+      return;
+    }
+    try {
+      const result = await run("import_workflow", { yamlSource: await file.text() });
+      const importedId = (result?.payload as { id?: string } | undefined)?.id;
+      if (importedId) setActiveWfId(importedId);
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : String(error));
+    }
   };
 
   const inspectedNode = useMemo(() => {
@@ -1234,6 +1312,17 @@ export default function WorkflowsStudio() {
         isDark ? "bg-[#0F172A] text-slate-100" : "bg-[#F8FAFC] text-slate-900"
       }`}
     >
+      <input
+        id="workflow-import-file"
+        type="file"
+        accept=".yaml,.yml,text/yaml,application/yaml"
+        className="hidden"
+        aria-label="Import workflow YAML"
+        onChange={(event) => {
+          void handleImportFile(event.target.files?.[0]);
+          event.target.value = "";
+        }}
+      />
       {/* ========================================================= */}
       {/* 1. TOP HEADER & WORKFLOW CONTROL TOOLBAR                  */}
       {/* ========================================================= */}
@@ -1386,13 +1475,7 @@ export default function WorkflowsStudio() {
           <button
             onClick={() => {
               if (!snapshotWf) return;
-              void call("pause_workflow", { id: snapshotWf.id })
-                .then((res) => {
-                  if (res.toast) setToast(res.toast);
-                })
-                .catch((error: unknown) => {
-                  setToast(error instanceof Error ? error.message : String(error));
-                });
+              void pauseWorkflow(snapshotWf.id);
             }}
             disabled={!snapshotWf || activeWf?.currentStatus !== "running"}
             className={`px-3 py-1.5 text-xs font-semibold rounded-lg border flex items-center gap-1.5 transition cursor-pointer disabled:opacity-50 ${
@@ -1434,6 +1517,43 @@ export default function WorkflowsStudio() {
             title="View or edit YAML graph spec"
           >
             <FileCode2 size={14} />
+          </button>
+
+          <button
+            onClick={() => setShowScheduleModal(true)}
+            disabled={!snapshotWf}
+            className={`px-3 py-1.5 text-xs font-semibold rounded-lg border flex items-center gap-1.5 transition cursor-pointer disabled:opacity-50 ${isDark ? "bg-slate-800 hover:bg-slate-700 text-slate-200 border-slate-700" : "bg-white hover:bg-slate-100 text-slate-700 border-slate-200"}`}
+            title="Configure automatic runs"
+          >
+            <CalendarClock size={13} />
+            <span>{savedSchedule || "Schedule"}</span>
+          </button>
+
+          <button
+            onClick={() => { setSelectedRun(activeRuns[0] ?? null); setShowHistoryModal(true); }}
+            disabled={!snapshotWf}
+            className={`p-1.5 rounded-lg border transition cursor-pointer ${isDark ? "bg-slate-800 hover:bg-slate-700 text-slate-300 border-slate-700" : "bg-white hover:bg-slate-100 text-slate-700 border-slate-200"}`}
+            title="Execution history and diagnostics"
+          >
+            <History size={14} />
+          </button>
+
+          <button
+            onClick={() => document.getElementById("workflow-import-file")?.click()}
+            disabled={busy}
+            className={`p-1.5 rounded-lg border transition cursor-pointer ${isDark ? "bg-slate-800 hover:bg-slate-700 text-slate-300 border-slate-700" : "bg-white hover:bg-slate-100 text-slate-700 border-slate-200"}`}
+            title="Import a workflow YAML file"
+          >
+            <Upload size={14} />
+          </button>
+
+          <button
+            onClick={() => void handleExport()}
+            disabled={!snapshotWf}
+            className={`p-1.5 rounded-lg border transition cursor-pointer ${isDark ? "bg-slate-800 hover:bg-slate-700 text-slate-300 border-slate-700" : "bg-white hover:bg-slate-100 text-slate-700 border-slate-200"}`}
+            title="Export workflow without runtime outputs"
+          >
+            <Download size={14} />
           </button>
 
           {/* Delete Workflow */}
@@ -1850,6 +1970,339 @@ export default function WorkflowsStudio() {
                   </select>
                 </div>
 
+                {/* Custom Model Provider (BYOK) */}
+                {inspectedNode.model === "custom" || inspectedNode.customModelProvider ? (
+                  <div className="space-y-2 p-3 rounded-xl border bg-amber-50/50 dark:bg-amber-950/20">
+                    <label className="text-[11px] font-semibold text-slate-500 block flex items-center gap-1.5">
+                      <Cpu size={13} className="text-amber-600" />
+                      <span>Custom Model Provider (Bring Your Own Key)</span>
+                    </label>
+                    <div className="grid grid-cols-1 gap-2">
+                      <div className="space-y-1">
+                        <label className="text-[10px] font-medium text-slate-500">Provider ID (e.g., prov_openai, prov_custom)</label>
+                        <input
+                          type="text"
+                          value={inspectedNode.customModelProvider?.providerId || ""}
+                          onChange={(e) => handleUpdateNodeFromInspector(inspectedNode.id, {
+                            customModelProvider: {
+                              ...inspectedNode.customModelProvider,
+                              providerId: e.target.value,
+                            } as CustomModelProvider,
+                          })}
+                          placeholder="prov_openai"
+                          className={`w-full px-3 py-1.5 text-xs rounded-xl outline-none border focus:border-indigo-500 ${
+                            isDark ? "bg-slate-950 border-slate-800 text-white" : "bg-slate-50 border-slate-200 text-slate-900"
+                          }`}
+                        />
+                      </div>
+                      <div className="space-y-1">
+                        <label className="text-[10px] font-medium text-slate-500">Custom Endpoint URL</label>
+                        <input
+                          type="text"
+                          value={inspectedNode.customModelProvider?.endpoint || ""}
+                          onChange={(e) => handleUpdateNodeFromInspector(inspectedNode.id, {
+                            customModelProvider: {
+                              ...inspectedNode.customModelProvider,
+                              endpoint: e.target.value,
+                            } as CustomModelProvider,
+                          })}
+                          placeholder="https://api.openai.com/v1"
+                          className={`w-full px-3 py-1.5 text-xs rounded-xl outline-none border focus:border-indigo-500 ${
+                            isDark ? "bg-slate-950 border-slate-800 text-white" : "bg-slate-50 border-slate-200 text-slate-900"
+                          }`}
+                        />
+                      </div>
+                      <div className="space-y-1">
+                        <label className="text-[10px] font-medium text-slate-500">API Key</label>
+                        <input
+                          type="password"
+                          value={inspectedNode.customModelProvider?.apiKey || ""}
+                          onChange={(e) => handleUpdateNodeFromInspector(inspectedNode.id, {
+                            customModelProvider: {
+                              ...inspectedNode.customModelProvider,
+                              apiKey: e.target.value,
+                            } as CustomModelProvider,
+                          })}
+                          placeholder="sk-..."
+                          className={`w-full px-3 py-1.5 text-xs rounded-xl outline-none border focus:border-indigo-500 ${
+                            isDark ? "bg-slate-950 border-slate-800 text-white" : "bg-slate-50 border-slate-200 text-slate-900"
+                          }`}
+                        />
+                      </div>
+                      <div className="space-y-1">
+                        <label className="text-[10px] font-medium text-slate-500">Model Name</label>
+                        <input
+                          type="text"
+                          value={inspectedNode.customModelProvider?.customModel || ""}
+                          onChange={(e) => handleUpdateNodeFromInspector(inspectedNode.id, {
+                            customModelProvider: {
+                              ...inspectedNode.customModelProvider,
+                              customModel: e.target.value,
+                            } as CustomModelProvider,
+                          })}
+                          placeholder="gpt-4o, claude-3-5-sonnet, etc."
+                          className={`w-full px-3 py-1.5 text-xs rounded-xl outline-none border focus:border-indigo-500 ${
+                            isDark ? "bg-slate-950 border-slate-800 text-white" : "bg-slate-50 border-slate-200 text-slate-900"
+                          }`}
+                        />
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => handleUpdateNodeFromInspector(inspectedNode.id, { model: "custom", customModelProvider: { providerId: "", endpoint: "", apiKey: "", customModel: "" } })}
+                    className="w-full px-3 py-1.5 text-xs font-medium text-amber-600 hover:text-amber-700 bg-amber-50/50 dark:bg-amber-950/20 border border-amber-200 dark:border-amber-800 rounded-xl transition"
+                  >
+                    + Configure Custom Model Provider (BYOK)
+                  </button>
+                )}
+
+                {/* Skills Selector */}
+                <div className="space-y-1">
+                  <label className="text-[11px] font-semibold text-slate-500 block flex items-center gap-1.5">
+                    <Sparkles size={13} className="text-indigo-600" />
+                    <span>Skills</span>
+                    {(inspectedNode.skillIds?.length ?? 0) > 0 && (
+                      <span className="text-[10px] font-mono text-indigo-600 bg-indigo-50 dark:bg-indigo-950/40 px-1.5 py-0.5 rounded">
+                        {inspectedNode.skillIds?.length} selected
+                      </span>
+                    )}
+                  </label>
+                  <div className={`max-h-48 overflow-y-auto rounded-xl border p-2 space-y-1 ${
+                    isDark ? "bg-slate-950 border-slate-800" : "bg-slate-50 border-slate-200"
+                  }`}>
+                    {skills.length === 0 ? (
+                      <p className="text-xs text-slate-400 p-2">No skills available</p>
+                    ) : (
+                      skills.map((skill) => {
+                        const isSelected = inspectedNode.skillIds?.includes(skill.id) ?? false;
+                        return (
+                          <label
+                            key={skill.id}
+                            className={`flex items-start gap-2 p-1.5 rounded-lg cursor-pointer transition ${
+                              isSelected
+                                ? isDark ? "bg-indigo-950/40 border border-indigo-800" : "bg-indigo-50 border border-indigo-200"
+                                : isDark ? "hover:bg-slate-900" : "hover:bg-white"
+                            }`}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={isSelected}
+                              onChange={(e) => {
+                                const current = inspectedNode.skillIds || [];
+                                const next = e.target.checked
+                                  ? [...current, skill.id]
+                                  : current.filter((id) => id !== skill.id);
+                                handleUpdateNodeFromInspector(inspectedNode.id, { skillIds: next });
+                              }}
+                              className="mt-0.5 w-3.5 h-3.5 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                            />
+                            <div className="flex-1 min-w-0">
+                              <div className="text-xs font-medium truncate">{skill.title}</div>
+                              <div className="text-[10px] text-slate-400 truncate">{skill.slashCommand || skill.slug}</div>
+                            </div>
+                          </label>
+                        );
+                      })
+                    )}
+                  </div>
+                </div>
+
+                {/* Plugins Selector */}
+                <div className="space-y-1">
+                  <label className="text-[11px] font-semibold text-slate-500 block flex items-center gap-1.5">
+                    <LayoutGrid size={13} className="text-emerald-600" />
+                    <span>Plugins</span>
+                    {(inspectedNode.pluginIds?.length ?? 0) > 0 && (
+                      <span className="text-[10px] font-mono text-emerald-600 bg-emerald-50 dark:bg-emerald-950/40 px-1.5 py-0.5 rounded">
+                        {inspectedNode.pluginIds?.length} selected
+                      </span>
+                    )}
+                  </label>
+                  <div className={`max-h-48 overflow-y-auto rounded-xl border p-2 space-y-1 ${
+                    isDark ? "bg-slate-950 border-slate-800" : "bg-slate-50 border-slate-200"
+                  }`}>
+                    {plugins.length === 0 ? (
+                      <p className="text-xs text-slate-400 p-2">No plugins installed</p>
+                    ) : (
+                      plugins.map((plugin) => {
+                        const isSelected = inspectedNode.pluginIds?.includes(plugin.id) ?? false;
+                        return (
+                          <label
+                            key={plugin.id}
+                            className={`flex items-start gap-2 p-1.5 rounded-lg cursor-pointer transition ${
+                              isSelected
+                                ? isDark ? "bg-emerald-950/40 border border-emerald-800" : "bg-emerald-50 border border-emerald-200"
+                                : isDark ? "hover:bg-slate-900" : "hover:bg-white"
+                            }`}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={isSelected}
+                              onChange={(e) => {
+                                const current = inspectedNode.pluginIds || [];
+                                const next = e.target.checked
+                                  ? [...current, plugin.id]
+                                  : current.filter((id) => id !== plugin.id);
+                                handleUpdateNodeFromInspector(inspectedNode.id, { pluginIds: next });
+                              }}
+                              className="mt-0.5 w-3.5 h-3.5 rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
+                            />
+                            <div className="flex-1 min-w-0">
+                              <div className="text-xs font-medium truncate">{plugin.name} <span className="text-slate-400">v{plugin.version}</span></div>
+                              <div className="text-[10px] text-slate-400 truncate">{plugin.slug}</div>
+                            </div>
+                          </label>
+                        );
+                      })
+                    )}
+                  </div>
+                </div>
+
+                {/* MCPs Selector */}
+                <div className="space-y-1">
+                  <label className="text-[11px] font-semibold text-slate-500 block flex items-center gap-1.5">
+                    <Database size={13} className="text-sky-600" />
+                    <span>MCP Servers</span>
+                    {(inspectedNode.mcpServerIds?.length ?? 0) > 0 && (
+                      <span className="text-[10px] font-mono text-sky-600 bg-sky-50 dark:bg-sky-950/40 px-1.5 py-0.5 rounded">
+                        {inspectedNode.mcpServerIds?.length} selected
+                      </span>
+                    )}
+                  </label>
+                  <div className={`max-h-48 overflow-y-auto rounded-xl border p-2 space-y-1 ${
+                    isDark ? "bg-slate-950 border-slate-800" : "bg-slate-50 border-slate-200"
+                  }`}>
+                    {mcpServers.length === 0 ? (
+                      <p className="text-xs text-slate-400 p-2">No MCP servers connected</p>
+                    ) : (
+                      mcpServers.map((mcp) => {
+                        const isSelected = inspectedNode.mcpServerIds?.includes(mcp.id) ?? false;
+                        return (
+                          <label
+                            key={mcp.id}
+                            className={`flex items-start gap-2 p-1.5 rounded-lg cursor-pointer transition ${
+                              isSelected
+                                ? isDark ? "bg-sky-950/40 border border-sky-800" : "bg-sky-50 border border-sky-200"
+                                : isDark ? "hover:bg-slate-900" : "hover:bg-white"
+                            }`}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={isSelected}
+                              onChange={(e) => {
+                                const current = inspectedNode.mcpServerIds || [];
+                                const next = e.target.checked
+                                  ? [...current, mcp.id]
+                                  : current.filter((id) => id !== mcp.id);
+                                handleUpdateNodeFromInspector(inspectedNode.id, { mcpServerIds: next });
+                              }}
+                              className="mt-0.5 w-3.5 h-3.5 rounded border-slate-300 text-sky-600 focus:ring-sky-500"
+                            />
+                            <div className="flex-1 min-w-0">
+                              <div className="text-xs font-medium truncate">{mcp.name}</div>
+                              <div className="text-[10px] text-slate-400 truncate">{mcp.transport} · {mcp.declaredTools.length} tools</div>
+                            </div>
+                          </label>
+                        );
+                      })
+                    )}
+                  </div>
+                </div>
+
+                {/* MCP Recommendations (Bot-suggested MCP servers) */}
+                <div className="space-y-1">
+                  <label className="text-[11px] font-semibold text-slate-500 block flex items-center gap-1.5">
+                    <Compass size={13} className="text-amber-600" />
+                    <span>Recommended MCP Servers</span>
+                    {(inspectedNode.recommendedMcpServers?.length ?? 0) > 0 && (
+                      <span className="text-[10px] font-mono text-amber-600 bg-amber-50 dark:bg-amber-950/40 px-1.5 py-0.5 rounded">
+                        {inspectedNode.recommendedMcpServers?.length} suggested
+                      </span>
+                    )}
+                  </label>
+                  <div className={`max-h-48 overflow-y-auto rounded-xl border p-2 space-y-1 ${
+                    isDark ? "bg-slate-950 border-slate-800" : "bg-slate-50 border-slate-200"
+                  }`}>
+                    {(inspectedNode.recommendedMcpServers?.length ?? 0) === 0 ? (
+                      <p className="text-xs text-slate-400 p-2">No MCP server recommendations yet</p>
+                    ) : (
+                      inspectedNode.recommendedMcpServers?.map((rec) => {
+                        const catalogItem = MARKETPLACE_CATALOG.find((item) => item.slug === rec.catalogSlug);
+                        const isAlreadyConnected = rec.connected || (inspectedNode.mcpServerIds?.includes(rec.id) ?? false);
+                        return (
+                          <div
+                            key={rec.id}
+                            className={`p-2 rounded-lg border ${
+                              isAlreadyConnected
+                                ? isDark ? "bg-emerald-950/20 border-emerald-800/50" : "bg-emerald-50 border-emerald-200"
+                                : isDark ? "bg-slate-950 border-slate-800" : "bg-white border-slate-200"
+                            }`}
+                          >
+                            <div className="flex items-start justify-between gap-2">
+                              <div className="flex-1 min-w-0">
+                                <div className="text-xs font-medium truncate flex items-center gap-1.5">
+                                  {rec.name}
+                                  {isAlreadyConnected && (
+                                    <CheckCircle2 size={11} className="text-emerald-500 shrink-0" />
+                                  )}
+                                </div>
+                                <div className="text-[10px] text-slate-400 mt-0.5 line-clamp-2">{rec.description}</div>
+                                <div className="text-[10px] text-amber-600 mt-1 font-medium">Reason: {rec.reason}</div>
+                              </div>
+                              <button
+                                type="button"
+                                disabled={isAlreadyConnected}
+                                onClick={() => {
+                                  if (isAlreadyConnected) return;
+                                  // Add to mcpServerIds and mark as connected
+                                  const current = inspectedNode.mcpServerIds || [];
+                                  const next = [...current, rec.id];
+                                  const updatedRecs = (inspectedNode.recommendedMcpServers || []).map((r) =>
+                                    r.id === rec.id ? { ...r, connected: true, connectedAt: Date.now() } : r
+                                  );
+                                  handleUpdateNodeFromInspector(inspectedNode.id, {
+                                    mcpServerIds: next,
+                                    recommendedMcpServers: updatedRecs,
+                                  });
+                                }}
+                                className={`shrink-0 px-2 py-1 text-[10px] font-semibold rounded-md transition ${
+                                  isAlreadyConnected
+                                    ? "bg-emerald-100 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300 cursor-default"
+                                    : "bg-amber-600 hover:bg-amber-500 text-white cursor-pointer"
+                                }`}
+                              >
+                                {isAlreadyConnected ? "Connected" : "Connect"}
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })
+                    )}
+                  </div>
+                </div>
+
+                {/* Subscription Plan Selector */}
+                <div className="space-y-1">
+                  <label className="text-[11px] font-semibold text-slate-500 block flex items-center gap-1.5">
+                    <Coins size={13} className="text-amber-600" />
+                    <span>Subscription Plan</span>
+                  </label>
+                  <select
+                    value={inspectedNode.subscriptionPlan || "free"}
+                    onChange={(e) => handleUpdateNodeFromInspector(inspectedNode.id, { subscriptionPlan: e.target.value })}
+                    className={`w-full px-3 py-1.5 text-xs rounded-xl outline-none border focus:border-indigo-500 cursor-pointer ${
+                      isDark ? "bg-slate-950 border-slate-800 text-white" : "bg-slate-50 border-slate-200 text-slate-900"
+                    }`}
+                  >
+                    <option value="free">Free</option>
+                    <option value="pro">Pro</option>
+                    <option value="founder_lifetime">Founder Lifetime</option>
+                    <option value="team">Team</option>
+                  </select>
+                </div>
+
                 {/* Step Prompt Editor */}
                 <div className="space-y-1 flex-1 flex flex-col">
                   <label className="text-[11px] font-semibold text-slate-500 block">Prompt / Directive</label>
@@ -2131,9 +2584,10 @@ export default function WorkflowsStudio() {
             <div className={`px-6 py-3 border-t flex items-center justify-between ${isDark ? "border-slate-800" : "border-slate-200"}`}>
               <button
                 onClick={() => {
-                  navigator.clipboard.writeText(yaml);
-                  setCopiedYaml(true);
-                  setTimeout(() => setCopiedYaml(false), 2000);
+                  void navigator.clipboard.writeText(yamlEditorDraft).then(() => {
+                    setCopiedYaml(true);
+                    setTimeout(() => setCopiedYaml(false), 2000);
+                  }).catch((error: unknown) => setToast(error instanceof Error ? error.message : String(error)));
                 }}
                 className={`px-3 py-1.5 text-xs font-semibold rounded-lg flex items-center gap-1.5 transition cursor-pointer border ${
                   isDark
@@ -2145,12 +2599,85 @@ export default function WorkflowsStudio() {
                 <span>{copiedYaml ? "Copied" : "Copy YAML"}</span>
               </button>
 
-              <button
-                onClick={() => setShowYamlModal(false)}
-                className="px-3.5 py-1.5 text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg cursor-pointer shadow-xs"
-              >
-                Close
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => setShowYamlModal(false)}
+                  className={`px-3.5 py-1.5 text-xs font-semibold rounded-lg cursor-pointer ${isDark ? "text-slate-400 hover:bg-slate-800" : "text-slate-600 hover:bg-slate-100"}`}
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={() => void handleSaveYaml()}
+                  disabled={busy || activeWf?.currentStatus === "running"}
+                  className="px-3.5 py-1.5 text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg cursor-pointer shadow-xs disabled:opacity-50"
+                >
+                  Save YAML
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showScheduleModal && snapshotWf && (
+        <div className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex items-center justify-center p-6">
+          <div className={`border rounded-3xl max-w-lg w-full p-6 shadow-2xl space-y-5 ${isDark ? "bg-slate-900 border-slate-800" : "bg-white border-slate-200"}`}>
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2"><CalendarClock size={17} className="text-indigo-600" /><h3 className="text-sm font-bold">Automatic workflow runs</h3></div>
+              <button onClick={() => setShowScheduleModal(false)} aria-label="Close schedule"><X size={16} /></button>
+            </div>
+            <label className="block space-y-2">
+              <span className="text-xs font-semibold">Schedule</span>
+              <input
+                value={scheduleDraft}
+                onChange={(event) => setScheduleDraft(event.target.value)}
+                placeholder="every 15m, every 1h, daily 09:00, or 0 9 * * *"
+                className={`w-full px-3 py-2.5 text-sm rounded-xl border outline-none focus:ring-1 focus:ring-indigo-500 ${isDark ? "bg-slate-950 border-slate-700 text-white" : "bg-slate-50 border-slate-200"}`}
+              />
+            </label>
+            <label className="flex items-center gap-2.5 text-xs font-semibold cursor-pointer">
+              <input type="checkbox" checked={snapshotWf.scheduleEnabled} onChange={(event) => void handleSaveSchedule(event.target.checked)} />
+              Automation enabled
+            </label>
+            <p className="text-xs text-slate-500 leading-relaxed">Runs in the background while Ronic OS is open and the vault is unlocked. One due job runs at a time. Closing the app pauses automation; interrupted runs are quarantined rather than replayed automatically.</p>
+            {snapshotWf.lastFiredAt > 0 && <p className="text-xs text-slate-500">Last scheduled attempt: {new Date(snapshotWf.lastFiredAt).toLocaleString()}</p>}
+            <div className="flex justify-end gap-2">
+              <button onClick={() => { setScheduleDraft(""); void run("update_workflow", { patch: { id: snapshotWf.id, schedule: "", scheduleEnabled: false } }).then((result) => { if (result) setShowScheduleModal(false); }); }} className="px-3 py-1.5 text-xs font-semibold text-rose-500">Clear schedule</button>
+              <button onClick={() => void handleSaveSchedule()} disabled={busy || snapshotWf.currentStatus === "running"} className="px-4 py-2 text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl disabled:opacity-50">Save schedule</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showHistoryModal && snapshotWf && (
+        <div className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex items-center justify-center p-6">
+          <div className={`border rounded-3xl max-w-4xl w-full max-h-[85vh] flex flex-col shadow-2xl overflow-hidden ${isDark ? "bg-slate-900 border-slate-800" : "bg-white border-slate-200"}`}>
+            <div className={`px-6 py-4 border-b flex items-center justify-between ${isDark ? "border-slate-800" : "border-slate-200"}`}>
+              <div className="flex items-center gap-2"><History size={17} className="text-indigo-600" /><h3 className="text-sm font-bold">Run history & diagnostics</h3></div>
+              <button onClick={() => setShowHistoryModal(false)} aria-label="Close run history"><X size={16} /></button>
+            </div>
+            <div className="grid md:grid-cols-[240px_1fr] flex-1 min-h-0">
+              <div className={`overflow-y-auto border-r ${isDark ? "border-slate-800" : "border-slate-200"}`}>
+                {activeRuns.length === 0 && <p className="p-5 text-xs text-slate-500">No recorded runs yet.</p>}
+                {activeRuns.map((run) => (
+                  <button key={run.id} onClick={() => setSelectedRun(run)} className={`w-full text-left px-4 py-3 border-b transition ${selectedRun?.id === run.id ? "bg-indigo-600/10" : ""} ${isDark ? "border-slate-800 hover:bg-slate-800" : "border-slate-100 hover:bg-slate-50"}`}>
+                    <div className="flex items-center gap-2"><span className={`w-2 h-2 rounded-full ${run.status === "completed" ? "bg-emerald-500" : run.status === "error" || run.status === "interrupted" ? "bg-rose-500" : "bg-amber-500"}`} /><span className="text-xs font-semibold capitalize">{run.status.replaceAll("_", " ")}</span></div>
+                    <p className="mt-1 text-[11px] text-slate-500">{new Date(run.startedAt).toLocaleString()}</p>
+                    <p className="mt-0.5 text-[10px] text-slate-400">{run.triggerKind.replaceAll("_", " ")}</p>
+                  </button>
+                ))}
+              </div>
+              <div className="overflow-y-auto p-5 space-y-4">
+                {!selectedRun ? <p className="text-xs text-slate-500">Select a run to inspect its steps and outputs.</p> : <>
+                  <div className="flex flex-wrap gap-x-5 gap-y-1 text-xs text-slate-500"><span>Run {selectedRun.id}</span><span>{selectedRun.triggerKind}</span>{selectedRun.finishedAt && <span>{Math.max(0, selectedRun.finishedAt - selectedRun.startedAt)} ms</span>}</div>
+                  {selectedRun.error && <div className="p-3 rounded-xl bg-rose-500/10 border border-rose-500/30 text-xs text-rose-500">{selectedRun.error}</div>}
+                  {selectedRun.status === "interrupted" && <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-500/30 text-xs text-amber-600">This run was interrupted. Start a new run instead of replaying side effects automatically.</div>}
+                  {selectedRun.nodes.map((node) => <div key={node.id} className={`p-3 rounded-xl border ${isDark ? "border-slate-800" : "border-slate-200"}`}>
+                    <div className="flex items-center justify-between gap-3"><span className="text-xs font-semibold">{node.name}</span><span className="text-[10px] text-slate-500">{node.status} · {node.latencyMs} ms</span></div>
+                    {selectedRun.checkpoint[node.id] && <pre className="mt-2 max-h-52 overflow-auto whitespace-pre-wrap break-words text-[11px] text-slate-500 font-mono">{String(selectedRun.checkpoint[node.id])}</pre>}
+                  </div>)}
+                </>}
+              </div>
             </div>
           </div>
         </div>
@@ -2256,8 +2783,7 @@ function nodeStatusIcon(status: string) {
 }
 
 function yamlStr(s: string) {
-  if (!s || /[:#"'\n]/.test(s) || s.startsWith(" "))
-    return `"${s.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, " ")}"`;
+  if (!s || /[:#"'\n\r\t]/.test(s) || s.startsWith(" ") || s.endsWith(" ")) return JSON.stringify(s);
   return s;
 }
 

@@ -26,10 +26,15 @@ fn bot_of_webview(webview: &Webview<tauri::Wry>) -> Result<String> {
 /// chat dock's embedded panel, which runs inside the MAIN webview) wins;
 /// otherwise the bot is derived from the calling mini computer shell webview.
 fn resolve_bot(webview: &Webview<tauri::Wry>, bot_id: &Option<String>) -> Result<String> {
+    let own = bot_of_webview(webview).ok();
     if let Some(explicit) = bot_id.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
-        return Ok(crate::util::safe_id_component(explicit)?.to_string());
+        let explicit = crate::util::safe_id_component(explicit)?.to_string();
+        if webview.label() == "main" || own.as_deref() == Some(&explicit) {
+            return Ok(explicit);
+        }
+        return Err(err("a bot computer can only control itself"));
     }
-    bot_of_webview(webview)
+    own.ok_or_else(|| err("not a mini computer shell"))
 }
 
 fn bot_handle_of(app: &AppHandle, bot_id: &str) -> String {
@@ -87,24 +92,34 @@ pub fn mini_shell_boot(webview: Webview<tauri::Wry>, app: AppHandle, state: taur
 }
 
 #[tauri::command]
-pub fn mini_shell_layout(webview: Webview<tauri::Wry>, app: AppHandle, x: f64, y: f64, w: f64, h: f64, dpr: Option<f64>) -> Result<()> {
-    let bot_id = bot_of_webview(&webview)?;
-    if !(w.is_finite() && h.is_finite()) || w < 1.0 || h < 1.0 {
+pub async fn mini_shell_layout(webview: Webview<tauri::Wry>, app: AppHandle, x: f64, y: f64, w: f64, h: f64, dpr: Option<f64>, bot_id: Option<String>, host_visible: Option<bool>) -> Result<()> {
+    let bot_id = resolve_bot(&webview, &bot_id)?;
+    let embedded = webview.label() == "main";
+    if ![x, y, w, h].iter().all(|value| value.is_finite()) || w < 0.0 || h < 0.0 {
         return Ok(());
     }
+    tauri::async_runtime::spawn_blocking(move || {
+    let expanded = crate::computer_subsystem::mini_is_expanded(&app, &bot_id);
+    if expanded == embedded {
+        return Ok(());
+    }
+    let host_visible = host_visible.unwrap_or(!embedded) && w > 1.0 && h > 1.0;
     update_shell_state(&bot_id, |s| {
         s.content = [x.max(0.0), y.max(0.0), w, h];
+        if embedded {
+            s.embedded_host_visible = host_visible;
+        }
         if let Some(dpr) = dpr {
             if dpr.is_finite() && dpr > 0.0 {
                 s.dpr = dpr;
             }
         }
     });
-    let visible = shell_state(&bot_id).chrome_visible;
-    if visible {
-        reposition_chrome(&app, &bot_id);
-    }
+    apply_chrome_visibility(&app, &bot_id);
     Ok(())
+    })
+    .await
+    .map_err(|e| err(format!("the browser layout did not run: {e}")))?
 }
 
 #[tauri::command]
