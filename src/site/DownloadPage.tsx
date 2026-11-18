@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, useSyncExternalStore, type PointerEvent } from "react";
 import { siteRecovery, siteResetPassword, siteSession, siteSignIn, siteSignOut, siteSignUp, siteUpdatePassword, startSiteAccount, subscribeSiteAccount } from "./account";
 import { doorStatus, MCP_URL, toolNames } from "./door";
-import { downloads, primaryDownload, type Download } from "./downloads";
+import { CHECKSUMS_URL, downloads, primaryDownload, type Download } from "./downloads";
 import "./download.css";
 
 const SCREENS: { name: string; why: string; features: { name: string; detail: string }[]; benefit: string }[] = [
@@ -275,7 +275,12 @@ export function DownloadPage() {
           <a className="site-btn" href={file.href}>Download for {file.label}</a>
           <a className="site-btn ghost" href="#pricing">See plans</a>
         </div>
-        <p className="site-fine">{file.note}</p>
+        <p className="site-fine">
+          {file.note}{" "}
+          <a href={CHECKSUMS_URL} target="_blank" rel="noopener noreferrer" className="site-verify-link">
+            Verify SHA-256 Checksums
+          </a>
+        </p>
 
         <div className="site-beam" onPointerMove={tilt} onPointerLeave={(event) => { event.currentTarget.style.removeProperty("--rx"); event.currentTarget.style.removeProperty("--ry"); }}>
           <figure className="site-frame">
@@ -404,7 +409,12 @@ export function DownloadPage() {
         <div className="site-foot-inner">
           <div>
             <img src="/brand/logo.png" alt="" />
-            <p>Ronic OS 2.2.0. Windows may ask you to confirm an unsigned setup file.</p>
+            <p>
+              Ronic OS 2.2.0 · Open-source release.{" "}
+              <a href={CHECKSUMS_URL} target="_blank" rel="noopener noreferrer" className="site-verify-link">
+                SHA-256 Checksums
+              </a>
+            </p>
           </div>
           <a className="site-btn" href={file.href}>Download for {file.label}</a>
         </div>

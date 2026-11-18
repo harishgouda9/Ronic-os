@@ -6,6 +6,8 @@ export type Download = {
 };
 
 const BASE = "https://github.com/harishgouda9/Ronic-os/releases/download/v2.2.0";
+export const CHECKSUMS_URL = `${BASE}/SHA256SUMS.txt`;
+export const RELEASES_URL = "https://github.com/harishgouda9/Ronic-os/releases/tag/v2.2.0";
 
 // shortcut: filenames include the release version, update them when the tag changes.
 export const downloads: Download[] = [

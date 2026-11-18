@@ -105,6 +105,8 @@
 .site-cta { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
 .site-cta .site-btn { min-height: 44px; padding: 0 18px; font-size: 15px; }
 .site-fine, .site-signin { margin: 12px 0 0; max-width: 65ch; color: #71717a; font-size: 12px; }
+.site-verify-link { color: #2563eb; text-decoration: underline; text-underline-offset: 2px; }
+.site-verify-link:hover { color: #1d4ed8; }
 .site-signin { color: #334155; }
 
 .site-beam {

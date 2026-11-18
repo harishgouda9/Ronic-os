@@ -169,3 +169,34 @@ jobs:
           if [[ -n "${RONIC_KEYCHAIN_PATH:-}" && -f "$RONIC_KEYCHAIN_PATH" ]]; then
             security delete-keychain "$RONIC_KEYCHAIN_PATH" || true
           fi
+
+  checksums:
+    name: Generate SHA-256 Checksums
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Generate and upload SHA-256 checksums
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          if [[ -z "$tag" || "$tag" == "$GITHUB_REF" ]]; then
+            pkg_ver=$(node -p "require('./package.json').version")
+            tag="v${pkg_ver}"
+          fi
+          echo "Processing release ${tag}..."
+          mkdir -p release-assets
+          gh release download "${tag}" --dir release-assets || true
+          cd release-assets
+          rm -f SHA256SUMS.txt
+          if [ "$(ls -A .)" ]; then
+            sha256sum * > SHA256SUMS.txt
+            cat SHA256SUMS.txt
+            gh release upload "${tag}" SHA256SUMS.txt --clobber
+          else
+            echo "No release assets found."
+          fi
