@@ -173,6 +173,7 @@ jobs:
   checksums:
     name: Generate SHA-256 Checksums
     needs: publish
+    if: always() && !cancelled()
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
