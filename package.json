@@ -2,6 +2,7 @@
   "name": "ronicos",
   "private": true,
   "version": "2.2.0",
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "dev": "node ./node_modules/vite/bin/vite.js",
