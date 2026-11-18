@@ -844,6 +844,105 @@ pub fn install_plugin_from_source(
     Ok(format!("Plugin '{slug}' was successfully downloaded, trusted, and enabled for bot profile '{profile}'."))
 }
 
+pub struct McpConnectTarget {
+    pub id: String,
+    pub catalog_slug: String,
+    pub name: String,
+    pub transport: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub url: String,
+    pub requires_auth: bool,
+}
+
+fn catalog_requires_interactive_auth(row: &CatalogMcp) -> bool {
+    if row.transport == "sse" {
+        return true;
+    }
+    matches!(
+        row.id,
+        "mcp-slack"
+            | "mcp-filesystem"
+            | "mcp-razorpay"
+            | "mcp-firecrawl"
+            | "mcp-email"
+            | "mcp-1password"
+            | "mcp-redis"
+            | "mcp-mongodb"
+            | "mcp-qdrant"
+            | "mcp-pinecone"
+            | "mcp-exa"
+            | "mcp-perplexity"
+            | "mcp-docker"
+            | "mcp-kraken"
+            | "mcp-phantom"
+            | "mcp-bulkpublish"
+    )
+}
+
+/// Resolve an MCP server request from chat before saving so servers that need
+/// credentials or local verification can open an interactive auth card in chat.
+pub fn resolve_mcp_target(
+    home: &Path,
+    name: &str,
+    transport: Option<&str>,
+    command: Option<&str>,
+    args: &[String],
+    url: Option<&str>,
+) -> Option<McpConnectTarget> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let cat = catalog_mcp(trimmed);
+    let mut trans = transport.unwrap_or("").trim().to_lowercase();
+    let mut cmd = command.unwrap_or("").trim().to_string();
+    let mut server_args = args.to_vec();
+    let mut endpoint_url = url.unwrap_or("").trim().to_string();
+    let mut id = String::new();
+    let mut catalog_slug = String::new();
+    let mut resolved_name = trimmed.to_string();
+
+    if let Some(row) = cat {
+        id = row.id.to_string();
+        catalog_slug = row.slug.to_string();
+        resolved_name = row.name.to_string();
+        if cmd.is_empty() && endpoint_url.is_empty() {
+            trans = row.transport.to_string();
+            cmd = row.command.to_string();
+            server_args = catalog_args(row, home);
+            endpoint_url = row.url.to_string();
+        } else if trans.is_empty() {
+            trans = row.transport.to_string();
+        }
+    }
+    if trans.is_empty() {
+        trans = if cmd.is_empty() && http_mcp_url(&endpoint_url) { "sse".into() } else { "stdio".into() };
+    }
+    if cmd.is_empty() && http_mcp_url(&endpoint_url) {
+        trans = "sse".into();
+    }
+    if id.is_empty() {
+        id = server_id_for_name(&resolved_name);
+    }
+    let remote = http_mcp_url(&endpoint_url) || trans == "sse";
+    let requires_auth = if let Some(row) = cat {
+        catalog_requires_interactive_auth(row)
+    } else {
+        remote && !loopback_mcp_url(&endpoint_url)
+    };
+    Some(McpConnectTarget {
+        id,
+        catalog_slug,
+        name: resolved_name,
+        transport: trans,
+        command: cmd,
+        args: server_args,
+        url: endpoint_url,
+        requires_auth,
+    })
+}
+
 pub fn connect_mcp_server(
     conn: &Connection,
     home: &Path,
@@ -1893,6 +1992,30 @@ mod tests {
         assert!(args.iter().any(|arg| arg == &home.display().to_string()), "{args:?}");
         assert!(!args.iter().any(|arg| arg == "."));
         let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn resolve_mcp_target_flags_auth_servers_and_keeps_zero_auth_direct() {
+        let home = std::env::temp_dir().join("ronic-mcp-resolve-test");
+        let notion = resolve_mcp_target(&home, "Notion", None, None, &[], None).unwrap();
+        assert_eq!(notion.id, "mcp-notion");
+        assert_eq!(notion.catalog_slug, "notion-mcp");
+        assert!(notion.requires_auth);
+
+        let slack = resolve_mcp_target(&home, "slack", None, None, &[], None).unwrap();
+        assert_eq!(slack.id, "mcp-slack");
+        assert!(slack.requires_auth);
+
+        let memory = resolve_mcp_target(&home, "Memory MCP", None, None, &[], None).unwrap();
+        assert_eq!(memory.id, "mcp-memory");
+        assert!(!memory.requires_auth);
+
+        let custom_https = resolve_mcp_target(&home, "Acme", None, None, &[], Some("https://mcp.acme.dev/mcp")).unwrap();
+        assert_eq!(custom_https.transport, "sse");
+        assert!(custom_https.requires_auth);
+
+        let custom_local = resolve_mcp_target(&home, "Local", None, None, &[], Some("http://127.0.0.1:4100/mcp")).unwrap();
+        assert!(!custom_local.requires_auth);
     }
 
 fn quoted(block: &str, key: &str) -> String {

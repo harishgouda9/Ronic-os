@@ -1950,6 +1950,534 @@ fn write_client_map(label: &str, path: &Path, map_key: &str, entry: &Value, crea
     }
 }
 
+fn sanitize_mcp_key(raw: &str) -> String {
+    let mut out = String::new();
+    for ch in raw.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if (ch == '-' || ch == '_' || ch == ' ') && !out.ends_with('-') && !out.is_empty() {
+            out.push('-');
+        }
+        if out.len() >= 48 {
+            break;
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
+fn external_mcp_entry(server: &crate::models::McpServer, style: &str) -> Option<Value> {
+    let transport = server.transport.trim().to_ascii_lowercase();
+    let url = server.url.trim();
+    let command = server.command.trim();
+    if !url.is_empty() && (transport == "http" || transport == "sse" || transport == "remote" || command.is_empty()) {
+        return Some(match style {
+            "gemini" => json!({ "httpUrl": url }),
+            "cursor" => json!({ "url": url }),
+            "opencode" => json!({ "type": "remote", "url": url }),
+            _ => json!({ "type": "http", "url": url }),
+        });
+    }
+    if !command.is_empty() {
+        return Some(match style {
+            "opencode" => {
+                let mut cmd = vec![command.to_string()];
+                cmd.extend(server.args.iter().cloned());
+                json!({ "type": "local", "command": cmd })
+            }
+            "vscode" => json!({ "type": "stdio", "command": command, "args": server.args }),
+            _ => json!({ "command": command, "args": server.args }),
+        });
+    }
+    None
+}
+
+/// Merge `ronic-os` (always refreshed) plus enabled Ronic OS MCP servers (only
+/// inserted when that server key is absent so user overrides stay intact).
+pub(crate) fn upsert_harness_mcp_json(
+    path: &Path,
+    map_key: &str,
+    ronic_entry: &Value,
+    extras: &[(String, Value)],
+    create: bool,
+) -> Result<Vec<String>, String> {
+    if !create && !path.is_file() {
+        return Ok(Vec::new());
+    }
+    let mut root = if path.is_file() {
+        let text = fs::read_to_string(path).map_err(|error| error.to_string())?;
+        if text.trim().is_empty() {
+            json!({})
+        } else {
+            serde_json::from_str::<Value>(&text)
+                .map_err(|_| format!("{} is not JSON, so it was left unchanged", path.display()))?
+        }
+    } else {
+        json!({})
+    };
+    if !root.is_object() {
+        return Err(format!("{} is not a JSON object, so it was left unchanged", path.display()));
+    }
+    let servers = root.as_object_mut().unwrap().entry(map_key).or_insert_with(|| json!({}));
+    if !servers.is_object() {
+        return Err(format!("{map_key} in {} is not an object, so it was left unchanged", path.display()));
+    }
+    let map = servers.as_object_mut().unwrap();
+    let mut changed = false;
+    let mut synced = vec!["ronic-os".to_string()];
+    if map.get("ronic-os") != Some(ronic_entry) {
+        map.insert("ronic-os".into(), ronic_entry.clone());
+        changed = true;
+    }
+    for (key, entry) in extras {
+        if key.is_empty() || key == "ronic-os" {
+            continue;
+        }
+        if !map.contains_key(key) {
+            map.insert(key.clone(), entry.clone());
+            changed = true;
+        }
+        synced.push(key.clone());
+    }
+    if changed {
+        write_json(path, &root)?;
+    }
+    Ok(synced)
+}
+
+pub(crate) fn upsert_codex_mcp_toml(path: &Path, url: &str, token: &str) -> Result<bool, String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let existing = if path.is_file() {
+        fs::read_to_string(path).map_err(|error| error.to_string())?
+    } else {
+        String::new()
+    };
+    let start_marker = "# ronicos-mcp-hub-start";
+    let end_marker = "# ronicos-mcp-hub-end";
+    let block = format!(
+        "{start_marker}\n[mcp_servers.ronic-os]\nurl = \"{url}\"\n\n[mcp_servers.ronic-os.http_headers]\nAuthorization = \"Bearer {token}\"\n{end_marker}\n"
+    );
+    let updated = if let (Some(s), Some(e)) = (existing.find(start_marker), existing.find(end_marker)) {
+        if e > s {
+            let after = e + end_marker.len();
+            let tail = existing[after..].trim_start_matches('\r').trim_start_matches('\n');
+            format!("{}{block}{tail}", &existing[..s])
+        } else {
+            format!("{}\n{block}", existing.trim_end())
+        }
+    } else if existing.contains("[mcp_servers.ronic-os]") {
+        // Legacy manual or automesh block present — leave user edits alone.
+        return Ok(false);
+    } else if existing.trim().is_empty() {
+        block
+    } else {
+        format!("{}\n\n{block}", existing.trim_end())
+    };
+    if updated == existing {
+        return Ok(false);
+    }
+    fs::write(path, updated).map_err(|error| error.to_string())?;
+    Ok(true)
+}
+
+pub(crate) fn is_agy_binary(binary_path: &str) -> bool {
+    let name = Path::new(binary_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    name == "agy" || name == "agy.exe" || name == "agy.cmd"
+}
+
+fn write_coding_context_file(conn: &Connection, home: &Path, project_root: &str) -> PathBuf {
+    let _ = fs::create_dir_all(home);
+    let path = home.join("coding-context.md");
+    let mut body = context_block(conn, home, "");
+    let project = project_root.trim();
+    if !project.is_empty() {
+        body = format!("# Ronic OS Coding Agent Context\nActive project root: {project}\n\n{body}\n");
+    }
+    let _ = fs::write(&path, body);
+    path
+}
+
+static AGY_REGISTERED_KEYS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static HARNESS_SYNC_CACHE: Mutex<Vec<(String, Instant, Value)>> = Mutex::new(Vec::new());
+
+/// Run `agy mcp add` once per `(binary, endpoint, token)` in a background thread
+/// so harness selection and dispatch never stall waiting on a child process.
+fn register_agy_mcp_async(binary_path: &str, url: &str, token: &str) {
+    if !is_agy_binary(binary_path) || !Path::new(binary_path).is_file() {
+        return;
+    }
+    let key = format!("{binary_path}|{url}|{token}");
+    {
+        let mut seen = AGY_REGISTERED_KEYS.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.iter().any(|k| k == &key) {
+            return;
+        }
+        seen.push(key);
+    }
+    let bin = binary_path.to_string();
+    let endpoint = url.to_string();
+    let auth_header = format!("Authorization: Bearer {token}");
+    std::thread::spawn(move || {
+        let _ = crate::util::run_capture(
+            &bin,
+            &["mcp", "add", "--type", "http", "--header", &auth_header, "ronic-os", &endpoint],
+            None,
+            Duration::from_secs(6),
+        );
+    });
+}
+
+/// Fast path for dispatch: reuse a recent sync report (within 45s) for the same
+/// `(agent, project_root)` instead of rewriting config files on every prompt.
+pub(crate) fn sync_harness_capabilities_fast(
+    conn: &Connection,
+    home: &Path,
+    agent: &str,
+    binary_path: &str,
+    project_root: &str,
+) -> Result<Value, String> {
+    let cache_key = format!("{agent}|{}|{}", binary_path.trim(), project_root.trim());
+    {
+        let cache = HARNESS_SYNC_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, at, val)) = cache.iter().find(|(k, _, _)| k == &cache_key) {
+            if at.elapsed() < Duration::from_secs(45) {
+                return Ok(val.clone());
+            }
+        }
+    }
+    sync_harness_capabilities(conn, home, agent, binary_path, project_root)
+}
+
+/// Automatically wire Ronic OS skills, plugins, MCP servers, and workspace
+/// context for whichever coding agent/harness the user selects or dispatches.
+pub(crate) fn sync_harness_capabilities(
+    conn: &Connection,
+    home: &Path,
+    agent: &str,
+    binary_path: &str,
+    project_root: &str,
+) -> Result<Value, String> {
+    let profile = active_profile(conn);
+    let view = capabilities::view(conn, home, &profile).map_err(|e| e.0)?;
+    let enabled_skills: Vec<_> = view
+        .skills
+        .iter()
+        .filter(|skill| in_index(skill, &profile, capabilities::plugin_agent_on(&view.plugins, &skill.plugin_id, &profile)))
+        .collect();
+    let enabled_plugins: Vec<_> = view
+        .plugins
+        .iter()
+        .filter(|plugin| plugin.agent_enables.iter().any(|f| f.profile_id == profile && f.enabled))
+        .collect();
+    let enabled_mcps: Vec<_> = view
+        .mcp_servers
+        .iter()
+        .filter(|srv| srv.enables.iter().any(|f| f.profile_id == profile && f.enabled))
+        .collect();
+    let memories = memory_count(conn);
+
+    let context_file = write_coding_context_file(conn, home, project_root);
+    let bridge = status();
+    let token = fs::read_to_string(home.join("bridge-token")).unwrap_or_default();
+    let token = token.trim().to_string();
+    let bridge_online = bridge.port != 0 && !bridge.endpoint.is_empty() && token.len() >= 32;
+
+    let mut config_targets: Vec<String> = Vec::new();
+    let mut synced_servers: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+
+    if bridge_online {
+        let url = bridge.endpoint.clone();
+        let headers = json!({ "Authorization": format!("Bearer {token}") });
+        let claude_entry = json!({ "type": "http", "url": &url, "headers": &headers });
+        let cursor_entry = json!({ "url": &url, "headers": &headers });
+        let gemini_entry = gemini_http_entry(&url, &headers);
+        let opencode_entry = json!({ "type": "remote", "url": &url, "headers": &headers });
+
+        let build_extras = |style: &str| -> Vec<(String, Value)> {
+            enabled_mcps
+                .iter()
+                .filter_map(|srv| {
+                    let key = sanitize_mcp_key(&srv.name);
+                    if key.is_empty() {
+                        return None;
+                    }
+                    external_mcp_entry(srv, style).map(|val| (key, val))
+                })
+                .collect()
+        };
+
+        // Always keep ~/.ronicos/mcp-hub.json current with ronic-os + enabled MCP servers.
+        let hub_path = home.join("mcp-hub.json");
+        if let Ok(list) = upsert_harness_mcp_json(&hub_path, "mcpServers", &claude_entry, &build_extras("claude"), true) {
+            synced_servers = list;
+        }
+
+        let user = user_home();
+        match agent {
+            "claude" => {
+                let p = user.join(".claude.json");
+                match upsert_harness_mcp_json(&p, "mcpServers", &claude_entry, &build_extras("claude"), true) {
+                    Ok(list) => {
+                        synced_servers = list;
+                        config_targets.push(format!("Claude Code ({})", p.display()));
+                    }
+                    Err(e) => warnings.push(e),
+                }
+                if let Some(appdata) = std::env::var_os("APPDATA") {
+                    let dir = PathBuf::from(appdata).join("Claude");
+                    if dir.is_dir() {
+                        let cp = dir.join("claude_desktop_config.json");
+                        if upsert_harness_mcp_json(&cp, "mcpServers", &claude_entry, &build_extras("claude"), true).is_ok() {
+                            config_targets.push(format!("Claude Desktop ({})", cp.display()));
+                        }
+                    }
+                }
+            }
+            "gemini" => {
+                let p = user.join(".gemini").join("settings.json");
+                match upsert_harness_mcp_json(&p, "mcpServers", &gemini_entry, &build_extras("gemini"), true) {
+                    Ok(list) => {
+                        synced_servers = list;
+                        config_targets.push(format!("Gemini CLI ({})", p.display()));
+                    }
+                    Err(e) => warnings.push(e),
+                }
+                let agy_cfg = user.join(".gemini").join("antigravity").join("mcp_config.json");
+                if is_agy_binary(binary_path) || agy_cfg.parent().is_some_and(|d| d.is_dir()) {
+                    match upsert_harness_mcp_json(&agy_cfg, "mcpServers", &claude_entry, &build_extras("claude"), true) {
+                        Ok(list) => {
+                            synced_servers = list;
+                            config_targets.push(format!("Antigravity MCP ({})", agy_cfg.display()));
+                        }
+                        Err(e) => warnings.push(e),
+                    }
+                }
+                register_agy_mcp_async(binary_path, &url, &token);
+            }
+            "cursor" => {
+                let p = user.join(".cursor").join("mcp.json");
+                match upsert_harness_mcp_json(&p, "mcpServers", &cursor_entry, &build_extras("cursor"), true) {
+                    Ok(list) => {
+                        synced_servers = list;
+                        config_targets.push(format!("Cursor ({})", p.display()));
+                    }
+                    Err(e) => warnings.push(e),
+                }
+            }
+            "vscode" => {
+                if let Some(appdata) = std::env::var_os("APPDATA") {
+                    let dir = PathBuf::from(appdata).join("Code").join("User");
+                    if dir.is_dir() {
+                        let p = dir.join("mcp.json");
+                        match upsert_harness_mcp_json(&p, "servers", &claude_entry, &build_extras("vscode"), true) {
+                            Ok(list) => {
+                                synced_servers = list;
+                                config_targets.push(format!("VS Code ({})", p.display()));
+                            }
+                            Err(e) => warnings.push(e),
+                        }
+                    }
+                }
+                let copilot = user.join(".copilot").join("mcp-config.json");
+                if upsert_harness_mcp_json(&copilot, "mcpServers", &claude_entry, &build_extras("claude"), true).is_ok() {
+                    config_targets.push(format!("Copilot ({})", copilot.display()));
+                }
+                if !project_root.trim().is_empty() {
+                    let ws_vscode = PathBuf::from(project_root.trim()).join(".vscode");
+                    if ws_vscode.is_dir() {
+                        let p = ws_vscode.join("mcp.json");
+                        if upsert_harness_mcp_json(&p, "servers", &claude_entry, &build_extras("vscode"), true).is_ok() {
+                            config_targets.push(format!("Workspace .vscode ({})", p.display()));
+                        }
+                    }
+                }
+            }
+            "codex" => {
+                let p = user.join(".codex").join("config.toml");
+                match upsert_codex_mcp_toml(&p, &url, &token) {
+                    Ok(_) => config_targets.push(format!("Codex CLI ({})", p.display())),
+                    Err(e) => warnings.push(e),
+                }
+            }
+            "opencode" => {
+                let p = user.join(".config").join("opencode").join("opencode.json");
+                match upsert_harness_mcp_json(&p, "mcp", &opencode_entry, &build_extras("opencode"), true) {
+                    Ok(list) => {
+                        synced_servers = list;
+                        config_targets.push(format!("OpenCode CLI ({})", p.display()));
+                    }
+                    Err(e) => warnings.push(e),
+                }
+            }
+            "aider" => {
+                config_targets.push(format!("Context Pack ({})", context_file.display()));
+                config_targets.push(format!("MCP Hub ({})", hub_path.display()));
+            }
+            _ => {
+                config_targets.push(format!("MCP Hub ({})", hub_path.display()));
+            }
+        }
+    } else {
+        warnings.push("Local Ronic OS MCP bridge is still starting; skills/plugins/MCPs will still be injected via context.".into());
+    }
+
+    let report = json!({
+        "agent": agent,
+        "bridgeOnline": bridge_online,
+        "bridgeEndpoint": bridge.endpoint,
+        "contextFile": context_file.display().to_string(),
+        "configTargets": config_targets,
+        "syncedServers": synced_servers,
+        "skillsCount": enabled_skills.len(),
+        "pluginsCount": enabled_plugins.len(),
+        "totalPluginsCount": view.plugins.len(),
+        "mcpCount": enabled_mcps.len() + usize::from(bridge_online),
+        "memoryCount": memories,
+        "warnings": warnings,
+        "syncedAt": now_ms(),
+    });
+    {
+        let cache_key = format!("{agent}|{}|{}", binary_path.trim(), project_root.trim());
+        let mut cache = HARNESS_SYNC_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        cache.retain(|(k, _, _)| k != &cache_key);
+        cache.push((cache_key, Instant::now(), report.clone()));
+        if cache.len() > 16 {
+            cache.remove(0);
+        }
+    }
+    Ok(report)
+}
+
+/// Build the live Ronic OS context preamble injected into CLI coding agent dispatches.
+/// `fast_mode = true` keeps the preamble ultra-compact (~400 chars) for fast TTFT
+/// while still pointing MCP-capable harnesses at `ronic-os` and attaching any
+/// explicitly selected/matched skill playbooks.
+pub(crate) fn build_coding_dispatch_prompt(
+    conn: &Connection,
+    home: &Path,
+    project_root: &str,
+    user_prompt: &str,
+    history_summary: &str,
+    attached_files: &[String],
+    selected_skills: &[String],
+    fast_mode: bool,
+) -> String {
+    let profile = active_profile(conn);
+    let view = capabilities::view(conn, home, &profile).ok();
+    let bridge = status();
+    let context_file = home.join("coding-context.md");
+    let mut parts: Vec<String> = Vec::new();
+
+    if fast_mode {
+        let mcp_hint = if bridge.port != 0 && !bridge.endpoint.is_empty() {
+            format!("Ronic OS MCP `ronic-os` is active at {} (list_skills/load_skill/list_plugins/list_mcp/search_memory).", bridge.endpoint)
+        } else {
+            format!("Ronic OS context: {}.", context_file.display())
+        };
+        parts.push(format!("[Ronic OS | Project: {}] {mcp_hint}", project_root.trim()));
+        if let Some(view) = &view {
+            let skills: Vec<_> = view
+                .skills
+                .iter()
+                .filter(|s| in_index(s, &profile, capabilities::plugin_agent_on(&view.plugins, &s.plugin_id, &profile)))
+                .collect();
+            let mut attached_playbooks = Vec::new();
+            for slug in selected_skills.iter().take(2) {
+                if let Ok(body) = capabilities::load_skill_text(conn, home, &profile, slug) {
+                    attached_playbooks.push(format!("--- Skill /{slug} ---\n{}", clip(&body, 1400)));
+                }
+            }
+            if attached_playbooks.is_empty() && user_prompt.contains('/') {
+                if let Some(body) = capabilities::playbook(user_prompt, &skills, &view.plugins, &profile) {
+                    attached_playbooks.push(format!("--- Skill Playbook ---\n{}", clip(&body, 1400)));
+                }
+            }
+            if !attached_playbooks.is_empty() {
+                parts.push(attached_playbooks.join("\n\n"));
+            }
+        }
+        if !attached_files.is_empty() {
+            parts.push(format!("Focus files: {}", attached_files.join(", ")));
+        }
+        if !history_summary.trim().is_empty() {
+            parts.push(format!("Prior context:\n{}", clip(history_summary.trim(), 500)));
+        }
+        parts.push(user_prompt.trim().to_string());
+        return clip(&parts.join("\n\n"), 3600);
+    }
+
+    parts.push("[Ronic OS Workspace Bridge — Active]".into());
+    if !project_root.trim().is_empty() {
+        parts.push(format!("Project root: {}", project_root.trim()));
+    }
+    if bridge.port != 0 && !bridge.endpoint.is_empty() {
+        parts.push(format!(
+            "Local MCP server `ronic-os` is online at {} (tools: list_skills, load_skill, load_skill_file, list_plugins, list_mcp, list_memory, search_memory, save_memory, curate_memory, list_files, read_file, workspace_manifest, ronic_search_capabilities).",
+            bridge.endpoint
+        ));
+    }
+    parts.push(format!("Full workspace context file: {}", context_file.display()));
+
+    if let Some(view) = view {
+        let skills: Vec<_> = view
+            .skills
+            .iter()
+            .filter(|s| in_index(s, &profile, capabilities::plugin_agent_on(&view.plugins, &s.plugin_id, &profile)))
+            .collect();
+        if !skills.is_empty() {
+            let names: Vec<String> = skills.iter().take(25).map(|s| format!("{} ({})", s.slash_command, clip(&s.description, 60))).collect();
+            parts.push(format!("Enabled Skills ({}): {}", skills.len(), names.join("; ")));
+        }
+        let plugins: Vec<_> = view
+            .plugins
+            .iter()
+            .filter(|p| p.agent_enables.iter().any(|f| f.profile_id == profile && f.enabled))
+            .collect();
+        if !plugins.is_empty() {
+            let names: Vec<String> = plugins.iter().take(15).map(|p| format!("{} v{}", p.name, p.version)).collect();
+            parts.push(format!("Enabled Plugins ({}): {}", plugins.len(), names.join(", ")));
+        }
+        let mcps: Vec<_> = view
+            .mcp_servers
+            .iter()
+            .filter(|m| m.enables.iter().any(|f| f.profile_id == profile && f.enabled))
+            .collect();
+        if !mcps.is_empty() {
+            let names: Vec<String> = mcps.iter().take(15).map(|m| format!("{} ({})", m.name, m.transport)).collect();
+            parts.push(format!("Enabled MCP Servers ({}): {}", mcps.len(), names.join(", ")));
+        }
+        let mut attached_playbooks = Vec::new();
+        for slug in selected_skills.iter().take(3) {
+            if let Ok(body) = capabilities::load_skill_text(conn, home, &profile, slug) {
+                attached_playbooks.push(format!("--- Skill /{slug} ---\n{}", clip(&body, 1800)));
+            }
+        }
+        if attached_playbooks.is_empty() {
+            if let Some(body) = capabilities::playbook(user_prompt, &skills, &view.plugins, &profile) {
+                attached_playbooks.push(format!("--- Matched Skill Playbook ---\n{}", clip(&body, 1800)));
+            }
+        }
+        if !attached_playbooks.is_empty() {
+            parts.push(attached_playbooks.join("\n\n"));
+        }
+    }
+
+    if !attached_files.is_empty() {
+        parts.push(format!("Focused project files: {}", attached_files.join(", ")));
+    }
+    if !history_summary.trim().is_empty() {
+        parts.push(format!("Recent session context:\n{}", clip(history_summary.trim(), 1200)));
+    }
+    parts.push(format!("User task:\n{}", user_prompt.trim()));
+    clip(&parts.join("\n\n"), 7500)
+}
+
 fn clip(text: &str, max_chars: usize) -> String {
     let count = text.chars().count();
     if count <= max_chars {
@@ -2226,6 +2754,39 @@ mod tests {
         if linked.is_ok() {
             assert!(!under_memory_root(&note.canonicalize().unwrap(), &link));
         }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn harness_mcp_sync_preserves_user_servers_and_adds_enabled_ronics() {
+        let dir = std::env::temp_dir().join(format!("ronic-harness-sync-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        fs::write(&path, r#"{"mcpServers":{"custom":{"httpUrl":"http://keep.local"},"ronic-os":{"httpUrl":"http://old"}}}"#).unwrap();
+        let ronic = json!({"httpUrl":"http://127.0.0.1:47331/mcp","headers":{"Authorization":"Bearer tok"}});
+        let extras = vec![
+            ("custom".into(), json!({"httpUrl":"http://should-not-overwrite"})),
+            ("github".into(), json!({"command":"npx","args":["-y","@modelcontextprotocol/server-github"]})),
+        ];
+        let synced = upsert_harness_mcp_json(&path, "mcpServers", &ronic, &extras, true).unwrap();
+        assert!(synced.contains(&"ronic-os".to_string()));
+        assert!(synced.contains(&"github".to_string()));
+        let saved: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["mcpServers"]["ronic-os"]["httpUrl"], "http://127.0.0.1:47331/mcp");
+        assert_eq!(saved["mcpServers"]["custom"]["httpUrl"], "http://keep.local");
+        assert_eq!(saved["mcpServers"]["github"]["command"], "npx");
+
+        let codex = dir.join("config.toml");
+        assert!(upsert_codex_mcp_toml(&codex, "http://127.0.0.1:47331/mcp", "tok1").unwrap());
+        let first = fs::read_to_string(&codex).unwrap();
+        assert!(first.contains("tok1"));
+        assert!(upsert_codex_mcp_toml(&codex, "http://127.0.0.1:47331/mcp", "tok2").unwrap());
+        let second = fs::read_to_string(&codex).unwrap();
+        assert!(second.contains("tok2") && !second.contains("tok1"));
+
+        assert!(is_agy_binary(r"C:\Users\haris\.gemini\bin\agy.exe"));
+        assert!(!is_agy_binary(r"C:\Users\haris\AppData\Roaming\npm\gemini.cmd"));
         let _ = fs::remove_dir_all(&dir);
     }
 }

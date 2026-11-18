@@ -48,6 +48,7 @@ process.on("exit", () => rmSync(outDir, { recursive: true, force: true }));
 
 const {
   MARKETPLACE_CATALOG,
+  findCatalogMcp,
   isItemInstalled,
   isItemConnected,
   getItemStatus,
@@ -172,4 +173,13 @@ test("Email is not sent through Microsoft Graph", () => {
   assert.equal(set[1].includes("mcp-email"), false);
   assert.match(source, /item\.id === "mcp-email"/);
   assert.match(source, /does not check SMTP passwords/);
+});
+
+test("findCatalogMcp resolves catalog servers by id, slug, short name, or display name", () => {
+  assert.equal(findCatalogMcp({ name: "Notion" })?.id, "mcp-notion");
+  assert.equal(findCatalogMcp({ catalogSlug: "github-mcp" })?.id, "mcp-github");
+  assert.equal(findCatalogMcp({ name: "slack" })?.id, "mcp-slack");
+  assert.equal(findCatalogMcp({ id: "mcp-supabase" })?.id, "mcp-supabase");
+  assert.equal(findCatalogMcp({ name: "Filesystem MCP" })?.id, "mcp-filesystem");
+  assert.equal(findCatalogMcp({ name: "My Custom Acme MCP" }), undefined);
 });

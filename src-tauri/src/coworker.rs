@@ -52,7 +52,7 @@ pub fn tool_failed(action: &str, payload: &Value, output: &str) -> bool {
     if lower_head.starts_with("stuck:") {
         return true;
     }
-    if matches!(action, "workflow" | "routine" | "code_diff" | "browser_inspect") {
+    if matches!(action, "workflow" | "routine" | "code_diff" | "browser_inspect" | "mcp_connect") {
         return false;
     }
     if action == "pty_terminal" || action == "sandbox_output" {
@@ -777,6 +777,7 @@ pub fn plan_workflow(name: &str, steps_text: &str, schedule: &str) -> Result<Pla
             prompt,
             status: "pending".into(),
             latency_ms: 0,
+            ..Default::default()
         });
     }
     if nodes.is_empty() {

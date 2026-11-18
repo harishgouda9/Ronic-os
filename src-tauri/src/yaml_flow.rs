@@ -1,4 +1,4 @@
-use crate::models::WfNode;
+use crate::models::{CustomModelProvider, WfNode};
 
 pub fn emit(id: &str, name: &str, status: &str, paused: Option<&str>, triggers: &[String], nodes: &[WfNode], checkpoint: &serde_json::Map<String, serde_json::Value>) -> String {
     let mut out = String::new();
@@ -22,6 +22,38 @@ pub fn emit(id: &str, name: &str, status: &str, paused: Option<&str>, triggers: 
         out.push_str(&format!("    status: {}\n", yaml_str(&n.status)));
         out.push_str(&format!("    latency_ms: {}\n", n.latency_ms));
         out.push_str(&format!("    prompt: {}\n", yaml_str(&n.prompt)));
+        if let Some(skills) = n.skill_ids.as_ref().filter(|items| !items.is_empty()) {
+            if let Ok(encoded) = serde_json::to_string(skills) {
+                out.push_str(&format!("    skills: {encoded}\n"));
+            }
+        }
+        if let Some(plugins) = n.plugin_ids.as_ref().filter(|items| !items.is_empty()) {
+            if let Ok(encoded) = serde_json::to_string(plugins) {
+                out.push_str(&format!("    plugins: {encoded}\n"));
+            }
+        }
+        if let Some(mcps) = n.mcp_server_ids.as_ref().filter(|items| !items.is_empty()) {
+            if let Ok(encoded) = serde_json::to_string(mcps) {
+                out.push_str(&format!("    mcps: {encoded}\n"));
+            }
+        }
+        if let Some(plan) = n.subscription_plan.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+            out.push_str(&format!("    subscription_plan: {}\n", yaml_str(plan)));
+        }
+        // Never write apiKey into YAML files or portable exports.
+        if let Some(custom) = n.custom_model_provider.as_ref() {
+            if !custom.provider_id.trim().is_empty() || !custom.endpoint.trim().is_empty() || !custom.custom_model.trim().is_empty() {
+                let safe = CustomModelProvider {
+                    provider_id: custom.provider_id.clone(),
+                    endpoint: custom.endpoint.clone(),
+                    api_key: String::new(),
+                    custom_model: custom.custom_model.clone(),
+                };
+                if let Ok(encoded) = serde_json::to_string(&safe) {
+                    out.push_str(&format!("    custom_provider: {encoded}\n"));
+                }
+            }
+        }
     }
     if !checkpoint.is_empty() {
         out.push_str("checkpoint:\n");
@@ -117,6 +149,7 @@ pub fn parse(text: &str) -> Result<(String, String, String, Option<String>, Vec<
                 prompt: String::new(),
                 status: "pending".into(),
                 latency_ms: 0,
+                ..Default::default()
             });
             continue;
         }
@@ -139,6 +172,26 @@ pub fn parse(text: &str) -> Result<(String, String, String, Option<String>, Vec<
                     "latency_ms" => node.latency_ms = v.parse().map_err(|_| "latency_ms must be a non-negative integer".to_string())?,
                     "prompt" => node.prompt = v,
                     "id" => node.id = v,
+                    "skills" => {
+                        let list: Vec<String> = serde_json::from_str(&v).map_err(|_| "skills must be a JSON string array".to_string())?;
+                        node.skill_ids = if list.is_empty() { None } else { Some(list) };
+                    }
+                    "plugins" => {
+                        let list: Vec<String> = serde_json::from_str(&v).map_err(|_| "plugins must be a JSON string array".to_string())?;
+                        node.plugin_ids = if list.is_empty() { None } else { Some(list) };
+                    }
+                    "mcps" => {
+                        let list: Vec<String> = serde_json::from_str(&v).map_err(|_| "mcps must be a JSON string array".to_string())?;
+                        node.mcp_server_ids = if list.is_empty() { None } else { Some(list) };
+                    }
+                    "subscription_plan" => {
+                        let plan = v.trim().to_string();
+                        node.subscription_plan = if plan.is_empty() { None } else { Some(plan) };
+                    }
+                    "custom_provider" => {
+                        let custom: CustomModelProvider = serde_json::from_str(&v).map_err(|_| "custom_provider must be a JSON object".to_string())?;
+                        node.custom_model_provider = Some(custom);
+                    }
                     _ => {}
                 }
             }
@@ -201,17 +254,37 @@ mod tests {
             prompt: "Extract catalysts: top 5".into(),
             status: "done".into(),
             latency_ms: 12,
+            skill_ids: Some(vec!["sk-catalog-ponytail".into()]),
+            plugin_ids: Some(vec!["plug-prebuilt".into()]),
+            mcp_server_ids: Some(vec!["mcp-filesystem".into(), "mcp-docker".into()]),
+            subscription_plan: Some("pro".into()),
+            custom_model_provider: Some(CustomModelProvider {
+                provider_id: "prov_custom".into(),
+                endpoint: "https://api.example.com/v1".into(),
+                api_key: "sk-secret-must-not-leak".into(),
+                custom_model: "gpt-4o".into(),
+            }),
+            ..Default::default()
         }];
         let triggers = vec!["cron: 0 8 * * *".into()];
         let mut checkpoint = serde_json::Map::new();
         checkpoint.insert("node_1".to_string(), serde_json::Value::String("test output".to_string()));
         let yaml = emit("wf_market", "Morning", "paused_editable", Some("node_1"), &triggers, &nodes, &checkpoint);
+        assert!(!yaml.contains("sk-secret-must-not-leak"), "YAML must never serialize BYOK API keys");
         let (_id, _name, status, paused, trig, parsed, parsed_checkpoint) = parse(&yaml).unwrap();
         assert_eq!(status, "paused_editable");
         assert_eq!(paused.as_deref(), Some("node_1"));
         assert_eq!(trig, triggers);
         assert_eq!(parsed[0].prompt, "Extract catalysts: top 5");
         assert_eq!(parsed[0].latency_ms, 12);
+        assert_eq!(parsed[0].skill_ids.as_deref(), Some(&["sk-catalog-ponytail".to_string()][..]));
+        assert_eq!(parsed[0].plugin_ids.as_deref(), Some(&["plug-prebuilt".to_string()][..]));
+        assert_eq!(parsed[0].mcp_server_ids.as_deref(), Some(&["mcp-filesystem".to_string(), "mcp-docker".to_string()][..]));
+        assert_eq!(parsed[0].subscription_plan.as_deref(), Some("pro"));
+        let custom = parsed[0].custom_model_provider.as_ref().unwrap();
+        assert_eq!(custom.endpoint, "https://api.example.com/v1");
+        assert_eq!(custom.custom_model, "gpt-4o");
+        assert!(custom.api_key.is_empty());
         assert_eq!(parsed_checkpoint.get("node_1").and_then(|v| v.as_str()), Some("test output"));
     }
 
@@ -220,6 +293,7 @@ mod tests {
         let nodes = vec![WfNode {
             id: "node_1".into(), name: "Unicode 漢字".into(), kind: "llm_reasoning".into(), bot_profile: String::new(), model: String::new(),
             prompt: "first line\nsecond \"quoted\" \\ path\ttab".into(), status: "pending".into(), latency_ms: 0,
+            ..Default::default()
         }];
         let mut checkpoint = serde_json::Map::new();
         checkpoint.insert("node_1".into(), serde_json::Value::String("line one\nline two".into()));

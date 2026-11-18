@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ReactFlow,
   Background,
@@ -700,8 +700,31 @@ function N8nCanvasNode({ id, data, selected }: NodeProps<Node<N8nNodeData>>) {
           }`}
         >
           <Cpu size={10} className="text-slate-400" />
-          <span className="truncate max-w-[90px]">{node.model || "auto"}</span>
+          <span className="truncate max-w-[90px]">
+            {node.model === "custom" && node.customModelProvider?.customModel
+              ? node.customModelProvider.customModel
+              : node.model || "auto"}
+          </span>
         </div>
+
+        {(node.skillIds?.length ?? 0) > 0 && (
+          <div className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md font-mono text-[10px] border bg-indigo-50/80 text-indigo-700 border-indigo-200 dark:bg-indigo-950/50 dark:text-indigo-300 dark:border-indigo-800">
+            <Sparkles size={9} />
+            <span>{node.skillIds!.length}</span>
+          </div>
+        )}
+        {(node.pluginIds?.length ?? 0) > 0 && (
+          <div className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md font-mono text-[10px] border bg-emerald-50/80 text-emerald-700 border-emerald-200 dark:bg-emerald-950/50 dark:text-emerald-300 dark:border-emerald-800">
+            <LayoutGrid size={9} />
+            <span>{node.pluginIds!.length}</span>
+          </div>
+        )}
+        {(node.mcpServerIds?.length ?? 0) > 0 && (
+          <div className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md font-mono text-[10px] border bg-sky-50/80 text-sky-700 border-sky-200 dark:bg-sky-950/50 dark:text-sky-300 dark:border-sky-800">
+            <Database size={9} />
+            <span>{node.mcpServerIds!.length}</span>
+          </div>
+        )}
 
         {node.latencyMs > 0 && (
           <div className="inline-flex items-center gap-1 text-[10px] text-slate-400 font-mono ml-auto">
@@ -842,6 +865,10 @@ export default function WorkflowsStudio() {
 
   // Live progress state from Tauri event
   const [live, setLive] = useState<{ wfId: string; status: string; nodes: WfNode[] } | null>(null);
+  // Optimistic node draft prevents rapid inspector edits/checkbox clicks from overwriting each other while IPC is in flight.
+  const [optimisticNodes, setOptimisticNodes] = useState<{ wfId: string; nodes: WfNode[] } | null>(null);
+  const optimisticNodesRef = useRef<{ wfId: string; nodes: WfNode[] } | null>(null);
+  const inFlightEditsRef = useRef(0);
 
   // React Flow state
   const [nodes, setNodes] = useState<Node<N8nNodeData>[]>([]);
@@ -867,8 +894,11 @@ export default function WorkflowsStudio() {
   }, [workflows, activeWfId]);
 
   const snapshotWf = workflows.find((w) => w.id === activeWfId) ?? workflows[0] ?? null;
-  const liveForThis = live && live.wfId === snapshotWf?.id ? live : null;
-  const activeWf: Workflow | null = liveForThis
+  const optimisticForThis = optimisticNodes && optimisticNodes.wfId === snapshotWf?.id ? optimisticNodes.nodes : null;
+  const liveForThis = !optimisticForThis && live && live.wfId === snapshotWf?.id ? live : null;
+  const activeWf: Workflow | null = optimisticForThis
+    ? { ...snapshotWf!, nodes: optimisticForThis }
+    : liveForThis
     ? { ...snapshotWf!, nodes: liveForThis.nodes, currentStatus: liveForThis.status }
     : snapshotWf;
 
@@ -1047,9 +1077,20 @@ export default function WorkflowsStudio() {
   );
 
   // Persist workflow changes back to Ronic OS backend
+  const getLatestNodes = (wf: Workflow): WfNode[] => {
+    if (optimisticNodesRef.current?.wfId === wf.id) {
+      return optimisticNodesRef.current.nodes;
+    }
+    return liveForThis?.nodes ?? wf.nodes;
+  };
+
   const persist = (wf: Workflow, updatedNodes: WfNode[], nameOverride?: string) => {
     const name = nameOverride ?? wf.name;
     const yamlStr = emitYaml({ ...wf, name }, updatedNodes);
+    const nextOptimistic = { wfId: wf.id, nodes: updatedNodes };
+    optimisticNodesRef.current = nextOptimistic;
+    setOptimisticNodes(nextOptimistic);
+    inFlightEditsRef.current += 1;
     void run("update_workflow", {
       patch: {
         id: wf.id,
@@ -1057,6 +1098,12 @@ export default function WorkflowsStudio() {
         nodes: updatedNodes,
         yamlSource: yamlStr,
       },
+    }).finally(() => {
+      inFlightEditsRef.current = Math.max(0, inFlightEditsRef.current - 1);
+      if (inFlightEditsRef.current === 0) {
+        optimisticNodesRef.current = null;
+        setOptimisticNodes(null);
+      }
     });
   };
 
@@ -1077,7 +1124,7 @@ export default function WorkflowsStudio() {
   // Node Actions
   const handleAddNodeToCanvas = (kind: string) => {
     if (!snapshotWf) return;
-    const currentNodes = liveForThis?.nodes ?? snapshotWf.nodes;
+    const currentNodes = getLatestNodes(snapshotWf);
     const id = `node_${Math.random().toString(36).slice(2, 7)}${Date.now().toString(36).slice(-3)}`;
     const kindDef = STEP_KINDS.find((k) => k.id === kind);
     const newNode: WfNode = {
@@ -1111,16 +1158,24 @@ export default function WorkflowsStudio() {
     setShowInspectorModal(true);
   };
 
-  const handleUpdateNodeFromInspector = (nodeId: string, patch: Partial<WfNode>) => {
+  const handleUpdateNodeFromInspector = (
+    nodeId: string,
+    patchOrUpdater: Partial<WfNode> | ((node: WfNode) => Partial<WfNode>)
+  ) => {
     if (!snapshotWf) return;
-    const currentNodes = liveForThis?.nodes ?? snapshotWf.nodes;
-    const nextNodes = currentNodes.map((n) => (n.id === nodeId ? { ...n, ...patch } : n));
+    const currentNodes = getLatestNodes(snapshotWf);
+    const nextNodes = currentNodes.map((n) => {
+      if (n.id !== nodeId) return n;
+      const patch = typeof patchOrUpdater === "function" ? patchOrUpdater(n) : patchOrUpdater;
+      return { ...n, ...patch };
+    });
+    setLive(null);
     persist(snapshotWf, nextNodes);
   };
 
   const handleDeleteNode = (nodeId: string) => {
     if (!snapshotWf) return;
-    const currentNodes = liveForThis?.nodes ?? snapshotWf.nodes;
+    const currentNodes = getLatestNodes(snapshotWf);
     if (currentNodes.length <= 1) return;
     const nextNodes = currentNodes.filter((n) => n.id !== nodeId);
     setLive(null);
@@ -1132,7 +1187,7 @@ export default function WorkflowsStudio() {
 
   const handleDuplicateNode = (nodeId: string) => {
     if (!snapshotWf) return;
-    const currentNodes = liveForThis?.nodes ?? snapshotWf.nodes;
+    const currentNodes = getLatestNodes(snapshotWf);
     const source = currentNodes.find((n) => n.id === nodeId);
     if (!source) return;
 
@@ -1143,6 +1198,11 @@ export default function WorkflowsStudio() {
       name: `${source.name} (Copy)`,
       status: "pending",
       latencyMs: 0,
+      skillIds: source.skillIds ? [...source.skillIds] : undefined,
+      pluginIds: source.pluginIds ? [...source.pluginIds] : undefined,
+      mcpServerIds: source.mcpServerIds ? [...source.mcpServerIds] : undefined,
+      customModelProvider: source.customModelProvider ? { ...source.customModelProvider } : undefined,
+      recommendedMcpServers: source.recommendedMcpServers ? source.recommendedMcpServers.map((r) => ({ ...r })) : undefined,
     };
 
     const sourceFlow = nodes.find((n) => n.id === nodeId);
@@ -1163,7 +1223,7 @@ export default function WorkflowsStudio() {
 
   const handleResetStep = (nodeId: string) => {
     if (!snapshotWf) return;
-    const currentNodes = liveForThis?.nodes ?? snapshotWf.nodes;
+    const currentNodes = getLatestNodes(snapshotWf);
     const nextNodes = currentNodes.map((n) => (n.id === nodeId ? { ...n, status: "pending" as const, latencyMs: 0 } : n));
     setLive(null);
     persist(snapshotWf, nextNodes);
@@ -1223,6 +1283,7 @@ export default function WorkflowsStudio() {
           name: tmpl.name,
           nodes: updatedNodes,
           yamlSource: generatedYaml,
+          ...(tmpl.triggers[0] ? { schedule: tmpl.triggers[0] } : {}),
           scheduleEnabled: false,
         },
       });
@@ -1956,8 +2017,23 @@ export default function WorkflowsStudio() {
                 <div className="space-y-1">
                   <label className="text-[11px] font-semibold text-slate-500 block">Model Provider Override</label>
                   <select
-                    value={inspectedNode.model}
-                    onChange={(e) => handleUpdateNodeFromInspector(inspectedNode.id, { model: e.target.value })}
+                    value={inspectedNode.model || "auto"}
+                    onChange={(e) => {
+                      const nextModel = e.target.value;
+                      handleUpdateNodeFromInspector(inspectedNode.id, (node) =>
+                        nextModel === "custom"
+                          ? {
+                              model: "custom",
+                              customModelProvider: node.customModelProvider ?? {
+                                providerId: "",
+                                endpoint: "",
+                                apiKey: "",
+                                customModel: "",
+                              },
+                            }
+                          : { model: nextModel, customModelProvider: undefined }
+                      );
+                    }}
                     className={`w-full px-3 py-1.5 text-xs rounded-xl outline-none border focus:border-indigo-500 cursor-pointer ${
                       isDark ? "bg-slate-950 border-slate-800 text-white" : "bg-slate-50 border-slate-200 text-slate-900"
                     }`}
@@ -1973,22 +2049,43 @@ export default function WorkflowsStudio() {
                 {/* Custom Model Provider (BYOK) */}
                 {inspectedNode.model === "custom" || inspectedNode.customModelProvider ? (
                   <div className="space-y-2 p-3 rounded-xl border bg-amber-50/50 dark:bg-amber-950/20">
-                    <label className="text-[11px] font-semibold text-slate-500 block flex items-center gap-1.5">
-                      <Cpu size={13} className="text-amber-600" />
-                      <span>Custom Model Provider (Bring Your Own Key)</span>
-                    </label>
+                    <div className="flex items-center justify-between gap-2">
+                      <label className="text-[11px] font-semibold text-slate-500 flex items-center gap-1.5">
+                        <Cpu size={13} className="text-amber-600" />
+                        <span>Custom Model Provider (Bring Your Own Key)</span>
+                      </label>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          handleUpdateNodeFromInspector(inspectedNode.id, {
+                            model: "auto",
+                            customModelProvider: undefined,
+                          })
+                        }
+                        className="text-[10px] font-semibold text-slate-400 hover:text-rose-500 cursor-pointer"
+                        title="Remove custom provider and revert to Auto"
+                      >
+                        Clear
+                      </button>
+                    </div>
                     <div className="grid grid-cols-1 gap-2">
                       <div className="space-y-1">
                         <label className="text-[10px] font-medium text-slate-500">Provider ID (e.g., prov_openai, prov_custom)</label>
                         <input
                           type="text"
                           value={inspectedNode.customModelProvider?.providerId || ""}
-                          onChange={(e) => handleUpdateNodeFromInspector(inspectedNode.id, {
-                            customModelProvider: {
-                              ...inspectedNode.customModelProvider,
-                              providerId: e.target.value,
-                            } as CustomModelProvider,
-                          })}
+                          onChange={(e) => {
+                            const val = e.target.value;
+                            handleUpdateNodeFromInspector(inspectedNode.id, (node) => ({
+                              customModelProvider: {
+                                endpoint: "",
+                                apiKey: "",
+                                customModel: "",
+                                ...node.customModelProvider,
+                                providerId: val,
+                              },
+                            }));
+                          }}
                           placeholder="prov_openai"
                           className={`w-full px-3 py-1.5 text-xs rounded-xl outline-none border focus:border-indigo-500 ${
                             isDark ? "bg-slate-950 border-slate-800 text-white" : "bg-slate-50 border-slate-200 text-slate-900"
@@ -2000,12 +2097,18 @@ export default function WorkflowsStudio() {
                         <input
                           type="text"
                           value={inspectedNode.customModelProvider?.endpoint || ""}
-                          onChange={(e) => handleUpdateNodeFromInspector(inspectedNode.id, {
-                            customModelProvider: {
-                              ...inspectedNode.customModelProvider,
-                              endpoint: e.target.value,
-                            } as CustomModelProvider,
-                          })}
+                          onChange={(e) => {
+                            const val = e.target.value;
+                            handleUpdateNodeFromInspector(inspectedNode.id, (node) => ({
+                              customModelProvider: {
+                                providerId: "",
+                                apiKey: "",
+                                customModel: "",
+                                ...node.customModelProvider,
+                                endpoint: val,
+                              },
+                            }));
+                          }}
                           placeholder="https://api.openai.com/v1"
                           className={`w-full px-3 py-1.5 text-xs rounded-xl outline-none border focus:border-indigo-500 ${
                             isDark ? "bg-slate-950 border-slate-800 text-white" : "bg-slate-50 border-slate-200 text-slate-900"
@@ -2017,12 +2120,18 @@ export default function WorkflowsStudio() {
                         <input
                           type="password"
                           value={inspectedNode.customModelProvider?.apiKey || ""}
-                          onChange={(e) => handleUpdateNodeFromInspector(inspectedNode.id, {
-                            customModelProvider: {
-                              ...inspectedNode.customModelProvider,
-                              apiKey: e.target.value,
-                            } as CustomModelProvider,
-                          })}
+                          onChange={(e) => {
+                            const val = e.target.value;
+                            handleUpdateNodeFromInspector(inspectedNode.id, (node) => ({
+                              customModelProvider: {
+                                providerId: "",
+                                endpoint: "",
+                                customModel: "",
+                                ...node.customModelProvider,
+                                apiKey: val,
+                              },
+                            }));
+                          }}
                           placeholder="sk-..."
                           className={`w-full px-3 py-1.5 text-xs rounded-xl outline-none border focus:border-indigo-500 ${
                             isDark ? "bg-slate-950 border-slate-800 text-white" : "bg-slate-50 border-slate-200 text-slate-900"
@@ -2034,12 +2143,18 @@ export default function WorkflowsStudio() {
                         <input
                           type="text"
                           value={inspectedNode.customModelProvider?.customModel || ""}
-                          onChange={(e) => handleUpdateNodeFromInspector(inspectedNode.id, {
-                            customModelProvider: {
-                              ...inspectedNode.customModelProvider,
-                              customModel: e.target.value,
-                            } as CustomModelProvider,
-                          })}
+                          onChange={(e) => {
+                            const val = e.target.value;
+                            handleUpdateNodeFromInspector(inspectedNode.id, (node) => ({
+                              customModelProvider: {
+                                providerId: "",
+                                endpoint: "",
+                                apiKey: "",
+                                ...node.customModelProvider,
+                                customModel: val,
+                              },
+                            }));
+                          }}
                           placeholder="gpt-4o, claude-3-5-sonnet, etc."
                           className={`w-full px-3 py-1.5 text-xs rounded-xl outline-none border focus:border-indigo-500 ${
                             isDark ? "bg-slate-950 border-slate-800 text-white" : "bg-slate-50 border-slate-200 text-slate-900"
@@ -2052,7 +2167,7 @@ export default function WorkflowsStudio() {
                   <button
                     type="button"
                     onClick={() => handleUpdateNodeFromInspector(inspectedNode.id, { model: "custom", customModelProvider: { providerId: "", endpoint: "", apiKey: "", customModel: "" } })}
-                    className="w-full px-3 py-1.5 text-xs font-medium text-amber-600 hover:text-amber-700 bg-amber-50/50 dark:bg-amber-950/20 border border-amber-200 dark:border-amber-800 rounded-xl transition"
+                    className="w-full px-3 py-1.5 text-xs font-medium text-amber-600 hover:text-amber-700 bg-amber-50/50 dark:bg-amber-950/20 border border-amber-200 dark:border-amber-800 rounded-xl transition cursor-pointer"
                   >
                     + Configure Custom Model Provider (BYOK)
                   </button>
@@ -2080,23 +2195,26 @@ export default function WorkflowsStudio() {
                         return (
                           <label
                             key={skill.id}
-                            className={`flex items-start gap-2 p-1.5 rounded-lg cursor-pointer transition ${
+                            className={`flex items-start gap-2 p-1.5 rounded-lg cursor-pointer transition border ${
                               isSelected
-                                ? isDark ? "bg-indigo-950/40 border border-indigo-800" : "bg-indigo-50 border border-indigo-200"
-                                : isDark ? "hover:bg-slate-900" : "hover:bg-white"
+                                ? isDark ? "bg-indigo-950/40 border-indigo-800" : "bg-indigo-50 border-indigo-200"
+                                : isDark ? "border-transparent hover:bg-slate-900" : "border-transparent hover:bg-white"
                             }`}
                           >
                             <input
                               type="checkbox"
                               checked={isSelected}
                               onChange={(e) => {
-                                const current = inspectedNode.skillIds || [];
-                                const next = e.target.checked
-                                  ? [...current, skill.id]
-                                  : current.filter((id) => id !== skill.id);
-                                handleUpdateNodeFromInspector(inspectedNode.id, { skillIds: next });
+                                const checked = e.target.checked;
+                                handleUpdateNodeFromInspector(inspectedNode.id, (node) => {
+                                  const current = node.skillIds || [];
+                                  const next = checked
+                                    ? Array.from(new Set([...current, skill.id]))
+                                    : current.filter((id) => id !== skill.id);
+                                  return { skillIds: next };
+                                });
                               }}
-                              className="mt-0.5 w-3.5 h-3.5 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                              className="mt-0.5 w-3.5 h-3.5 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 cursor-pointer"
                             />
                             <div className="flex-1 min-w-0">
                               <div className="text-xs font-medium truncate">{skill.title}</div>
@@ -2131,23 +2249,26 @@ export default function WorkflowsStudio() {
                         return (
                           <label
                             key={plugin.id}
-                            className={`flex items-start gap-2 p-1.5 rounded-lg cursor-pointer transition ${
+                            className={`flex items-start gap-2 p-1.5 rounded-lg cursor-pointer transition border ${
                               isSelected
-                                ? isDark ? "bg-emerald-950/40 border border-emerald-800" : "bg-emerald-50 border border-emerald-200"
-                                : isDark ? "hover:bg-slate-900" : "hover:bg-white"
+                                ? isDark ? "bg-emerald-950/40 border-emerald-800" : "bg-emerald-50 border-emerald-200"
+                                : isDark ? "border-transparent hover:bg-slate-900" : "border-transparent hover:bg-white"
                             }`}
                           >
                             <input
                               type="checkbox"
                               checked={isSelected}
                               onChange={(e) => {
-                                const current = inspectedNode.pluginIds || [];
-                                const next = e.target.checked
-                                  ? [...current, plugin.id]
-                                  : current.filter((id) => id !== plugin.id);
-                                handleUpdateNodeFromInspector(inspectedNode.id, { pluginIds: next });
+                                const checked = e.target.checked;
+                                handleUpdateNodeFromInspector(inspectedNode.id, (node) => {
+                                  const current = node.pluginIds || [];
+                                  const next = checked
+                                    ? Array.from(new Set([...current, plugin.id]))
+                                    : current.filter((id) => id !== plugin.id);
+                                  return { pluginIds: next };
+                                });
                               }}
-                              className="mt-0.5 w-3.5 h-3.5 rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
+                              className="mt-0.5 w-3.5 h-3.5 rounded border-slate-300 text-emerald-600 focus:ring-emerald-500 cursor-pointer"
                             />
                             <div className="flex-1 min-w-0">
                               <div className="text-xs font-medium truncate">{plugin.name} <span className="text-slate-400">v{plugin.version}</span></div>
@@ -2182,23 +2303,26 @@ export default function WorkflowsStudio() {
                         return (
                           <label
                             key={mcp.id}
-                            className={`flex items-start gap-2 p-1.5 rounded-lg cursor-pointer transition ${
+                            className={`flex items-start gap-2 p-1.5 rounded-lg cursor-pointer transition border ${
                               isSelected
-                                ? isDark ? "bg-sky-950/40 border border-sky-800" : "bg-sky-50 border border-sky-200"
-                                : isDark ? "hover:bg-slate-900" : "hover:bg-white"
+                                ? isDark ? "bg-sky-950/40 border-sky-800" : "bg-sky-50 border-sky-200"
+                                : isDark ? "border-transparent hover:bg-slate-900" : "border-transparent hover:bg-white"
                             }`}
                           >
                             <input
                               type="checkbox"
                               checked={isSelected}
                               onChange={(e) => {
-                                const current = inspectedNode.mcpServerIds || [];
-                                const next = e.target.checked
-                                  ? [...current, mcp.id]
-                                  : current.filter((id) => id !== mcp.id);
-                                handleUpdateNodeFromInspector(inspectedNode.id, { mcpServerIds: next });
+                                const checked = e.target.checked;
+                                handleUpdateNodeFromInspector(inspectedNode.id, (node) => {
+                                  const current = node.mcpServerIds || [];
+                                  const next = checked
+                                    ? Array.from(new Set([...current, mcp.id]))
+                                    : current.filter((id) => id !== mcp.id);
+                                  return { mcpServerIds: next };
+                                });
                               }}
-                              className="mt-0.5 w-3.5 h-3.5 rounded border-slate-300 text-sky-600 focus:ring-sky-500"
+                              className="mt-0.5 w-3.5 h-3.5 rounded border-slate-300 text-sky-600 focus:ring-sky-500 cursor-pointer"
                             />
                             <div className="flex-1 min-w-0">
                               <div className="text-xs font-medium truncate">{mcp.name}</div>
@@ -2256,15 +2380,16 @@ export default function WorkflowsStudio() {
                                 disabled={isAlreadyConnected}
                                 onClick={() => {
                                   if (isAlreadyConnected) return;
-                                  // Add to mcpServerIds and mark as connected
-                                  const current = inspectedNode.mcpServerIds || [];
-                                  const next = [...current, rec.id];
-                                  const updatedRecs = (inspectedNode.recommendedMcpServers || []).map((r) =>
-                                    r.id === rec.id ? { ...r, connected: true, connectedAt: Date.now() } : r
-                                  );
-                                  handleUpdateNodeFromInspector(inspectedNode.id, {
-                                    mcpServerIds: next,
-                                    recommendedMcpServers: updatedRecs,
+                                  handleUpdateNodeFromInspector(inspectedNode.id, (node) => {
+                                    const current = node.mcpServerIds || [];
+                                    const next = Array.from(new Set([...current, rec.id]));
+                                    const updatedRecs = (node.recommendedMcpServers || []).map((r) =>
+                                      r.id === rec.id ? { ...r, connected: true, connectedAt: Date.now() } : r
+                                    );
+                                    return {
+                                      mcpServerIds: next,
+                                      recommendedMcpServers: updatedRecs,
+                                    };
                                   });
                                 }}
                                 className={`shrink-0 px-2 py-1 text-[10px] font-semibold rounded-md transition ${
@@ -2800,16 +2925,34 @@ function emitYaml(
   const paused = wf.pausedAtNodeId ? `paused_at: ${yamlStr(wf.pausedAtNodeId)}\n` : "";
   const triggers = (wf.triggers ?? []).map((t) => `  - ${yamlStr(t)}`).join("\n");
   const nodeBlock = nodes
-    .map(
-      (n) => `  - id: ${yamlStr(n.id)}
-    name: ${yamlStr(n.name)}
-    kind: ${yamlStr(n.kind)}
-    bot: ${yamlStr(n.botProfile)}
-    model: ${yamlStr(n.model)}
-    status: ${yamlStr(n.status)}
-    latency_ms: ${n.latencyMs}
-    prompt: ${yamlStr(n.prompt)}`
-    )
+    .map((n) => {
+      const lines = [
+        `  - id: ${yamlStr(n.id)}`,
+        `    name: ${yamlStr(n.name)}`,
+        `    kind: ${yamlStr(n.kind)}`,
+        `    bot: ${yamlStr(n.botProfile)}`,
+        `    model: ${yamlStr(n.model)}`,
+        `    status: ${yamlStr(n.status)}`,
+        `    latency_ms: ${n.latencyMs}`,
+        `    prompt: ${yamlStr(n.prompt)}`,
+      ];
+      if (n.skillIds?.length) lines.push(`    skills: ${JSON.stringify(n.skillIds)}`);
+      if (n.pluginIds?.length) lines.push(`    plugins: ${JSON.stringify(n.pluginIds)}`);
+      if (n.mcpServerIds?.length) lines.push(`    mcps: ${JSON.stringify(n.mcpServerIds)}`);
+      if (n.subscriptionPlan?.trim()) lines.push(`    subscription_plan: ${yamlStr(n.subscriptionPlan.trim())}`);
+      if (n.customModelProvider && (n.customModelProvider.providerId?.trim() || n.customModelProvider.endpoint?.trim() || n.customModelProvider.customModel?.trim())) {
+        // Never write BYOK API keys into YAML specs or exported files.
+        lines.push(
+          `    custom_provider: ${JSON.stringify({
+            providerId: n.customModelProvider.providerId || "",
+            endpoint: n.customModelProvider.endpoint || "",
+            apiKey: "",
+            customModel: n.customModelProvider.customModel || "",
+          })}`
+        );
+      }
+      return lines.join("\n");
+    })
     .join("\n");
   return `id: ${yamlStr(wf.id)}
 name: ${yamlStr(wf.name)}

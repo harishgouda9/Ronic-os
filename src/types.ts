@@ -152,6 +152,7 @@ export type Step = {
     | "handoff_capsule"
     | "bot_handoff"
     | "gateway_approval"
+    | "mcp_connect"
     | "wallet_tx"
     | "workflow"
     | "routine"

@@ -35,6 +35,7 @@ import { AppLogo } from "../ui/appLogos";
 import { ModelMenu } from "../ui/ModelMenu";
 
 import { BotFace, botName, botPresence, BotModelPick, ComputerDock, CoworkerSidebar, GatewayCard, HandoffLine, MODES, modeLabel, ProfileSlide } from "../ui/BotCoworkers";
+import { McpConnectCard } from "../ui/McpConnectCard";
 import { lightUserHighlight } from "../ui/userHighlight";
 
 import { Harness2PipelineCard, SuperchargeControl } from "../components/Harness2Studio";
@@ -176,16 +177,12 @@ function chunkTurnSteps(steps: Step[]): TurnChunk[] {
   for (const step of steps) {
 
     const isProcess =
-
-      step.actionType === "harness2_pipeline" ||
-
-      step.actionType === "thinking" ||
-
-      step.role === "tool" ||
-
-      step.actionType === "handoff_capsule" ||
-
-      step.actionType === "bot_handoff";
+      step.actionType !== "mcp_connect" &&
+      (step.actionType === "harness2_pipeline" ||
+        step.actionType === "thinking" ||
+        step.role === "tool" ||
+        step.actionType === "handoff_capsule" ||
+        step.actionType === "bot_handoff");
 
     if (isProcess) {
 
@@ -2665,6 +2662,10 @@ export function Chat() {
 
                       <GatewayCard key={step.id} step={step} model={model} />
 
+                    ) : step.actionType === "mcp_connect" ? (
+
+                      <McpConnectCard key={step.id} step={step} />
+
                     ) : step.actionType === "bot_handoff" ? (
 
                       <HandoffLine key={step.id} step={step} />
@@ -4501,56 +4502,6 @@ function botHeaderLabel(modelUsed?: string) {
 
 }
 
-
-
-import { MARKETPLACE_CATALOG, getMcpAuthVault, getAuthenticatedMcpIds } from "../kernel/marketplaceCatalog";
-import type { McpRecommendation } from "../types";
-
-// ==========================================
-// MCP Recommendations Component
-// ==========================================
-function McpRecommendationCard({ recommendation, onConnect }: {
-  recommendation: McpRecommendation;
-  onConnect: (id: string) => void;
-}) {
-  const catalogItem = MARKETPLACE_CATALOG.find((item) => item.slug === recommendation.catalogSlug);
-  const isConnected = recommendation.connected;
-  
-  return (
-    <div className={`mt-2 p-2 rounded-lg border text-xs ${
-      isConnected 
-        ? "bg-emerald-50 dark:bg-emerald-950/20 border-emerald-200 dark:border-emerald-800"
-        : "bg-amber-50 dark:bg-amber-950/20 border-amber-200 dark:border-amber-800"
-    }`}>
-      <div className="flex items-start justify-between gap-2">
-        <div className="flex-1 min-w-0">
-          <div className="font-medium flex items-center gap-1.5">
-            {recommendation.name}
-            {isConnected && <Check size={11} className="text-emerald-500" />}
-          </div>
-          <div className="text-slate-500 dark:text-slate-400 mt-0.5 line-clamp-2">
-            {recommendation.description}
-          </div>
-          <div className="text-amber-600 dark:text-amber-400 mt-1 font-medium">
-            Reason: {recommendation.reason}
-          </div>
-        </div>
-        <button
-          type="button"
-          disabled={isConnected}
-          onClick={() => onConnect(recommendation.id)}
-          className={`shrink-0 px-2 py-1 text-[10px] font-semibold rounded-md transition ${
-            isConnected
-              ? "bg-emerald-100 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300 cursor-default"
-              : "bg-amber-600 hover:bg-amber-500 text-white cursor-pointer"
-          }`}
-        >
-          {isConnected ? "Connected" : "Connect"}
-        </button>
-      </div>
-    </div>
-  );
-}
 
 
 const StepView = memo(function StepView({

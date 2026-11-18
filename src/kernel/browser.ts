@@ -18,7 +18,7 @@ import { composerModelFor, modelById } from "./modelPrefs";
 import { installCatalog, installMcp, installPlugin, installSkillFromMarket, installSkillFromUrl, connectMcp, proposeSkill, removeMcp, removePlugin, removeSkill, resolveProposal, saveMcp, savePlugin, saveSkill, toggleMcp, togglePluginAgent, togglePluginDesktop, toggleSkill, trustMcp, trustPlugin } from "./capabilityState";
 import { ensurePrebuilt } from "./prebuiltSkills";
 import { inIndex, rebuildRegistry } from "./skillIndex";
-import { MARKETPLACE_CATALOG } from "./marketplaceCatalog";
+import { findCatalogMcp, MARKETPLACE_CATALOG } from "./marketplaceCatalog";
 import { applyCurate, applyWorkspaceTool, parseToolFence, workspaceSystem, type ToolBag } from "./workspaceTools";
 import { executionCommitment, frictionReason, normalizeModelLanes, planDelegation, type PlanBot, type PlanGroup } from "./chiefDelegation";
 import { normalizeUpdateSettings } from "../updates/feed";
@@ -250,6 +250,13 @@ function workflowYaml(workflow: Workflow): string {
       `    latency_ms: ${node.latencyMs}`,
       `    prompt: ${quote(node.prompt)}`,
     );
+    if (node.skillIds?.length) lines.push(`    skills: ${JSON.stringify(node.skillIds)}`);
+    if (node.pluginIds?.length) lines.push(`    plugins: ${JSON.stringify(node.pluginIds)}`);
+    if (node.mcpServerIds?.length) lines.push(`    mcps: ${JSON.stringify(node.mcpServerIds)}`);
+    if (node.subscriptionPlan?.trim()) lines.push(`    subscription_plan: ${quote(node.subscriptionPlan.trim())}`);
+    if (node.customModelProvider && (node.customModelProvider.providerId?.trim() || node.customModelProvider.endpoint?.trim() || node.customModelProvider.customModel?.trim())) {
+      lines.push(`    custom_provider: ${JSON.stringify({ providerId: node.customModelProvider.providerId || "", endpoint: node.customModelProvider.endpoint || "", apiKey: "", customModel: node.customModelProvider.customModel || "" })}`);
+    }
   }
   const checkpoint = Object.entries(workflow.checkpoint ?? {});
   if (checkpoint.length) {
@@ -303,6 +310,35 @@ function parseWorkflowYaml(source: string): Pick<Workflow, "name" | "nodes" | "t
       else if (key === "status" && (value === "pending" || value === "running" || value === "paused" || value === "error" || value === "done")) current.status = value;
       else if (key === "prompt") current.prompt = value;
       else if (key === "latency_ms") current.latencyMs = Number(value) || 0;
+      else if (key === "skills" || key === "plugins" || key === "mcps") {
+        try {
+          const arr = JSON.parse(raw.trim());
+          if (Array.isArray(arr)) {
+            const list = arr.map(String).filter(Boolean);
+            if (list.length) {
+              if (key === "skills") current.skillIds = list;
+              else if (key === "plugins") current.pluginIds = list;
+              else current.mcpServerIds = list;
+            }
+          }
+        } catch {
+          throw new Error(`Invalid ${key} JSON array in workflow YAML.`);
+        }
+      } else if (key === "subscription_plan") {
+        if (value.trim()) current.subscriptionPlan = value.trim();
+      } else if (key === "custom_provider") {
+        try {
+          const obj = JSON.parse(raw.trim()) as Record<string, unknown>;
+          current.customModelProvider = {
+            providerId: String(obj.providerId ?? ""),
+            endpoint: String(obj.endpoint ?? ""),
+            apiKey: String(obj.apiKey ?? ""),
+            customModel: String(obj.customModel ?? ""),
+          };
+        } catch {
+          throw new Error("Invalid custom_provider JSON object in workflow YAML.");
+        }
+      }
       continue;
     }
     if (key === "name") name = scalar(raw);
@@ -1451,13 +1487,41 @@ export async function browserCall(cmd: string, args: Record<string, unknown>): P
             noteActivity(bit ? `${call.name} · ${String(bit).slice(0, 56)}` : call.name);
             const output = applyWorkspaceTool(bag, call.name, args, () => nid("mem"));
             writeBag(bag);
-            step({
-              role: "tool",
-              modelUsed: call.name,
-              contentMarkdown: output,
-              actionType: "message",
-              actionPayload: { name: call.name, arguments: args },
-            });
+            if (call.name === "connect_mcp") {
+              const reqName = String(args.name ?? args.server ?? "").trim();
+              const matched = findCatalogMcp({ name: reqName });
+              const reqUrl = String(args.url ?? args.endpoint ?? matched?.mcpConfig?.url ?? "").trim();
+              const reqCmd = String(args.command ?? args.cmd ?? matched?.mcpConfig?.command ?? "").trim();
+              const reqArgs = Array.isArray(args.args)
+                ? args.args.map(String)
+                : matched?.mcpConfig?.args ?? [];
+              const reqTransport = String(args.transport ?? matched?.mcpConfig?.transport ?? (reqUrl ? "sse" : "stdio"));
+              step({
+                role: "tool",
+                modelUsed: call.name,
+                contentMarkdown: output,
+                actionType: "mcp_connect",
+                actionPayload: {
+                  status: "needs_auth",
+                  id: matched?.id ?? `mcp-${reqName.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`,
+                  catalogSlug: matched?.slug ?? "",
+                  name: matched?.name ?? (reqName || "MCP Server"),
+                  transport: reqTransport,
+                  command: reqCmd,
+                  args: reqArgs,
+                  url: reqUrl,
+                  profileId: addressed.id,
+                },
+              });
+            } else {
+              step({
+                role: "tool",
+                modelUsed: call.name,
+                contentMarkdown: output,
+                actionType: "message",
+                actionPayload: { name: call.name, arguments: args },
+              });
+            }
             messages.push({ role: "tool", content: output, toolCallId: call.id, name: call.name });
           }
           if (round === 15) {
@@ -1773,8 +1837,21 @@ export async function browserCall(cmd: string, args: Record<string, unknown>): P
     case "install_mcp":
       return ok(installMcp(state, String(a.name ?? "")));
     case "connect_mcp":
-    case "connect_mcp_server":
-      return ok(connectMcp(state, String(a.name ?? ""), String(a.secret ?? "")));
+    case "connect_mcp_server": {
+      const name = String(a.name ?? "").trim();
+      const secret = String(a.secret ?? "").trim();
+      if (name && (a.url || a.command) && !state.mcpServers.some((s) => s.name.toLowerCase() === name.toLowerCase() || s.id === name)) {
+        saveMcp(state, {
+          name,
+          transport: String(a.transport ?? (a.url ? "sse" : "stdio")),
+          command: String(a.command ?? ""),
+          args: Array.isArray(a.args) ? a.args.map(String) : [],
+          url: String(a.url ?? ""),
+          secret,
+        });
+      }
+      return ok(connectMcp(state, name, secret));
+    }
     case "probe_local_tool":
       throw new Error("Docker and folder checks run in the desktop app. The browser preview does not mark a server connected.");
     case "connect_watched_wallet":
@@ -2277,8 +2354,60 @@ export async function browserCall(cmd: string, args: Record<string, unknown>): P
       }
       return { ...ok("Vault search runs in the desktop app."), payload: { hits: [], events: [] } };
     }
-    case "workspace_git":
-      return { ...ok("Git status and agent dispatch run in the desktop app."), payload: { files: [] } };
+    case "workspace_git": {
+      const action = String(a.action ?? "");
+      if (action === "cancel") {
+        return { ...ok("Stopped coding agent preview."), payload: { cancelled: true } };
+      }
+      if (action === "tree") {
+        return { ...ok(null), payload: { entries: [], path: String(a.path ?? ""), projectRoot: state.settings.projectRoot || "" } };
+      }
+      if (action === "read_file") {
+        return {
+          ...ok(null),
+          payload: { path: String(a.path ?? ""), content: "File reading runs in the desktop app.", size: 0, lines: 1, binary: false, truncated: false },
+        };
+      }
+      if (action === "list_models") {
+        const agent = String(a.agent ?? state.ideAgent ?? "claude");
+        return {
+          ...ok(null),
+          payload: {
+            agent,
+            models: [
+              { id: "gemini-3.8-flash-low", label: "Gemini 3.8 Flash (Low · Fast)", tier: "fast", source: "preset" },
+              { id: "claude-haiku-4-5", label: "Claude Haiku 4.5 (Fast)", tier: "fast", source: "preset" },
+              { id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6", tier: "balanced", source: "preset" },
+              { id: "gpt-5-mini", label: "GPT-5 Mini (Fast)", tier: "fast", source: "preset" },
+            ],
+          },
+        };
+      }
+      if (action === "sync_harness") {
+        const agent = String(a.agent ?? state.ideAgent ?? "claude");
+        return {
+          ...ok(`Browser preview simulated capability sync for ${agent}.`),
+          payload: {
+            sync: {
+              agent,
+              bridgeOnline: false,
+              bridgeEndpoint: "",
+              contextFile: "",
+              configTargets: [],
+              syncedServers: ["ronic-os"],
+              skillsCount: state.skills.length,
+              pluginsCount: state.plugins.length,
+              totalPluginsCount: state.plugins.length,
+              mcpCount: state.mcpServers.length,
+              memoryCount: state.memories.length,
+              warnings: ["Live MCP bridge sync runs in the desktop app."],
+              syncedAt: Date.now(),
+            },
+          },
+        };
+      }
+      return { ...ok("Git status and agent dispatch run in the desktop app."), payload: { files: [], isGit: false, branch: "", projectRoot: state.settings.projectRoot || "" } };
+    }
     case "install_git_package":
       return ok("Cloning a Git repository runs in the desktop app.");
     case "create_workflow": {
@@ -2303,16 +2432,27 @@ export async function browserCall(cmd: string, args: Record<string, unknown>): P
     case "update_workflow": {
       const wf = state.workflows.find((w) => w.id === a.patch.id);
       if (!wf) return ok("Missing workflow.");
-      if (a.patch.yamlSource) {
+      const prevNodes = wf.nodes;
+      if (a.patch.nodes) {
+        wf.nodes = a.patch.nodes;
+      } else if (a.patch.yamlSource) {
         const parsed = parseWorkflowYaml(String(a.patch.yamlSource));
         wf.name = parsed.name;
-        wf.nodes = parsed.nodes;
+        wf.nodes = parsed.nodes.map((node) => {
+          const prev = prevNodes.find((p) => p.id === node.id);
+          if (prev?.customModelProvider?.apiKey && node.customModelProvider && !node.customModelProvider.apiKey) {
+            node.customModelProvider.apiKey = prev.customModelProvider.apiKey;
+          }
+          if (prev?.recommendedMcpServers && !node.recommendedMcpServers) {
+            node.recommendedMcpServers = prev.recommendedMcpServers;
+          }
+          return node;
+        });
         wf.triggers = parsed.triggers;
         wf.currentStatus = parsed.currentStatus;
         wf.pausedAtNodeId = parsed.pausedAtNodeId;
       }
       if (a.patch.name) wf.name = a.patch.name;
-      if (a.patch.nodes) wf.nodes = a.patch.nodes;
       if (a.patch.checkpoint) wf.checkpoint = a.patch.checkpoint;
       if (a.patch.currentStatus) wf.currentStatus = a.patch.currentStatus;
       if (a.patch.schedule !== undefined) {
@@ -2365,7 +2505,15 @@ export async function browserCall(cmd: string, args: Record<string, unknown>): P
       targets.forEach((n) => {
         n.status = "done";
         n.latencyMs = Math.floor(Math.random() * 350 + 120);
-        wf.checkpoint[n.id] = `Execution result for step "${n.name}" (${n.kind}): successfully processed with ${n.model || "default agent engine"}.`;
+        const engine = n.model === "custom" && n.customModelProvider?.customModel
+          ? `${n.customModelProvider.customModel} (${n.customModelProvider.endpoint || "custom"})`
+          : n.model || "default agent engine";
+        const caps: string[] = [];
+        if (n.skillIds?.length) caps.push(`${n.skillIds.length} skill(s)`);
+        if (n.pluginIds?.length) caps.push(`${n.pluginIds.length} plugin(s)`);
+        if (n.mcpServerIds?.length) caps.push(`${n.mcpServerIds.length} MCP server(s)`);
+        const capNote = caps.length ? ` with ${caps.join(", ")}` : "";
+        wf.checkpoint[n.id] = `Execution result for step "${n.name}" (${n.kind}): successfully processed with ${engine}${capNote}.`;
       });
       wf.currentStatus = wf.nodes.every((n) => n.status === "done") ? "completed" : "idle";
       wf.pausedAtNodeId = null;

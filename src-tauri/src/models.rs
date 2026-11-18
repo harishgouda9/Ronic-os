@@ -354,8 +354,8 @@ pub struct RegistryTool {
     pub reason: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", default)]
 pub struct CustomModelProvider {
     pub provider_id: String,
     pub endpoint: String,
@@ -363,8 +363,8 @@ pub struct CustomModelProvider {
     pub custom_model: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", default)]
 pub struct McpRecommendation {
     pub id: String,
     pub name: String,
@@ -377,7 +377,7 @@ pub struct McpRecommendation {
     pub connected_at: Option<i64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WfNode {
     pub id: String,
@@ -388,11 +388,17 @@ pub struct WfNode {
     pub prompt: String,
     pub status: String,
     pub latency_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_model_provider: Option<CustomModelProvider>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill_ids: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin_ids: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_server_ids: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subscription_plan: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recommended_mcp_servers: Option<Vec<McpRecommendation>>,
 }
 

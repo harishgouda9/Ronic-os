@@ -275,8 +275,8 @@ export function applyWorkspaceTool(bag: ToolBag, name: string, args: Record<stri
     return `Plugin from "${source}" installed and trusted in this workspace.`;
   }
   if (name === "connect_mcp") {
-    const serverName = String(args.name ?? args.server ?? "").trim();
-    return `This preview cannot connect MCP server "${serverName}". Open the desktop app.`;
+    const serverName = String(args.name ?? args.server ?? "").trim() || "MCP server";
+    return `Opened the authentication & connection card for "${serverName}" directly in chat. Ask the user to complete authentication in the card below — never ask them to paste secrets in chat messages.`;
   }
   if (name === "list_mcp") return "This preview does not start MCP servers. Open the desktop app to list the servers saved in this workspace.";
   if (name === "list_plugins") return "This preview does not list plugin switches. Open the desktop app.";

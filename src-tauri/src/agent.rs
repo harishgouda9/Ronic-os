@@ -450,6 +450,108 @@ fn prepare_turn(conn: &Connection, title_source: &str, prompt: &str, provider_ov
     })
 }
 
+struct TempProviderGuard<'a> {
+    state: &'a AppState,
+    id: Option<String>,
+}
+
+impl Drop for TempProviderGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            let _ = with_db(self.state, |conn| conn.execute("DELETE FROM provider_accounts WHERE id = ?1", params![id]));
+        }
+    }
+}
+
+fn workflow_capability_prompt(
+    skills: &[crate::models::Skill],
+    plugins: &[crate::models::PluginPackage],
+    mcp_servers: &[crate::models::McpServer],
+    skill_ids: Option<&[String]>,
+    plugin_ids: Option<&[String]>,
+    mcp_server_ids: Option<&[String]>,
+) -> Option<String> {
+    let mut sections: Vec<String> = Vec::new();
+    let mut budget: usize = 9000;
+
+    if let Some(ids) = skill_ids.filter(|list| !list.is_empty()) {
+        let mut lines = Vec::new();
+        for id in ids {
+            if let Some(skill) = skills.iter().find(|s| &s.id == id) {
+                let title = if skill.title.trim().is_empty() { skill.slug.as_str() } else { skill.title.trim() };
+                let body: String = skill.body.chars().take(budget.min(3500)).collect();
+                budget = budget.saturating_sub(body.chars().count());
+                if body.trim().is_empty() {
+                    lines.push(format!("# {title} ({})\n{}", skill.slug, skill.description));
+                } else {
+                    lines.push(format!("# {title} ({})\n{body}", skill.slug));
+                }
+            }
+        }
+        if !lines.is_empty() {
+            sections.push(format!("Workflow step selected skills (follow these instructions):\n{}", lines.join("\n\n")));
+        }
+    }
+
+    if let Some(ids) = plugin_ids.filter(|list| !list.is_empty()) {
+        let mut lines = Vec::new();
+        for id in ids {
+            if let Some(plugin) = plugins.iter().find(|p| &p.id == id) {
+                let tools = plugin
+                    .tools
+                    .iter()
+                    .map(|t| if t.description.trim().is_empty() { t.name.clone() } else { format!("{} ({})", t.name, t.description.trim()) })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if tools.is_empty() {
+                    lines.push(format!("- {} ({})", plugin.name, plugin.slug));
+                } else {
+                    lines.push(format!("- {} ({}) — tools: {tools}", plugin.name, plugin.slug));
+                }
+                for skill in skills.iter().filter(|s| s.plugin_id == plugin.id) {
+                    if budget == 0 {
+                        break;
+                    }
+                    let body: String = skill.body.chars().take(budget.min(2000)).collect();
+                    budget = budget.saturating_sub(body.chars().count());
+                    if !body.trim().is_empty() {
+                        let title = if skill.title.trim().is_empty() { skill.slug.as_str() } else { skill.title.trim() };
+                        lines.push(format!("  Skill #{title}:\n{body}"));
+                    }
+                }
+            }
+        }
+        if !lines.is_empty() {
+            sections.push(format!("Workflow step selected plugins:\n{}", lines.join("\n")));
+        }
+    }
+
+    if let Some(ids) = mcp_server_ids.filter(|list| !list.is_empty()) {
+        let mut lines = Vec::new();
+        for id in ids {
+            if let Some(mcp) = mcp_servers.iter().find(|m| &m.id == id) {
+                let tools = mcp
+                    .declared_tools
+                    .iter()
+                    .map(|t| if t.description.trim().is_empty() { t.name.clone() } else { format!("{} ({})", t.name, t.description.trim()) })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let tools_note = if tools.is_empty() { "no declared tools".to_string() } else { tools };
+                lines.push(format!("- {} ({}, {}) — tools: {tools_note}. Invoke via call_mcp with server=\"{}\".", mcp.name, mcp.transport, mcp.trust, mcp.name));
+            }
+        }
+        if !lines.is_empty() {
+            sections.push(format!("Workflow step selected MCP servers (use call_mcp when needed):\n{}", lines.join("\n")));
+        }
+    }
+
+    if sections.is_empty() {
+        None
+    } else {
+        Some(sections.join("\n\n"))
+    }
+}
+
 fn answer_bot(
     state: &AppState,
     thread_id: &str,
@@ -468,7 +570,7 @@ fn answer_bot(
     plugin_ids: Option<&[String]>,
     mcp_server_ids: Option<&[String]>,
 ) -> Result<BotTurn> {
-    let ready = with_db(state, |conn| -> Result<std::result::Result<(crate::bots::BotFlags, String, String, Vec<Value>, String), String>> {
+    let ready = with_db(state, |conn| -> Result<std::result::Result<(crate::bots::BotFlags, String, String, Vec<Value>, String, Option<String>), String>> {
         let speaker = crate::bots::flags(conn, bot_id)?;
         if speaker.takeover {
             let note = format!("{} is paused while you have control of its computer.", speaker.handle);
@@ -501,23 +603,25 @@ fn answer_bot(
             crate::chief_delegation::pick_turn_account(&speaker.primary, &speaker.long_context, &speaker.fallback, context_chars)
         };
 
-        // Handle custom model provider for workflow steps
-        let custom_provider_id = if let Some(custom) = custom_model_provider {
+        // Handle custom model provider for workflow steps when an endpoint is configured
+        let active_custom = custom_model_provider.filter(|custom| !custom.endpoint.trim().is_empty());
+        let custom_provider_id = if let Some(custom) = active_custom {
             let custom_id = format!("wf_custom_{}", thread_id);
-            // Insert temporary provider account
+            let custom_name = if custom.provider_id.trim().is_empty() {
+                "Workflow custom provider"
+            } else {
+                custom.provider_id.trim()
+            };
             let _ = conn.execute(
                 "INSERT OR REPLACE INTO provider_accounts (id, name, provider_type, binary_or_endpoint, has_secret, quota_window_hours, quota_used_percent, quota_resets_at, fallback_account_id, is_active, allow_cli_dispatch, health_detail, created_at) VALUES (?1, ?2, 'byok_api', ?3, 1, 5, 0, '', '', 1, 0, 'Workflow custom provider', ?4)",
-                params![&custom_id, &custom.provider_id, &custom.endpoint, now_ms()],
+                params![&custom_id, custom_name, custom.endpoint.trim(), now_ms()],
             );
-            // Store API key in secrets
-            // Note: We can't modify the secrets HashMap here since it's a reference
-            // The API key will be passed through the secrets HashMap with the custom provider ID
-            // This is handled by the caller putting the key in secrets with the custom_id
-            provider_id = custom_id;
+            provider_id = custom_id.clone();
             Some(custom_id)
         } else {
             None
         };
+        let pinned = pinned || custom_provider_id.is_some();
 
         if provider_id.trim().is_empty() {
             let note = format!("{} has no model selected. Choose a model in the chat, or set Primary on the bot profile.", speaker.handle);
@@ -527,9 +631,11 @@ fn answer_bot(
         }
         // Remember the requested id on the provider this turn actually chose,
         // before a quota handoff can swap that provider.
-        if let Some(raw) = model.map(str::trim).filter(|value| !value.is_empty()) {
-            remember_upstream(conn, &provider_id, raw);
-            claim_bot_model(conn, bot_id, raw);
+        if custom_provider_id.is_none() {
+            if let Some(raw) = model.map(str::trim).filter(|value| !value.is_empty()) {
+                remember_upstream(conn, &provider_id, raw);
+                claim_bot_model(conn, bot_id, raw);
+            }
         }
         // Failover is the Pro entitlement: <50ms handoff when a subscription
         // cap hits mid-task. Starter gets the honest error instead of a silent
@@ -567,6 +673,17 @@ fn answer_bot(
             format!("You are: {}\n\n{}", speaker.role.trim(), speaker.soul)
         };
         let mut system = crate::capabilities::system_for(conn, &home, bot_id, &charter, composed, &memory)?;
+        let has_selected_caps = skill_ids.is_some_and(|l| !l.is_empty())
+            || plugin_ids.is_some_and(|l| !l.is_empty())
+            || mcp_server_ids.is_some_and(|l| !l.is_empty());
+        if has_selected_caps {
+            if let Ok(view) = crate::capabilities::view(conn, &home, bot_id) {
+                if let Some(cap_block) = workflow_capability_prompt(&view.skills, &view.plugins, &view.mcp_servers, skill_ids, plugin_ids, mcp_server_ids) {
+                    system.push_str("\n\n");
+                    system.push_str(&cap_block);
+                }
+            }
+        }
         if let Some(block) = crate::bots::task_prompt(conn, thread_id) {
             system.push_str("\n\n");
             system.push_str(&block);
@@ -589,12 +706,26 @@ fn answer_bot(
                 if model_claimed_by_other(conn, bot_id, &shared) { String::new() } else { shared }
             }
         };
-        Ok(Ok((speaker, provider_id, system, tools, remembered)))
+        Ok(Ok((speaker, provider_id, system, tools, remembered, custom_provider_id)))
     })?;
-    let (speaker, mut provider_id, system, tools, remembered) = match ready {
+    let (speaker, mut provider_id, system, tools, remembered, custom_provider_id) = match ready {
         Err(note) => return Ok(BotTurn::Paused(note)),
         Ok(ready) => ready,
     };
+    let _temp_provider_guard = TempProviderGuard { state, id: custom_provider_id.clone() };
+    let pinned = pinned || custom_provider_id.is_some();
+    let owned_secrets = if let (Some(cid), Some(custom)) = (custom_provider_id.as_ref(), custom_model_provider) {
+        if !custom.api_key.trim().is_empty() {
+            let mut merged = secrets.clone();
+            merged.insert(cid.clone(), custom.api_key.clone());
+            Some(merged)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let turn_secrets = owned_secrets.as_ref().unwrap_or(secrets);
     // Bound bots default to the model they were linked with. A turn with no
     // model argument uses the model this bot claimed, not another bot's.
     let explicit = model.map(str::trim).filter(|value| !value.is_empty());
@@ -627,41 +758,14 @@ fn answer_bot(
         // Get tools from prompt-matched skills
         let mut tools = crate::capabilities::required_tools(composed, &visible, &view.plugins, bot_id);
 
-        // Add tools from explicitly selected skills (for workflow steps)
+        // Add required tools from explicitly selected skills (capped; plugins & MCP tools
+        // are injected into the system prompt instead of forcing every tool to run).
         if let Some(selected_skill_ids) = skill_ids {
             for skill_id in selected_skill_ids {
                 if let Some(skill) = view.skills.iter().find(|s| &s.id == skill_id) {
                     for tool in &skill.requires_tools {
                         let tool = tool.trim();
-                        if !tool.is_empty() && !tools.iter().any(|t| t == tool) {
-                            tools.push(tool.to_string());
-                        }
-                    }
-                }
-            }
-        }
-
-        // Add tools from explicitly selected plugins (for workflow steps)
-        if let Some(selected_plugin_ids) = plugin_ids {
-            for plugin_id in selected_plugin_ids {
-                if let Some(plugin) = view.plugins.iter().find(|p| &p.id == plugin_id) {
-                    for tool in &plugin.tools {
-                        let tool = tool.name.trim();
-                        if !tool.is_empty() && !tools.iter().any(|t| t == tool) {
-                            tools.push(tool.to_string());
-                        }
-                    }
-                }
-            }
-        }
-
-        // Add MCP server tools for explicitly selected servers (for workflow steps)
-        if let Some(selected_mcp_ids) = mcp_server_ids {
-            for mcp_id in selected_mcp_ids {
-                if let Some(mcp) = view.mcp_servers.iter().find(|m| &m.id == mcp_id) {
-                    for tool in &mcp.declared_tools {
-                        let tool = tool.name.trim();
-                        if !tool.is_empty() && !tools.iter().any(|t| t == tool) {
+                        if !tool.is_empty() && !tools.iter().any(|t| t == tool) && tools.len() < 4 {
                             tools.push(tool.to_string());
                         }
                     }
@@ -672,7 +776,7 @@ fn answer_bot(
         tools
     });
     contract.tools.extend(extra);
-    let (reply, failed) = match run_turn(state, thread_id, turn_id, bot_id, &provider_id, &system, secrets, model.as_deref(), effort, &tools, speaker.allow_code, speaker.allow_computer, speaker.allow_browser, speaker.allow_file, &contract, composed, attachments) {
+    let (reply, failed) = match run_turn(state, thread_id, turn_id, bot_id, &provider_id, &system, turn_secrets, model.as_deref(), effort, &tools, speaker.allow_code, speaker.allow_computer, speaker.allow_browser, speaker.allow_file, &contract, composed, attachments) {
         Err(first) if reply_was_cleared(&first) => {
             let _ = with_db(state, |conn| finish(conn, thread_id));
             return Ok(BotTurn::Paused(first));
@@ -710,7 +814,7 @@ fn answer_bot(
                 // The retry keeps the bot's own tool permissions. Overriding
                 // them here would let a fenced tool call run on failover even
                 // when the bot was configured with every tool disabled.
-                match run_turn(state, thread_id, turn_id, bot_id, &provider_id, &system, secrets, model.as_deref(), effort, &tools, speaker.allow_code, speaker.allow_computer, speaker.allow_browser, speaker.allow_file, &contract, &retry_prompt, attachments) {
+                match run_turn(state, thread_id, turn_id, bot_id, &provider_id, &system, turn_secrets, model.as_deref(), effort, &tools, speaker.allow_code, speaker.allow_computer, speaker.allow_browser, speaker.allow_file, &contract, &retry_prompt, attachments) {
                     Err(error) if reply_was_cleared(&error) => {
                         let _ = with_db(state, |conn| finish(conn, thread_id));
                         return Ok(BotTurn::Paused(error));
@@ -1513,7 +1617,7 @@ fn tool_specs(allow_code: bool, allow_computer: bool, allow_browser: bool, allow
             "type": "function",
             "function": {
                 "name": "connect_mcp",
-                "description": "Save and trust an MCP server for this bot. name can be a catalog name (Notion, notion-mcp, mcp-notion, filesystem-mcp, Apollo.io) and fills the server when command and url are empty. An https URL with no command is a remote server. A non-local remote server needs secret. Saving a server does not prove the provider accepted the key; the Marketplace screen runs that check.",
+                "description": "Connect or open the in-chat authentication card for an MCP server (e.g., Notion, GitHub, Slack, Linear, Supabase, Gmail, Google Docs, Filesystem, Docker, or a custom URL/command). Call this immediately whenever the user asks to connect an MCP server. For servers requiring OAuth, API keys, multi-field config, or local verification, call with just the server name (omit secret): Ronic OS will show a secure authentication card directly in chat so the user never pastes credentials into chat text.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -2220,6 +2324,29 @@ fn execute_tool_raw(state: &AppState, thread_id: &str, bot_id: &str, name: &str,
                 Vec::new()
             };
             let home = state.home.clone();
+            let target = crate::capabilities::resolve_mcp_target(&home, name, transport, command, &args_list, url);
+            if secret.is_empty() {
+                if let Some(ref resolved) = target {
+                    if resolved.requires_auth {
+                        let payload = json!({
+                            "status": "needs_auth",
+                            "id": resolved.id,
+                            "catalogSlug": resolved.catalog_slug,
+                            "name": resolved.name,
+                            "transport": resolved.transport,
+                            "command": resolved.command,
+                            "args": resolved.args,
+                            "url": resolved.url,
+                            "profileId": bot_id,
+                        });
+                        let msg = format!(
+                            "Opened the authentication & connection card for {} directly in chat. Ask the user to complete authentication in the card below — never ask them to paste API keys or tokens into plain chat messages.",
+                            resolved.name
+                        );
+                        return ("mcp_connect".into(), payload, msg);
+                    }
+                }
+            }
             with_db(state, |conn| match crate::capabilities::connect_mcp_server(conn, &home, bot_id, name, transport, command, &args_list, url, Some(secret.as_str())) {
                 Ok(done) => {
                     let mut note = done.note;
@@ -2232,7 +2359,18 @@ fn execute_tool_raw(state: &AppState, thread_id: &str, bot_id: &str, name: &str,
                             Err(error) => return ("message".into(), json!({}), format!("The server was saved, but the credential was not: {}", error.0)),
                         }
                     }
-                    ("mcp_connect".into(), json!({"name": name, "id": done.id, "status": "saved"}), note)
+                    let payload = json!({
+                        "status": "connected",
+                        "id": done.id,
+                        "catalogSlug": target.as_ref().map(|t| t.catalog_slug.as_str()).unwrap_or(""),
+                        "name": target.as_ref().map(|t| t.name.as_str()).unwrap_or(name),
+                        "transport": target.as_ref().map(|t| t.transport.as_str()).unwrap_or(""),
+                        "command": target.as_ref().map(|t| t.command.as_str()).unwrap_or(""),
+                        "args": target.as_ref().map(|t| t.args.clone()).unwrap_or_default(),
+                        "url": target.as_ref().map(|t| t.url.as_str()).unwrap_or(""),
+                        "profileId": bot_id,
+                    });
+                    ("mcp_connect".into(), payload, note)
                 }
                 Err(error) => ("message".into(), json!({}), error.0),
             })
@@ -3912,6 +4050,73 @@ mod tests {
         assert!(blob.contains("functionResponse"));
         assert!(blob.contains("list_skills"));
         assert!(!blob.contains("tool:\n"));
+    }
+
+    #[test]
+    fn workflow_capability_prompt_includes_selected_skills_plugins_and_mcps() {
+        let skill = crate::models::Skill {
+            id: "sk-1".into(),
+            slug: "ponytail".into(),
+            origin: "catalog".into(),
+            owner_profile_id: String::new(),
+            plugin_id: String::new(),
+            title: "Ponytail".into(),
+            description: "Minimal diffs".into(),
+            slash_command: "/ponytail".into(),
+            requires_tools: Vec::new(),
+            platforms: Vec::new(),
+            body: "Solve with least code.".into(),
+            files: Vec::new(),
+            enables: Vec::new(),
+            hidden_reason: String::new(),
+            index_line: String::new(),
+            version: "1".into(),
+            updated_at: 0,
+        };
+        let plugin = crate::models::PluginPackage {
+            id: "plug-1".into(),
+            slug: "drive-pulse".into(),
+            name: "Drive Pulse".into(),
+            version: "1.0.0".into(),
+            source: "builtin".into(),
+            source_path: String::new(),
+            trust: "trusted".into(),
+            has_agent: true,
+            has_desktop: false,
+            tools: vec![crate::models::DeclaredTool { name: "sync_drive".into(), description: "Sync files".into() }],
+            hooks: Vec::new(),
+            bundled_skills: Vec::new(),
+            desktop: Vec::new(),
+            agent_enables: Vec::new(),
+            desktop_enabled: false,
+        };
+        let mcp = crate::models::McpServer {
+            id: "mcp-fs".into(),
+            name: "Filesystem MCP".into(),
+            transport: "stdio".into(),
+            command: "npx".into(),
+            args: Vec::new(),
+            url: String::new(),
+            trust: "trusted".into(),
+            declared_tools: vec![crate::models::DeclaredTool { name: "read_tree".into(), description: "List tree".into() }],
+            enables: Vec::new(),
+            last_error: String::new(),
+        };
+        let block = super::workflow_capability_prompt(
+            &[skill],
+            &[plugin],
+            &[mcp],
+            Some(&["sk-1".into()]),
+            Some(&["plug-1".into()]),
+            Some(&["mcp-fs".into()]),
+        )
+        .unwrap();
+        assert!(block.contains("Solve with least code."));
+        assert!(block.contains("Drive Pulse"));
+        assert!(block.contains("sync_drive"));
+        assert!(block.contains("Filesystem MCP"));
+        assert!(block.contains("call_mcp"));
+        assert!(super::workflow_capability_prompt(&[], &[], &[], None, None, None).is_none());
     }
 }
 

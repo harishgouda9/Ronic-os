@@ -2617,16 +2617,45 @@ pub async fn workspace_git(
     finish_payload(&state, Some(toast), Some(payload))
 }
 
+/// Fast path for Coding Agents Workspace actions (`tree`, `read_file`, `status`,
+/// `list_models`, `sync_harness`, `dispatch`, etc.) — skips rebuilding the full
+/// workspace SQLite snapshot on every call for instant UI responsiveness.
+#[tauri::command]
+pub async fn workspace_git_fast(
+    app: AppHandle,
+    action: String,
+    path: Option<String>,
+    agent: Option<String>,
+    prompt: Option<String>,
+) -> Result<Value> {
+    let app_for_work = app.clone();
+    let (toast, payload) = tauri::async_runtime::spawn_blocking(move || {
+        let state = app_for_work.state::<AppState>();
+        crate::workspace_git::perform(
+            &state,
+            action.trim(),
+            path.unwrap_or_default().trim(),
+            agent.unwrap_or_default().trim(),
+            prompt.unwrap_or_default().trim(),
+        )
+    })
+    .await
+    .map_err(|error| err(format!("git work stopped: {error}")))??;
+    Ok(json!({ "toast": if toast.is_empty() { Value::Null } else { Value::String(toast) }, "payload": payload }))
+}
+
 #[tauri::command]
 pub async fn install_git_package(state: State<'_, AppState>, url: String, profile_id: Option<String>) -> Result<CommandResult> {
     let note = crate::workspace_git::install_package(&state, url.trim(), profile_id.unwrap_or_default().trim())?;
     finish(&state, Some(note))
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 pub struct WorkflowPatch {
     pub id: String,
+    pub name: Option<String>,
+    pub nodes: Option<Vec<WfNode>>,
     pub node_id: Option<String>,
     pub model: Option<String>,
     pub prompt: Option<String>,
@@ -2651,6 +2680,7 @@ pub async fn create_workflow(state: State<'_, AppState>, name: String) -> Result
             prompt: String::new(),
             status: "pending".into(),
             latency_ms: 0,
+            ..Default::default()
         }];
         let triggers: Vec<String> = Vec::new();
         let yaml = crate::yaml_flow::emit(&id, &name, "idle", None, &triggers, &nodes, &serde_json::Map::new());
@@ -2729,7 +2759,7 @@ pub async fn pause_workflow(state: State<'_, AppState>, id: String, node_id: Opt
                 return finish(&state, Some("Pause requested. The workflow stops before the next step.".into()));
             }
             let conn = guard(&state);
-            let patch = WorkflowPatch { id, node_id, model: None, prompt: None, yaml_source: None, schedule: None, schedule_enabled: None };
+            let patch = WorkflowPatch { id, node_id, ..Default::default() };
             pause_node(&conn, &state.home, &patch)?;
         } else {
             let thread_exists: bool = conn
@@ -2807,30 +2837,68 @@ pub async fn resume_workflow(app: AppHandle, id: String) -> Result<CommandResult
     finish(&state, Some(toast))
 }
 
+fn validate_workflow_nodes(nodes: &[WfNode]) -> Result<()> {
+    if nodes.is_empty() {
+        return Err(err("workflow needs at least one node"));
+    }
+    if nodes.len() > 200 {
+        return Err(err("workflow has too many steps (200 limit)"));
+    }
+    let mut ids = std::collections::HashSet::new();
+    for node in nodes {
+        if node.id.trim().is_empty() || !ids.insert(node.id.as_str()) {
+            return Err(err("every workflow step needs a unique id"));
+        }
+        if node.latency_ms < 0 {
+            return Err(err("latency_ms must be non-negative"));
+        }
+    }
+    Ok(())
+}
+
 fn apply_workflow(conn: &Connection, home: &std::path::Path, patch: &WorkflowPatch, _resume: bool) -> Result<()> {
-    let (old_triggers_raw, status, checkpoint_raw): (String, String, String) = conn.query_row(
-        "SELECT triggers_json, current_status, checkpoint_json FROM workflows WHERE id=?1",
+    let (existing_name, existing_status, existing_paused, old_triggers_raw, existing_nodes_raw, checkpoint_raw): (String, String, Option<String>, String, String, String) = conn.query_row(
+        "SELECT name, current_status, paused_at_node_id, triggers_json, nodes_json, checkpoint_json FROM workflows WHERE id=?1",
         params![patch.id],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
     ).map_err(|_| err("workflow not found"))?;
-    if status == "running" {
+    if existing_status == "running" {
         return Err(err("pause the workflow before editing it"));
     }
+    let existing_triggers: Vec<String> = serde_json::from_str(&old_triggers_raw).unwrap_or_default();
+    let existing_nodes: Vec<WfNode> = serde_json::from_str(&existing_nodes_raw).unwrap_or_default();
     let checkpoint = serde_json::from_str::<Value>(&checkpoint_raw).ok().and_then(|value| value.as_object().cloned()).unwrap_or_default();
-    let (name, status, paused, mut triggers, mut nodes) = if let Some(yaml) = patch.yaml_source.as_ref().filter(|s| !s.trim().is_empty()) {
+
+    let (mut name, status, mut paused, mut triggers, mut nodes) = if let Some(updated_nodes) = patch.nodes.clone() {
+        validate_workflow_nodes(&updated_nodes)?;
+        let paused = existing_paused.filter(|pid| updated_nodes.iter().any(|n| &n.id == pid));
+        (existing_name, existing_status, paused, existing_triggers, updated_nodes)
+    } else if let Some(yaml) = patch.yaml_source.as_ref().filter(|s| !s.trim().is_empty()) {
         let parsed = crate::yaml_flow::parse(yaml).map_err(err)?;
-        (parsed.1, parsed.2, parsed.3, parsed.4, parsed.5)
+        let mut parsed_nodes = parsed.5;
+        // Preserve stored BYOK secrets and recommendations omitted from YAML.
+        for node in &mut parsed_nodes {
+            if let Some(prev) = existing_nodes.iter().find(|n| n.id == node.id) {
+                if let (Some(curr_custom), Some(prev_custom)) = (node.custom_model_provider.as_mut(), prev.custom_model_provider.as_ref()) {
+                    if curr_custom.api_key.is_empty() && !prev_custom.api_key.is_empty() {
+                        curr_custom.api_key = prev_custom.api_key.clone();
+                    }
+                }
+                if node.recommended_mcp_servers.is_none() && prev.recommended_mcp_servers.is_some() {
+                    node.recommended_mcp_servers = prev.recommended_mcp_servers.clone();
+                }
+            }
+        }
+        (parsed.1, parsed.2, parsed.3, parsed.4, parsed_nodes)
     } else {
-        conn.query_row(
-            "SELECT name, current_status, paused_at_node_id, triggers_json, nodes_json FROM workflows WHERE id=?1",
-            params![patch.id],
-            |r| {
-                let triggers: Vec<String> = serde_json::from_str(&r.get::<_, String>(3)?).unwrap_or_default();
-                let nodes: Vec<WfNode> = serde_json::from_str(&r.get::<_, String>(4)?).unwrap_or_default();
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, triggers, nodes))
-            },
-        ).map_err(|_| err("workflow not found"))?
+        (existing_name, existing_status, existing_paused, existing_triggers, existing_nodes)
     };
+    if let Some(next_name) = patch.name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        name = next_name.to_string();
+    }
+    if paused.as_ref().is_some_and(|pid| !nodes.iter().any(|n| &n.id == pid)) {
+        paused = None;
+    }
     if let Some(node_id) = &patch.node_id {
         let node = nodes.iter_mut().find(|n| &n.id == node_id).ok_or_else(|| err("that step is not in this workflow"))?;
         if let Some(model) = &patch.model {
@@ -2989,7 +3057,7 @@ fn workflow_retry(message: &str) -> bool {
 
 fn step_model_choice(model: &str) -> (Option<String>, Option<String>) {
     let model = model.trim();
-    if model.is_empty() || model.eq_ignore_ascii_case("auto") {
+    if model.is_empty() || model.eq_ignore_ascii_case("auto") || model.eq_ignore_ascii_case("custom") {
         (None, None)
     } else if model.starts_with("prov_") {
         (Some(model.to_string()), None)
@@ -3531,25 +3599,20 @@ fn execute_workflow_mode(state: &AppState, id: &str, approve_paused_gate: bool, 
         };
         let prompt = fill_step_prompt(&node_prompt, &node_name, &node_kind, &previous, &handle, &workspace);
         let (provider_override, mut model_override) = step_model_choice(&node_model);
-        
-        // Handle custom model provider for workflow steps
-        let custom_model_provider = nodes[index].custom_model_provider.clone();
-        let mut secrets = state.secrets.lock().unwrap_or_else(|e| e.into_inner()).clone();
+
+        // Activate custom model provider only when an endpoint is configured;
+        // agent::answer_bot registers the temporary provider & API key cleanly.
+        let custom_model_provider = nodes[index]
+            .custom_model_provider
+            .clone()
+            .filter(|custom| !custom.endpoint.trim().is_empty());
         if let Some(ref custom) = custom_model_provider {
-            if !custom.api_key.is_empty() {
-                let custom_provider_id = format!("wf_custom_{}", nodes[index].id);
-                secrets.insert(custom_provider_id, custom.api_key.clone());
-            }
-            // Override provider and model with custom values
-            if !custom.provider_id.is_empty() {
-                provider_override = Some(format!("wf_custom_{}", nodes[index].id));
-            }
-            if !custom.custom_model.is_empty() {
-                model_override = Some(custom.custom_model.clone());
+            if !custom.custom_model.trim().is_empty() {
+                model_override = Some(custom.custom_model.trim().to_string());
             }
         }
-        
-        if provider_override.is_none() && model_override.is_none() {
+
+        if custom_model_provider.is_none() && provider_override.is_none() && model_override.is_none() {
             let conn = guard(state);
             let bot = if step_bot.is_empty() {
                 kv_get(&conn, "active_profile").ok().flatten().unwrap_or_default()
@@ -3578,14 +3641,12 @@ fn execute_workflow_mode(state: &AppState, id: &str, approve_paused_gate: bool, 
             Err(error) if workflow_retry(&error.0) => {
                 std::thread::sleep(Duration::from_millis(500));
                 let retry = format!("{prompt}\n\nThe previous attempt failed: {error}\nTry this step once more.");
-                crate::agent::dispatch(
+                crate::agent::dispatch_workflow_step(
                     state,
                     &retry,
                     &secrets,
                     provider_override.as_deref(),
                     model_override.as_deref(),
-                    None,
-                    &[],
                     custom_model_provider.as_ref(),
                     nodes[index].skill_ids.as_deref(),
                     nodes[index].plugin_ids.as_deref(),
@@ -3703,11 +3764,34 @@ fn write_workflow(home: &std::path::Path, id: &str, yaml: &str) -> Result<()> {
 
 #[tauri::command]
 pub async fn set_ide_agent(state: State<'_, AppState>, agent: String) -> Result<CommandResult> {
-    {
+    let sync = {
         let conn = guard(&state);
         kv_set(&conn, "ide_agent", &agent)?;
-    }
-    finish(&state, None)
+        let settings = db::settings_of(&conn).unwrap_or_default();
+        let binary = match agent.as_str() {
+            "claude" => settings.claude_path.clone(),
+            "aider" => settings.aider_path.clone(),
+            "opencode" => settings.opencode_path.clone(),
+            "codex" => settings.codex_path.clone(),
+            "gemini" => settings.gemini_path.clone(),
+            "cursor" => conn
+                .query_row("SELECT executable_path FROM linked_local_apps WHERE id = 'app_cursor'", [], |row| row.get(0))
+                .unwrap_or_default(),
+            "vscode" => conn
+                .query_row("SELECT executable_path FROM linked_local_apps WHERE id = 'app_vscode'", [], |row| row.get(0))
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
+        crate::workspace_bridge::sync_harness_capabilities(
+            &conn,
+            &state.home,
+            agent.trim(),
+            &binary,
+            &settings.project_root,
+        )
+        .ok()
+    };
+    finish_payload(&state, None, sync.map(|s| json!({ "sync": s })))
 }
 
 #[tauri::command]
@@ -4373,7 +4457,72 @@ mod tests {
             prompt: String::new(),
             status: status.into(),
             latency_ms: 3,
+            ..Default::default()
         }
+    }
+
+    #[test]
+    fn apply_workflow_persists_skills_plugins_mcps_and_custom_provider() {
+        let conn = Connection::open_in_memory().unwrap();
+        db::migrate(&conn).unwrap();
+        let home = std::env::temp_dir().join(format!("ronic-wf-cap-{}", nid("test")));
+        std::fs::create_dir_all(&home).unwrap();
+        let initial = vec![sample_node("node_1", "pending")];
+        let initial_yaml = crate::yaml_flow::emit("wf_cap", "Cap Flow", "idle", None, &[], &initial, &serde_json::Map::new());
+        conn.execute(
+            "INSERT INTO workflows (id,name,yaml_source,nodes_json,triggers_json,current_status,paused_at_node_id,checkpoint_json,updated_at) VALUES ('wf_cap','Cap Flow',?1,?2,'[]','idle',NULL,'{}',1)",
+            params![initial_yaml, serde_json::to_string(&initial).unwrap()],
+        ).unwrap();
+
+        let mut updated_node = sample_node("node_1", "pending");
+        updated_node.model = "custom".into();
+        updated_node.skill_ids = Some(vec!["sk-a".into(), "sk-b".into()]);
+        updated_node.plugin_ids = Some(vec!["plug-1".into()]);
+        updated_node.mcp_server_ids = Some(vec!["mcp-fs".into()]);
+        updated_node.subscription_plan = Some("pro".into());
+        updated_node.custom_model_provider = Some(crate::models::CustomModelProvider {
+            provider_id: "prov_custom".into(),
+            endpoint: "https://api.example.com/v1".into(),
+            api_key: "sk-live-secret".into(),
+            custom_model: "gpt-4o".into(),
+        });
+
+        let patch = WorkflowPatch {
+            id: "wf_cap".into(),
+            name: Some("Cap Flow Renamed".into()),
+            nodes: Some(vec![updated_node]),
+            yaml_source: Some(initial_yaml),
+            ..Default::default()
+        };
+        apply_workflow(&conn, &home, &patch, false).unwrap();
+
+        let (saved_name, saved_yaml, nodes_raw): (String, String, String) = conn
+            .query_row("SELECT name, yaml_source, nodes_json FROM workflows WHERE id='wf_cap'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap();
+        assert_eq!(saved_name, "Cap Flow Renamed");
+        assert!(!saved_yaml.contains("sk-live-secret"), "YAML on disk must never contain BYOK API key");
+        let saved: Vec<WfNode> = serde_json::from_str(&nodes_raw).unwrap();
+        assert_eq!(saved[0].skill_ids.as_deref(), Some(&["sk-a".to_string(), "sk-b".to_string()][..]));
+        assert_eq!(saved[0].plugin_ids.as_deref(), Some(&["plug-1".to_string()][..]));
+        assert_eq!(saved[0].mcp_server_ids.as_deref(), Some(&["mcp-fs".to_string()][..]));
+        assert_eq!(saved[0].subscription_plan.as_deref(), Some("pro"));
+        assert_eq!(saved[0].custom_model_provider.as_ref().unwrap().api_key, "sk-live-secret");
+
+        // Editing YAML later preserves the stored BYOK api_key while keeping skills/plugins/mcps.
+        let yaml_patch = WorkflowPatch {
+            id: "wf_cap".into(),
+            yaml_source: Some(saved_yaml),
+            ..Default::default()
+        };
+        apply_workflow(&conn, &home, &yaml_patch, false).unwrap();
+        let nodes_after_yaml: String = conn.query_row("SELECT nodes_json FROM workflows WHERE id='wf_cap'", [], |r| r.get(0)).unwrap();
+        let after: Vec<WfNode> = serde_json::from_str(&nodes_after_yaml).unwrap();
+        assert_eq!(after[0].skill_ids.as_deref(), Some(&["sk-a".to_string(), "sk-b".to_string()][..]));
+        assert_eq!(after[0].plugin_ids.as_deref(), Some(&["plug-1".to_string()][..]));
+        assert_eq!(after[0].mcp_server_ids.as_deref(), Some(&["mcp-fs".to_string()][..]));
+        assert_eq!(after[0].custom_model_provider.as_ref().unwrap().api_key, "sk-live-secret");
+
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]

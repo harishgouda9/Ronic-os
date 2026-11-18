@@ -2344,6 +2344,50 @@ export function unmarkMcpAuthenticated(id: string): void {
 /**
  * Returns true if the catalog item is currently registered in the live snapshot
  */
+function normalizeMcpLookup(raw?: string): string {
+  return (raw || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+/** Find a marketplace MCP entry by id, slug, short slug (without -mcp/-cdp), or display name. */
+export function findCatalogMcp(query: {
+  id?: string;
+  catalogSlug?: string;
+  slug?: string;
+  name?: string;
+}): MarketplaceCatalogItem | undefined {
+  const candidates = [query.id, query.catalogSlug, query.slug, query.name]
+    .map(normalizeMcpLookup)
+    .filter(Boolean);
+  if (candidates.length === 0) return undefined;
+
+  const mcps = MARKETPLACE_CATALOG.filter((item) => item.kind === "mcp");
+  for (const key of candidates) {
+    const exact = mcps.find(
+      (item) =>
+        normalizeMcpLookup(item.id) === key ||
+        normalizeMcpLookup(item.slug) === key ||
+        normalizeMcpLookup(item.name) === key
+    );
+    if (exact) return exact;
+  }
+  for (const key of candidates) {
+    const stripped = key.replace(/-(mcp|cdp)$/, "").replace(/^mcp-/, "");
+    if (!stripped) continue;
+    const hits = mcps.filter((item) => {
+      const s = normalizeMcpLookup(item.slug).replace(/-(mcp|cdp)$/, "");
+      const idBase = normalizeMcpLookup(item.id).replace(/^mcp-/, "");
+      const n = normalizeMcpLookup(item.name).replace(/-mcp$/, "");
+      return s === stripped || idBase === stripped || n === stripped;
+    });
+    if (hits.length === 1) return hits[0];
+  }
+  return undefined;
+}
+
 export function isItemInstalled(item: MarketplaceCatalogItem, snap: Snapshot): boolean {
   if (item.kind === "mcp") {
     return snap.mcpServers.some(

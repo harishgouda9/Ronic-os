@@ -749,10 +749,10 @@ fn delete_if_exact(path: &Path, expected: &str) {
 
 fn reference_market_yaml() -> String {
     let nodes = vec![
-        WfNode { id: "node_1".into(), name: "@Grokbot Scrape".into(), kind: "bot_action".into(), bot_profile: "@Grokbot-Scout".into(), model: "grok-pro-webview".into(), prompt: "Extract the top 5 macro and crypto catalysts from the configured feeds.".into(), status: "done".into(), latency_ms: 180 },
-        WfNode { id: "node_2".into(), name: "Obsidian memory".into(), kind: "memory_enrich".into(), bot_profile: "@Quant-Trader".into(), model: "local-memory".into(), prompt: "Pull trading rules and the risk limits note.".into(), status: "done".into(), latency_ms: 14 },
-        WfNode { id: "node_3".into(), name: "Analyze and backtest".into(), kind: "llm_reasoning".into(), bot_profile: "@FullStack-Architect".into(), model: "prov_claude".into(), prompt: "Backtest the signal against recent volatility and output a signed trade intent only if it clears the risk note.".into(), status: "paused".into(), latency_ms: 0 },
-        WfNode { id: "node_4".into(), name: "Wallet execute".into(), kind: "wallet_execution".into(), bot_profile: "@Quant-Trader".into(), model: "policy-gate".into(), prompt: "Settle the intent on the sandbox x402 rail if policy allows. Amount 0.04 USD.".into(), status: "pending".into(), latency_ms: 0 },
+        WfNode { id: "node_1".into(), name: "@Grokbot Scrape".into(), kind: "bot_action".into(), bot_profile: "@Grokbot-Scout".into(), model: "grok-pro-webview".into(), prompt: "Extract the top 5 macro and crypto catalysts from the configured feeds.".into(), status: "done".into(), latency_ms: 180, ..Default::default() },
+        WfNode { id: "node_2".into(), name: "Obsidian memory".into(), kind: "memory_enrich".into(), bot_profile: "@Quant-Trader".into(), model: "local-memory".into(), prompt: "Pull trading rules and the risk limits note.".into(), status: "done".into(), latency_ms: 14, ..Default::default() },
+        WfNode { id: "node_3".into(), name: "Analyze and backtest".into(), kind: "llm_reasoning".into(), bot_profile: "@FullStack-Architect".into(), model: "prov_claude".into(), prompt: "Backtest the signal against recent volatility and output a signed trade intent only if it clears the risk note.".into(), status: "paused".into(), latency_ms: 0, ..Default::default() },
+        WfNode { id: "node_4".into(), name: "Wallet execute".into(), kind: "wallet_execution".into(), bot_profile: "@Quant-Trader".into(), model: "policy-gate".into(), prompt: "Settle the intent on the sandbox x402 rail if policy allows. Amount 0.04 USD.".into(), status: "pending".into(), latency_ms: 0, ..Default::default() },
     ];
     let triggers = vec!["cron: 0 8 * * *".to_string(), "telegram: /run_alpha".to_string()];
     crate::yaml_flow::emit("wf_market", "Morning Market Signal", "paused_editable", Some("node_3"), &triggers, &nodes, &serde_json::Map::new())

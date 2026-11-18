@@ -346,6 +346,35 @@ pub fn run_capture_stream<F>(
     args: &[&str],
     cwd: Option<&Path>,
     timeout: Duration,
+    on_chunk: F,
+) -> Result<(i32, String)>
+where
+    F: FnMut(&str),
+{
+    run_capture_stream_env(program, args, cwd, &[], timeout, on_chunk)
+}
+
+pub fn run_capture_stream_env<F>(
+    program: &str,
+    args: &[&str],
+    cwd: Option<&Path>,
+    envs: &[(&str, &str)],
+    timeout: Duration,
+    on_chunk: F,
+) -> Result<(i32, String)>
+where
+    F: FnMut(&str),
+{
+    run_capture_stream_env_cancel(program, args, cwd, envs, timeout, None, on_chunk)
+}
+
+pub fn run_capture_stream_env_cancel<F>(
+    program: &str,
+    args: &[&str],
+    cwd: Option<&Path>,
+    envs: &[(&str, &str)],
+    timeout: Duration,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
     mut on_chunk: F,
 ) -> Result<(i32, String)>
 where
@@ -359,6 +388,11 @@ where
         .stderr(Stdio::piped());
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
+    }
+    for (k, v) in envs {
+        if !k.is_empty() && !v.is_empty() {
+            cmd.env(k, v);
+        }
     }
     #[cfg(windows)]
     {
@@ -428,6 +462,16 @@ where
                 total_output.push_str("\n…truncated");
             }
             return Ok((status.code().unwrap_or(-1), total_output));
+        }
+
+        if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            let _ = child.kill();
+            let _ = child.wait();
+            if !total_output.ends_with('\n') && !total_output.is_empty() {
+                total_output.push('\n');
+            }
+            total_output.push_str("[Cancelled by user]");
+            return Ok((130, total_output));
         }
 
         if started.elapsed() > timeout {

@@ -17,12 +17,19 @@ export interface TerminalPanelProps {
   className?: string;
   onClose?: () => void;
   title?: string;
+  cwd?: string;
+}
+
+export interface TerminalPanelHandle {
+  sendCommand: (command: string) => void;
+  focus: () => void;
 }
 
 export interface TerminalTabInstanceHandle {
   clear: () => void;
   restart: () => void;
   focus: () => void;
+  write: (data: string) => void;
 }
 
 const isWin = typeof navigator !== "undefined" && navigator.platform.includes("Win");
@@ -31,13 +38,16 @@ const TerminalTabInstance = forwardRef<
   TerminalTabInstanceHandle,
   {
     sessionId: string;
+    cwd?: string;
     isActive: boolean;
     onConnectedChange: (connected: boolean) => void;
   }
->(function TerminalTabInstance({ sessionId, isActive, onConnectedChange }, ref) {
+>(function TerminalTabInstance({ sessionId, cwd, isActive, onConnectedChange }, ref) {
   const terminalRef = useRef<HTMLDivElement | null>(null);
   const xtermInstance = useRef<Terminal | null>(null);
   const fitAddonInstance = useRef<FitAddon | null>(null);
+  const cwdRef = useRef<string | undefined>(cwd);
+  cwdRef.current = cwd;
 
   useImperativeHandle(ref, () => ({
     clear: () => {
@@ -54,6 +64,7 @@ const TerminalTabInstance = forwardRef<
                   sessionId,
                   cols: xtermInstance.current.cols || 80,
                   rows: xtermInstance.current.rows || 24,
+                  cwd: cwdRef.current || undefined,
                 }).catch(() => {});
               }
             });
@@ -62,6 +73,16 @@ const TerminalTabInstance = forwardRef<
       }
     },
     focus: () => {
+      xtermInstance.current?.focus();
+    },
+    write: (data: string) => {
+      if (isTauri()) {
+        void import("@tauri-apps/api/core").then(({ invoke }) => {
+          invoke("write_terminal", { sessionId, data }).catch(() => {});
+        });
+      } else {
+        xtermInstance.current?.write(data);
+      }
       xtermInstance.current?.focus();
     },
   }));
@@ -151,6 +172,7 @@ const TerminalTabInstance = forwardRef<
           sessionId,
           cols: term.cols || 80,
           rows: term.rows || 24,
+          cwd: cwdRef.current || undefined,
         })
           .then(() => {
             if (!active) {
@@ -271,12 +293,16 @@ const TerminalTabInstance = forwardRef<
   );
 });
 
-export default function TerminalPanel({
-  sessionId = "workspace_main",
-  className = "",
-  onClose,
-  title,
-}: TerminalPanelProps) {
+const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>(function TerminalPanel(
+  {
+    sessionId = "workspace_main",
+    className = "",
+    onClose,
+    title,
+    cwd,
+  },
+  ref,
+) {
   const defaultShellName = title || (isWin ? "PowerShell" : "Bash");
 
   const [tabs, setTabs] = useState<TerminalTab[]>(() => [
@@ -293,6 +319,17 @@ export default function TerminalPanel({
 
   const nextTabNum = useRef<number>(2);
   const tabInstances = useRef<Record<string, TerminalTabInstanceHandle>>({});
+
+  useImperativeHandle(ref, () => ({
+    sendCommand: (command: string) => {
+      const target = tabInstances.current[activeTabId];
+      if (!target) return;
+      target.write(command.endsWith("\r") || command.endsWith("\n") ? command : `${command}\r`);
+    },
+    focus: () => {
+      tabInstances.current[activeTabId]?.focus();
+    },
+  }), [activeTabId]);
 
   // Keyboard shortcut Ctrl+Shift+T / Alt+T to add new tab; Ctrl+Shift+W to close tab
   useEffect(() => {
@@ -502,6 +539,7 @@ export default function TerminalPanel({
                 else delete tabInstances.current[tab.id];
               }}
               sessionId={tab.sessionId}
+              cwd={cwd}
               isActive={tab.id === activeTabId}
               onConnectedChange={(connected) => {
                 setTabs((prev) =>
@@ -514,4 +552,6 @@ export default function TerminalPanel({
       </div>
     </div>
   );
-}
+});
+
+export default TerminalPanel;

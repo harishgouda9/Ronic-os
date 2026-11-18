@@ -225,6 +225,7 @@ pub fn run() {
             commands::run_sandbox,
             commands::memory_vault,
             commands::workspace_git,
+            commands::workspace_git_fast,
             commands::install_git_package,
             commands::create_workflow,
             commands::import_workflow,
